@@ -14,7 +14,8 @@ use crate::tools::builtin::{
     ApplyPatchTool, CancelJobTool, CreateJobTool, EchoTool, HttpTool, JobStatusTool, JsonTool,
     ListDirTool, ListJobsTool, MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool,
     ReadFileTool, ShellTool, TimeTool, ToolActivateTool, ToolAuthTool, ToolInstallTool,
-    ToolListTool, ToolRemoveTool, ToolSearchTool, WriteFileTool,
+    ToolListTool, ToolRemoveTool, ToolSearchTool, VaultListTool, VaultReadTool, VaultWriteTool,
+    WriteFileTool,
 };
 use crate::tools::tool::Tool;
 use crate::tools::wasm::{
@@ -159,6 +160,19 @@ impl ToolRegistry {
         self.register_sync(Arc::new(CancelJobTool::new(context_manager)));
 
         tracing::info!("Registered 4 job management tools");
+    }
+
+    /// Register Obsidian vault bridge tools (read, write, list).
+    ///
+    /// These tools allow the agent to read and write files directly in the
+    /// user's Obsidian vault on disk, bridging IronClaw's workspace with
+    /// the life system.
+    pub fn register_vault_tools(&self) {
+        self.register_sync(Arc::new(VaultReadTool));
+        self.register_sync(Arc::new(VaultWriteTool));
+        self.register_sync(Arc::new(VaultListTool));
+
+        tracing::info!("Registered 3 vault bridge tools");
     }
 
     /// Register extension management tools (search, install, auth, activate, list, remove).

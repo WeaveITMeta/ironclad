@@ -13,6 +13,7 @@ mod restaurant;
 mod shell;
 mod taskrabbit;
 mod time;
+mod vault;
 
 pub use echo::EchoTool;
 pub use ecommerce::EcommerceTool;
@@ -29,3 +30,4 @@ pub use restaurant::RestaurantTool;
 pub use shell::ShellTool;
 pub use taskrabbit::TaskRabbitTool;
 pub use time::TimeTool;
+pub use vault::{VaultListTool, VaultReadTool, VaultWriteTool};
