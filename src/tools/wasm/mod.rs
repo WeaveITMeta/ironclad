@@ -83,6 +83,7 @@ mod limits;
 mod loader;
 mod rate_limiter;
 mod runtime;
+mod fjall_store;
 mod storage;
 mod wrapper;
 
@@ -108,6 +109,7 @@ pub use credential_injector::{CredentialInjector, InjectedCredentials, Injection
 pub use rate_limiter::{LimitType, RateLimitError, RateLimitResult, RateLimiter};
 
 // Storage (V2)
+pub use fjall_store::FjallWasmToolStore;
 pub use storage::{
     PostgresWasmToolStore, StoreToolParams, StoredCapabilities, StoredWasmTool,
     StoredWasmToolWithBinary, ToolStatus, TrustLevel, WasmStorageError, WasmToolStore,

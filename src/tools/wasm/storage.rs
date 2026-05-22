@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::tools::wasm::capabilities::{
@@ -25,7 +26,7 @@ use crate::tools::wasm::capabilities::{
 };
 
 /// Trust level for a WASM tool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrustLevel {
     /// Built-in system tool (highest trust).
     System,
@@ -59,7 +60,7 @@ impl std::str::FromStr for TrustLevel {
 }
 
 /// Status of a WASM tool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolStatus {
     /// Tool is active and can be used.
     Active,
@@ -93,7 +94,7 @@ impl std::str::FromStr for ToolStatus {
 }
 
 /// A stored WASM tool.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredWasmTool {
     pub id: Uuid,
     pub user_id: String,
@@ -117,7 +118,7 @@ pub struct StoredWasmToolWithBinary {
 }
 
 /// Capabilities stored in the database.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredCapabilities {
     pub id: Uuid,
     pub wasm_tool_id: Uuid,
