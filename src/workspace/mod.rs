@@ -45,12 +45,14 @@ mod document;
 mod embeddings;
 mod repository;
 mod search;
+mod vector_store;
 
 pub use chunker::{ChunkConfig, chunk_document};
 pub use document::{MemoryChunk, MemoryDocument, WorkspaceEntry, paths};
 pub use embeddings::{EmbeddingProvider, MockEmbeddings, NearAiEmbeddings, OpenAiEmbeddings};
 pub use repository::Repository;
 pub use search::{SearchConfig, SearchResult};
+pub use vector_store::{VectorHit, VectorStore};
 
 use std::sync::Arc;
 
@@ -113,6 +115,25 @@ impl Workspace {
     pub fn with_embeddings(mut self, provider: Arc<dyn EmbeddingProvider>) -> Self {
         self.embeddings = Some(provider);
         self
+    }
+
+    /// Attach a shared embedvec-backed vector store for semantic search.
+    ///
+    /// Pass the same `Arc` to every workspace in the process: the underlying
+    /// Fjall keyspace allows a single writer, so the index must be shared.
+    pub fn with_vector_store(self, vector_store: Arc<VectorStore>) -> Self {
+        let Self {
+            user_id,
+            agent_id,
+            repo,
+            embeddings,
+        } = self;
+        Self {
+            user_id,
+            agent_id,
+            repo: repo.with_vector_store(vector_store),
+            embeddings,
+        }
     }
 
     /// Get the user ID.

@@ -33,7 +33,7 @@ use ironclaw::{
         mcp::{McpClient, McpSessionManager, config::load_mcp_servers, is_authenticated},
         wasm::{WasmToolLoader, WasmToolRuntime},
     },
-    workspace::{EmbeddingProvider, NearAiEmbeddings, OpenAiEmbeddings, Workspace},
+    workspace::{EmbeddingProvider, NearAiEmbeddings, OpenAiEmbeddings, VectorStore, Workspace},
 };
 
 #[tokio::main]
@@ -279,11 +279,38 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Open the shared embedvec vector index (Fjall) when embeddings are on.
+    // One instance per process: the Fjall keyspace allows a single writer, so
+    // every workspace shares this Arc. On failure, semantic search is disabled
+    // (full-text search still works).
+    let vector_store: Option<Arc<VectorStore>> = if let Some(ref emb) = embeddings {
+        let dir = dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".ironclaw");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("vector-index");
+        match VectorStore::open(&path.to_string_lossy(), emb.dimension()).await {
+            Ok(vs) => {
+                tracing::info!("Vector store (embedvec/Fjall) ready at {}", path.display());
+                Some(Arc::new(vs))
+            }
+            Err(e) => {
+                tracing::warn!("Vector store open failed; semantic search disabled: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Register memory tools if database is available
     if let Some(ref store) = store {
         let mut workspace = Workspace::new("default", store.pool());
         if let Some(ref emb) = embeddings {
             workspace = workspace.with_embeddings(emb.clone());
+        }
+        if let Some(ref vs) = vector_store {
+            workspace = workspace.with_vector_store(vs.clone());
         }
         let workspace = Arc::new(workspace);
         tools.register_memory_tools(workspace);
@@ -689,6 +716,9 @@ async fn main() -> anyhow::Result<()> {
         let mut ws = Workspace::new("default", s.pool());
         if let Some(ref emb) = embeddings {
             ws = ws.with_embeddings(emb.clone());
+        }
+        if let Some(ref vs) = vector_store {
+            ws = ws.with_vector_store(vs.clone());
         }
         Arc::new(ws)
     });

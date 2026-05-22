@@ -2,7 +2,7 @@
 //!
 //! Uses Reciprocal Rank Fusion (RRF) to combine results from:
 //! 1. PostgreSQL full-text search (ts_rank_cd)
-//! 2. pgvector cosine similarity search
+//! 2. embedvec (HNSW, Fjall-backed) cosine similarity search
 //!
 //! RRF formula: score = sum(1 / (k + rank)) for each retrieval method
 //! This is robust to different score scales and produces better results

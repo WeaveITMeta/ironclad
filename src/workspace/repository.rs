@@ -4,25 +4,39 @@
 //! - Documents in `memory_documents` table
 //! - Chunks in `memory_chunks` table (with FTS and vector indexes)
 
+use std::sync::Arc;
+
 use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
-use pgvector::Vector;
 use uuid::Uuid;
 
 use crate::error::WorkspaceError;
 
 use crate::workspace::document::{MemoryChunk, MemoryDocument, WorkspaceEntry};
 use crate::workspace::search::{RankedResult, SearchConfig, SearchResult, reciprocal_rank_fusion};
+use crate::workspace::vector_store::VectorStore;
 
 /// Database repository for workspace operations.
 pub struct Repository {
     pool: Pool,
+    /// Optional embedvec-backed vector index (Fjall). When set, semantic search
+    /// and embedding writes go through it instead of pgvector.
+    vector_store: Option<Arc<VectorStore>>,
 }
 
 impl Repository {
     /// Create a new repository with a connection pool.
     pub fn new(pool: Pool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            vector_store: None,
+        }
+    }
+
+    /// Attach an embedvec-backed vector store for semantic search.
+    pub fn with_vector_store(mut self, vector_store: Arc<VectorStore>) -> Self {
+        self.vector_store = Some(vector_store);
+        self
     }
 
     /// Get a connection from the pool.
@@ -286,6 +300,23 @@ impl Repository {
     pub async fn delete_chunks(&self, document_id: Uuid) -> Result<(), WorkspaceError> {
         let conn = self.conn().await?;
 
+        // Remove the document's vectors from the store first (keyed by chunk id).
+        if let Some(vs) = &self.vector_store {
+            let rows = conn
+                .query(
+                    "SELECT id FROM memory_chunks WHERE document_id = $1",
+                    &[&document_id],
+                )
+                .await
+                .map_err(|e| WorkspaceError::ChunkingFailed {
+                    reason: format!("Lookup failed: {}", e),
+                })?;
+            for row in &rows {
+                let chunk_id: Uuid = row.get("id");
+                vs.delete(chunk_id).await?;
+            }
+        }
+
         conn.execute(
             "DELETE FROM memory_chunks WHERE document_id = $1",
             &[&document_id],
@@ -309,19 +340,22 @@ impl Repository {
         let conn = self.conn().await?;
         let id = Uuid::new_v4();
 
-        let embedding_vec = embedding.map(|e| Vector::from(e.to_vec()));
-
         conn.execute(
             r#"
-            INSERT INTO memory_chunks (id, document_id, chunk_index, content, embedding)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO memory_chunks (id, document_id, chunk_index, content)
+            VALUES ($1, $2, $3, $4)
             "#,
-            &[&id, &document_id, &chunk_index, &content, &embedding_vec],
+            &[&id, &document_id, &chunk_index, &content],
         )
         .await
         .map_err(|e| WorkspaceError::ChunkingFailed {
             reason: format!("Insert failed: {}", e),
         })?;
+
+        // Mirror the embedding into the vector store (keyed by chunk id).
+        if let (Some(vs), Some(emb)) = (&self.vector_store, embedding) {
+            vs.upsert(id, document_id, content, emb).await?;
+        }
 
         Ok(id)
     }
@@ -332,17 +366,26 @@ impl Repository {
         chunk_id: Uuid,
         embedding: &[f32],
     ) -> Result<(), WorkspaceError> {
+        // Embeddings now live only in the vector store. Look up the chunk's
+        // document id + content and upsert; no-op if no store is attached.
+        let Some(vs) = &self.vector_store else {
+            return Ok(());
+        };
         let conn = self.conn().await?;
-        let embedding_vec = Vector::from(embedding.to_vec());
-
-        conn.execute(
-            "UPDATE memory_chunks SET embedding = $2 WHERE id = $1",
-            &[&chunk_id, &embedding_vec],
-        )
-        .await
-        .map_err(|e| WorkspaceError::EmbeddingFailed {
-            reason: format!("Update failed: {}", e),
-        })?;
+        let row = conn
+            .query_opt(
+                "SELECT document_id, content FROM memory_chunks WHERE id = $1",
+                &[&chunk_id],
+            )
+            .await
+            .map_err(|e| WorkspaceError::EmbeddingFailed {
+                reason: format!("Lookup failed: {}", e),
+            })?;
+        if let Some(row) = row {
+            let document_id: Uuid = row.get("document_id");
+            let content: String = row.get("content");
+            vs.upsert(chunk_id, document_id, &content, embedding).await?;
+        }
 
         Ok(())
     }
@@ -354,8 +397,12 @@ impl Repository {
         agent_id: Option<Uuid>,
         limit: usize,
     ) -> Result<Vec<MemoryChunk>, WorkspaceError> {
+        let Some(vs) = &self.vector_store else {
+            return Ok(Vec::new());
+        };
         let conn = self.conn().await?;
 
+        // A chunk needs an embedding if it isn't in the vector store yet.
         let rows = conn
             .query(
                 r#"
@@ -363,27 +410,34 @@ impl Repository {
                 FROM memory_chunks c
                 JOIN memory_documents d ON d.id = c.document_id
                 WHERE d.user_id = $1 AND d.agent_id IS NOT DISTINCT FROM $2
-                  AND c.embedding IS NULL
-                LIMIT $3
+                ORDER BY c.created_at
                 "#,
-                &[&user_id, &agent_id, &(limit as i64)],
+                &[&user_id, &agent_id],
             )
             .await
             .map_err(|e| WorkspaceError::SearchFailed {
                 reason: format!("Query failed: {}", e),
             })?;
 
-        Ok(rows
-            .iter()
-            .map(|row| MemoryChunk {
-                id: row.get("id"),
+        let mut out = Vec::new();
+        for row in &rows {
+            let id: Uuid = row.get("id");
+            if vs.contains(id).await {
+                continue;
+            }
+            out.push(MemoryChunk {
+                id,
                 document_id: row.get("document_id"),
                 chunk_index: row.get("chunk_index"),
                 content: row.get("content"),
                 embedding: None,
                 created_at: row.get("created_at"),
-            })
-            .collect())
+            });
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     // ==================== Search Operations ====================
@@ -460,43 +514,28 @@ impl Repository {
             .collect())
     }
 
-    /// Vector similarity search using pgvector cosine distance.
+    /// Vector similarity search via the embedvec-backed store.
+    ///
+    /// Single-tenant: results are not filtered by user_id/agent_id, since
+    /// IronClaw runs a single "default" user. Revisit for multi-tenant.
     async fn vector_search(
         &self,
-        user_id: &str,
-        agent_id: Option<Uuid>,
+        _user_id: &str,
+        _agent_id: Option<Uuid>,
         embedding: &[f32],
         limit: usize,
     ) -> Result<Vec<RankedResult>, WorkspaceError> {
-        let conn = self.conn().await?;
-        let embedding_vec = Vector::from(embedding.to_vec());
-
-        let rows = conn
-            .query(
-                r#"
-                SELECT c.id as chunk_id, c.document_id, c.content,
-                       1 - (c.embedding <=> $3) as similarity
-                FROM memory_chunks c
-                JOIN memory_documents d ON d.id = c.document_id
-                WHERE d.user_id = $1 AND d.agent_id IS NOT DISTINCT FROM $2
-                  AND c.embedding IS NOT NULL
-                ORDER BY c.embedding <=> $3
-                LIMIT $4
-                "#,
-                &[&user_id, &agent_id, &embedding_vec, &(limit as i64)],
-            )
-            .await
-            .map_err(|e| WorkspaceError::SearchFailed {
-                reason: format!("Vector query failed: {}", e),
-            })?;
-
-        Ok(rows
-            .iter()
+        let Some(vs) = &self.vector_store else {
+            return Ok(Vec::new());
+        };
+        let hits = vs.search(embedding, limit).await?;
+        Ok(hits
+            .into_iter()
             .enumerate()
-            .map(|(i, row)| RankedResult {
-                chunk_id: row.get("chunk_id"),
-                document_id: row.get("document_id"),
-                content: row.get("content"),
+            .map(|(i, hit)| RankedResult {
+                chunk_id: hit.chunk_id,
+                document_id: hit.document_id,
+                content: hit.content,
                 rank: (i + 1) as u32,
             })
             .collect())

@@ -74,10 +74,6 @@ urlencoding = "2"
 # Open URLs in browser
 open = "5"
 
-# Vector embeddings for semantic search
-# The postgres feature provides ToSql/FromSql for postgres-types (shared by tokio-postgres)
-pgvector = { version = "0.4", features = ["postgres"] }
-
 # WASM sandbox for untrusted tool execution
 wasmtime = { version = "28", features = ["component-model"] }
 wasmtime-wasi = "28"  # WASI support for component model
@@ -99,6 +95,7 @@ hyper-util = { version = "0.1", features = ["server", "tokio", "http1", "http2"]
 http-body-util = "0.1"
 bytes = "1"
 base64 = "0.22.1"
+embedvec = "0.8.0"
 
 # macOS keychain
 [target.'cfg(target_os = "macos")'.dependencies]
