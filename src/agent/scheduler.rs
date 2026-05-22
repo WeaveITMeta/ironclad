@@ -13,7 +13,7 @@ use crate::agent::worker::{Worker, WorkerDeps};
 use crate::config::AgentConfig;
 use crate::context::{ContextManager, JobContext, JobState};
 use crate::error::{Error, JobError};
-use crate::history::Store;
+use crate::history::FjallHistoryStore as Store;
 use crate::llm::LlmProvider;
 use crate::safety::SafetyLayer;
 use crate::tools::ToolRegistry;

@@ -22,10 +22,10 @@ use ironclaw::{
     config::Config,
     context::ContextManager,
     extensions::ExtensionManager,
-    history::Store,
+    history::FjallHistoryStore as Store,
     llm::{SessionConfig, create_llm_provider, create_session_manager},
     safety::SafetyLayer,
-    secrets::{PostgresSecretsStore, SecretsCrypto, SecretsStore},
+    secrets::{FjallSecretsStore, SecretsCrypto, SecretsStore},
     settings::Settings,
     setup::{SetupConfig, SetupWizard},
     tools::{
@@ -38,6 +38,15 @@ use ironclaw::{
         VectorStore, Workspace,
     },
 };
+
+/// IronClaw's local data directory (`~/.ironclaw`), created if missing.
+fn ironclaw_data_dir() -> std::path::PathBuf {
+    let dir = dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".ironclaw");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
 
 /// Open the embedded memory stores (Fjall KV + tantivy FTS + embedvec vectors),
 /// shared by every workspace in the process. Replaces PostgreSQL for memory;
@@ -120,11 +129,9 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .init();
 
-            // Memory commands need database (and optionally embeddings)
+            // Memory commands use the embedded stores (and optionally embeddings)
             let _ = dotenvy::dotenv();
             let config = Config::from_env().map_err(|e| anyhow::anyhow!("{}", e))?;
-            let store = ironclaw::history::Store::new(&config.database).await?;
-            store.run_migrations().await?;
 
             // Set up embeddings if available
             let session = ironclaw::llm::create_session_manager(ironclaw::llm::SessionConfig {
@@ -263,14 +270,13 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Loaded configuration for agent: {}", config.agent.name);
     tracing::info!("NEAR AI session authenticated");
 
-    // Initialize database store (optional for testing)
+    // Initialize the embedded history store (optional for testing)
     let store = if cli.no_db {
-        tracing::warn!("Running without database connection");
+        tracing::warn!("Running without history store");
         None
     } else {
-        let store = Store::new(&config.database).await?;
-        store.run_migrations().await?;
-        tracing::info!("Database connected and migrations applied");
+        let store = Store::open(&ironclaw_data_dir().join("history-index").to_string_lossy())?;
+        tracing::info!("History store (Fjall) ready");
         Some(Arc::new(store))
     };
 
@@ -354,12 +360,18 @@ async fn main() -> anyhow::Result<()> {
 
     // Create secrets store if master key is configured (needed for MCP auth and WASM channels)
     let secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>> =
-        if let (Some(store), Some(master_key)) = (&store, config.secrets.master_key()) {
+        if let Some(master_key) = config.secrets.master_key() {
             match SecretsCrypto::new(master_key.clone()) {
-                Ok(crypto) => Some(Arc::new(PostgresSecretsStore::new(
-                    store.pool(),
+                Ok(crypto) => match FjallSecretsStore::open(
+                    &ironclaw_data_dir().join("secrets-index").to_string_lossy(),
                     Arc::new(crypto),
-                ))),
+                ) {
+                    Ok(s) => Some(Arc::new(s)),
+                    Err(e) => {
+                        tracing::warn!("Failed to open secrets store: {}", e);
+                        None
+                    }
+                },
                 Err(e) => {
                     tracing::warn!("Failed to initialize secrets crypto: {}", e);
                     None

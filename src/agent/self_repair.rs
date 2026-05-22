@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::context::{ContextManager, JobState};
 use crate::error::RepairError;
-use crate::history::Store;
+use crate::history::FjallHistoryStore as Store;
 use crate::tools::{BuildRequirement, Language, SoftwareBuilder, SoftwareType, ToolRegistry};
 
 /// A job that has been detected as stuck.

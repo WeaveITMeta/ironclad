@@ -11,8 +11,7 @@ use clap::Subcommand;
 use tokio::fs;
 
 use crate::config::Config;
-use crate::history::Store;
-use crate::secrets::{CreateSecretParams, PostgresSecretsStore, SecretsCrypto, SecretsStore};
+use crate::secrets::{CreateSecretParams, FjallSecretsStore, SecretsCrypto, SecretsStore};
 use crate::tools::wasm::{CapabilitiesFile, compute_binary_hash};
 
 /// Default tools directory.
@@ -722,11 +721,15 @@ async fn auth_tool(name: String, dir: Option<PathBuf>, user_id: String) -> anyho
         )
     })?;
 
-    let store = Store::new(&config.database).await?;
-    store.run_migrations().await?;
-
     let crypto = SecretsCrypto::new(master_key.clone())?;
-    let secrets_store = Arc::new(PostgresSecretsStore::new(store.pool(), Arc::new(crypto)));
+    let dir = dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".ironclaw");
+    let _ = std::fs::create_dir_all(&dir);
+    let secrets_store = Arc::new(FjallSecretsStore::open(
+        &dir.join("secrets-index").to_string_lossy(),
+        Arc::new(crypto),
+    )?);
 
     // Check if already configured
     let already_configured = secrets_store
@@ -796,7 +799,7 @@ async fn auth_tool(name: String, dir: Option<PathBuf>, user_id: String) -> anyho
 
 /// OAuth browser-based login flow.
 async fn auth_tool_oauth(
-    store: &PostgresSecretsStore,
+    store: &FjallSecretsStore,
     user_id: &str,
     auth: &crate::tools::wasm::AuthCapabilitySchema,
     oauth: &crate::tools::wasm::OAuthConfigSchema,
@@ -1044,7 +1047,7 @@ async fn auth_tool_oauth(
 
 /// Manual token entry flow.
 async fn auth_tool_manual(
-    store: &PostgresSecretsStore,
+    store: &FjallSecretsStore,
     user_id: &str,
     auth: &crate::tools::wasm::AuthCapabilitySchema,
 ) -> anyhow::Result<()> {
@@ -1217,7 +1220,7 @@ async fn validate_token(
 
 /// Save token to secrets store.
 async fn save_token(
-    store: &PostgresSecretsStore,
+    store: &FjallSecretsStore,
     user_id: &str,
     auth: &crate::tools::wasm::AuthCapabilitySchema,
     token: &str,

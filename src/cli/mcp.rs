@@ -8,8 +8,7 @@ use std::sync::Arc;
 use clap::Subcommand;
 
 use crate::config::Config;
-use crate::history::Store;
-use crate::secrets::{PostgresSecretsStore, SecretsCrypto, SecretsStore};
+use crate::secrets::{FjallSecretsStore, SecretsCrypto, SecretsStore};
 use crate::tools::mcp::{
     McpClient, McpServerConfig, McpSessionManager, OAuthConfig,
     auth::{authorize_mcp_server, is_authenticated},
@@ -455,14 +454,15 @@ async fn get_secrets_store() -> anyhow::Result<Arc<dyn SecretsStore + Send + Syn
         )
     })?;
 
-    let store = Store::new(&config.database).await?;
-    store.run_migrations().await?;
-
     let crypto = SecretsCrypto::new(master_key.clone())?;
-    Ok(Arc::new(PostgresSecretsStore::new(
-        store.pool(),
+    let dir = dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".ironclaw");
+    let _ = std::fs::create_dir_all(&dir);
+    Ok(Arc::new(FjallSecretsStore::open(
+        &dir.join("secrets-index").to_string_lossy(),
         Arc::new(crypto),
-    )))
+    )?))
 }
 
 #[cfg(test)]

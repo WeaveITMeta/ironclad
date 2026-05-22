@@ -11,7 +11,7 @@ use crate::agent::scheduler::WorkerMessage;
 use crate::agent::task::TaskOutput;
 use crate::context::{ContextManager, JobState};
 use crate::error::Error;
-use crate::history::Store;
+use crate::history::FjallHistoryStore as Store;
 use crate::llm::{
     ActionPlan, ChatMessage, LlmProvider, Reasoning, ReasoningContext, RespondResult, ToolSelection,
 };

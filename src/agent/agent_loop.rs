@@ -20,7 +20,7 @@ use crate::context::ContextManager;
 use crate::context::JobContext;
 use crate::error::Error;
 use crate::extensions::ExtensionManager;
-use crate::history::Store;
+use crate::history::FjallHistoryStore as Store;
 use crate::llm::{ChatMessage, LlmProvider, Reasoning, ReasoningContext, RespondResult};
 use crate::safety::SafetyLayer;
 use crate::tools::ToolRegistry;
