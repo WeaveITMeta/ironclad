@@ -91,7 +91,7 @@ pub struct StateTransition {
 }
 
 /// Context for a running job.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobContext {
     /// Unique job ID.
     pub job_id: Uuid,

@@ -6,7 +6,9 @@
 //! - Analytics and metrics
 
 mod analytics;
+mod fjall_store;
 mod store;
 
-pub use analytics::{JobStats, ToolStats};
+pub use analytics::{CategoryHistoryEntry, EstimationAccuracy, JobStats, ToolStats};
+pub use fjall_store::FjallHistoryStore;
 pub use store::{LlmCallRecord, Store};
