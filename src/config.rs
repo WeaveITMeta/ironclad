@@ -10,7 +10,6 @@ use crate::error::ConfigError;
 /// Main configuration for the agent.
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub database: DatabaseConfig,
     pub llm: LlmConfig,
     pub embeddings: EmbeddingsConfig,
     pub tunnel: TunnelConfig,
@@ -31,7 +30,6 @@ impl Config {
         let _ = dotenvy::dotenv();
 
         Ok(Self {
-            database: DatabaseConfig::from_env()?,
             llm: LlmConfig::from_env()?,
             embeddings: EmbeddingsConfig::from_env()?,
             tunnel: TunnelConfig::from_env()?,
@@ -122,47 +120,6 @@ impl TunnelConfig {
     }
 }
 
-/// Database configuration.
-#[derive(Debug, Clone)]
-pub struct DatabaseConfig {
-    pub url: SecretString,
-    pub pool_size: usize,
-}
-
-impl DatabaseConfig {
-    fn from_env() -> Result<Self, ConfigError> {
-        let settings = crate::settings::Settings::load();
-
-        // Priority: env var > settings > error (required)
-        let url = optional_env("DATABASE_URL")?
-            .or(settings.database_url.clone())
-            .ok_or_else(|| ConfigError::MissingRequired {
-                key: "database_url".to_string(),
-                hint: "Run 'ironclaw onboard' or set DATABASE_URL environment variable".to_string(),
-            })?;
-
-        // Priority: env var > settings > default
-        let pool_size = optional_env("DATABASE_POOL_SIZE")?
-            .map(|s| s.parse())
-            .transpose()
-            .map_err(|e| ConfigError::InvalidValue {
-                key: "DATABASE_POOL_SIZE".to_string(),
-                message: format!("must be a positive integer: {e}"),
-            })?
-            .or(settings.database_pool_size)
-            .unwrap_or(10);
-
-        Ok(Self {
-            url: SecretString::from(url),
-            pool_size,
-        })
-    }
-
-    /// Get the database URL (exposes the secret).
-    pub fn url(&self) -> &str {
-        self.url.expose_secret()
-    }
-}
 
 /// LLM provider configuration (NEAR AI only).
 #[derive(Debug, Clone)]

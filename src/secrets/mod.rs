@@ -38,7 +38,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use ironclaw::secrets::{SecretsStore, PostgresSecretsStore, SecretsCrypto, CreateSecretParams};
+//! use ironclaw::secrets::{SecretsStore, FjallSecretsStore, SecretsCrypto, CreateSecretParams};
 //! use secrecy::SecretString;
 //!
 //! // Initialize crypto with master key from environment
@@ -46,7 +46,7 @@
 //! let crypto = Arc::new(SecretsCrypto::new(master_key)?);
 //!
 //! // Create store
-//! let store = PostgresSecretsStore::new(pool, crypto);
+//! let store = FjallSecretsStore::open("~/.ironclaw/secrets-index", crypto)?;
 //!
 //! // Store a secret
 //! store.create("user_123", CreateSecretParams::new("openai_key", "sk-...")).await?;
@@ -66,7 +66,7 @@ mod types;
 
 pub use crypto::SecretsCrypto;
 pub use fjall_store::FjallSecretsStore;
-pub use store::{PostgresSecretsStore, SecretsStore};
+pub use store::SecretsStore;
 pub use types::{
     CreateSecretParams, CredentialLocation, CredentialMapping, DecryptedSecret, Secret,
     SecretError, SecretRef,

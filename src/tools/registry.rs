@@ -269,7 +269,7 @@ impl ToolRegistry {
     /// # Example
     ///
     /// ```ignore
-    /// let store = PostgresWasmToolStore::new(pool);
+    /// let store = FjallWasmToolStore::open("~/.ironclaw/wasm-index")?;
     /// let runtime = Arc::new(WasmToolRuntime::new(WasmRuntimeConfig::default())?);
     ///
     /// registry.register_wasm_from_storage(

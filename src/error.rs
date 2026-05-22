@@ -80,15 +80,6 @@ pub enum DatabaseError {
 
     #[error("Serialization error: {0}")]
     Serialization(String),
-
-    #[error("PostgreSQL error: {0}")]
-    Postgres(#[from] tokio_postgres::Error),
-
-    #[error("Pool build error: {0}")]
-    PoolBuild(#[from] deadpool_postgres::BuildError),
-
-    #[error("Pool runtime error: {0}")]
-    PoolRuntime(#[from] deadpool_postgres::PoolError),
 }
 
 /// Channel-related errors.

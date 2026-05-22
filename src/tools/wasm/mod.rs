@@ -111,9 +111,8 @@ pub use rate_limiter::{LimitType, RateLimitError, RateLimitResult, RateLimiter};
 // Storage (V2)
 pub use fjall_store::FjallWasmToolStore;
 pub use storage::{
-    PostgresWasmToolStore, StoreToolParams, StoredCapabilities, StoredWasmTool,
-    StoredWasmToolWithBinary, ToolStatus, TrustLevel, WasmStorageError, WasmToolStore,
-    compute_binary_hash, verify_binary_integrity,
+    StoreToolParams, StoredCapabilities, StoredWasmTool, StoredWasmToolWithBinary, ToolStatus,
+    TrustLevel, WasmStorageError, WasmToolStore, compute_binary_hash, verify_binary_integrity,
 };
 
 // Loader

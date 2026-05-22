@@ -21,17 +21,15 @@ pub async fn run_status_command() -> anyhow::Result<()> {
         env!("CARGO_PKG_VERSION")
     );
 
-    // Database
-    let db_url_set = settings.database_url.is_some() || std::env::var("DATABASE_URL").is_ok();
-    print!("  Database:    ");
-    if db_url_set {
-        // Try to connect
-        match check_database().await {
-            Ok(()) => println!("connected"),
-            Err(e) => println!("error ({})", e),
-        }
+    // Storage (embedded Fjall stores)
+    let data_dir = dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".ironclaw");
+    print!("  Storage:     ");
+    if data_dir.join("history-index").exists() {
+        println!("Fjall (embedded) at {}", data_dir.display());
     } else {
-        println!("not configured");
+        println!("Fjall (embedded), not yet initialized");
     }
 
     // Session / Auth
@@ -135,37 +133,6 @@ pub async fn run_status_command() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn check_database() -> anyhow::Result<()> {
-    let _ = dotenvy::dotenv();
-    let settings = Settings::load();
-    let url = std::env::var("DATABASE_URL")
-        .ok()
-        .or(settings.database_url)
-        .ok_or_else(|| anyhow::anyhow!("no URL"))?;
-
-    let config: deadpool_postgres::Config = deadpool_postgres::Config {
-        url: Some(url),
-        ..Default::default()
-    };
-    let pool = config
-        .create_pool(
-            Some(deadpool_postgres::Runtime::Tokio1),
-            tokio_postgres::NoTls,
-        )
-        .map_err(|e| anyhow::anyhow!("pool error: {}", e))?;
-
-    let client = tokio::time::timeout(std::time::Duration::from_secs(5), pool.get())
-        .await
-        .map_err(|_| anyhow::anyhow!("timeout"))?
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-
-    client
-        .execute("SELECT 1", &[])
-        .await
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-
-    Ok(())
-}
 
 fn count_wasm_files(dir: &std::path::Path) -> usize {
     std::fs::read_dir(dir)

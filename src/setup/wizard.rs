@@ -12,9 +12,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use deadpool_postgres::{Config as PoolConfig, Runtime};
 use secrecy::SecretString;
-use tokio_postgres::NoTls;
 
 use crate::channels::wasm::{
     ChannelCapabilitiesFile, bundled_channel_names, install_bundled_channel,
@@ -26,7 +24,7 @@ use crate::setup::channels::{
     SecretsContext, setup_http, setup_telegram, setup_tunnel, setup_wasm_channel,
 };
 use crate::setup::prompts::{
-    confirm, input, optional_input, print_error, print_header, print_info, print_step,
+    confirm, input, optional_input, print_header, print_info, print_step,
     print_success, select_many, select_one,
 };
 
@@ -66,8 +64,6 @@ pub struct SetupWizard {
     config: SetupConfig,
     settings: Settings,
     session_manager: Option<Arc<SessionManager>>,
-    /// Database pool (created during setup).
-    db_pool: Option<deadpool_postgres::Pool>,
     /// Secrets crypto (created during setup).
     secrets_crypto: Option<Arc<SecretsCrypto>>,
 }
@@ -79,7 +75,6 @@ impl SetupWizard {
             config: SetupConfig::default(),
             settings: Settings::load(),
             session_manager: None,
-            db_pool: None,
             secrets_crypto: None,
         }
     }
@@ -90,7 +85,6 @@ impl SetupWizard {
             config,
             settings: Settings::load(),
             session_manager: None,
-            db_pool: None,
             secrets_crypto: None,
         }
     }
@@ -110,155 +104,40 @@ impl SetupWizard {
             print_step(1, 1, "Channel Configuration");
             self.step_channels().await?;
         } else {
-            let total_steps = 7;
+            let total_steps = 6;
 
-            // Step 1: Database
-            print_step(1, total_steps, "Database Connection");
-            self.step_database().await?;
-
-            // Step 2: Security
-            print_step(2, total_steps, "Security");
+            // Step 1: Security
+            print_step(1, total_steps, "Security");
             self.step_security().await?;
 
-            // Step 3: Authentication (unless skipped)
+            // Step 2: Authentication (unless skipped)
             if !self.config.skip_auth {
-                print_step(3, total_steps, "NEAR AI Authentication");
+                print_step(2, total_steps, "NEAR AI Authentication");
                 self.step_authentication().await?;
             } else {
                 print_info("Skipping authentication (using existing session)");
             }
 
-            // Step 4: Model selection
-            print_step(4, total_steps, "Model Selection");
+            // Step 3: Model selection
+            print_step(3, total_steps, "Model Selection");
             self.step_model_selection().await?;
 
-            // Step 5: Embeddings
-            print_step(5, total_steps, "Embeddings (Semantic Search)");
+            // Step 4: Embeddings
+            print_step(4, total_steps, "Embeddings (Semantic Search)");
             self.step_embeddings()?;
 
-            // Step 6: Channel configuration
-            print_step(6, total_steps, "Channel Configuration");
+            // Step 5: Channel configuration
+            print_step(5, total_steps, "Channel Configuration");
             self.step_channels().await?;
 
-            // Step 7: Heartbeat
-            print_step(7, total_steps, "Background Tasks");
+            // Step 6: Heartbeat
+            print_step(6, total_steps, "Background Tasks");
             self.step_heartbeat()?;
         }
 
         // Save settings and print summary
         self.save_and_summarize()?;
 
-        Ok(())
-    }
-
-    /// Step 1: Database connection.
-    async fn step_database(&mut self) -> Result<(), SetupError> {
-        // Check if we have an existing URL in env or settings
-        let existing_url = std::env::var("DATABASE_URL")
-            .ok()
-            .or_else(|| self.settings.database_url.clone());
-
-        if let Some(ref url) = existing_url {
-            // Mask the password for display
-            let display_url = mask_password_in_url(url);
-            print_info(&format!("Existing database URL: {}", display_url));
-
-            if confirm("Use this database?", true).map_err(SetupError::Io)? {
-                // Test the connection
-                if let Err(e) = self.test_database_connection(url).await {
-                    print_error(&format!("Connection failed: {}", e));
-                    print_info("Let's configure a new database URL.");
-                } else {
-                    print_success("Database connection successful");
-                    self.settings.database_url = Some(url.clone());
-                    return Ok(());
-                }
-            }
-        }
-
-        // Prompt for new URL
-        println!();
-        print_info("Enter your PostgreSQL connection URL.");
-        print_info("Format: postgres://user:password@host:port/database");
-        println!();
-
-        loop {
-            let url = input("Database URL").map_err(SetupError::Io)?;
-
-            if url.is_empty() {
-                print_error("Database URL is required.");
-                continue;
-            }
-
-            // Test the connection
-            print_info("Testing connection...");
-            match self.test_database_connection(&url).await {
-                Ok(()) => {
-                    print_success("Database connection successful");
-
-                    // Ask if we should run migrations
-                    if confirm("Run database migrations?", true).map_err(SetupError::Io)? {
-                        self.run_migrations().await?;
-                    }
-
-                    self.settings.database_url = Some(url);
-                    return Ok(());
-                }
-                Err(e) => {
-                    print_error(&format!("Connection failed: {}", e));
-                    if !confirm("Try again?", true).map_err(SetupError::Io)? {
-                        return Err(SetupError::Database(
-                            "Database connection failed".to_string(),
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    /// Test database connection and store the pool.
-    async fn test_database_connection(&mut self, url: &str) -> Result<(), SetupError> {
-        let mut cfg = PoolConfig::new();
-        cfg.url = Some(url.to_string());
-        cfg.pool = Some(deadpool_postgres::PoolConfig {
-            max_size: 5,
-            ..Default::default()
-        });
-
-        let pool = cfg
-            .create_pool(Some(Runtime::Tokio1), NoTls)
-            .map_err(|e| SetupError::Database(format!("Failed to create pool: {}", e)))?;
-
-        // Test the connection
-        let _ = pool
-            .get()
-            .await
-            .map_err(|e| SetupError::Database(format!("Failed to connect: {}", e)))?;
-
-        self.db_pool = Some(pool);
-        Ok(())
-    }
-
-    /// Run database migrations.
-    async fn run_migrations(&self) -> Result<(), SetupError> {
-        if let Some(ref pool) = self.db_pool {
-            use refinery::embed_migrations;
-            embed_migrations!("migrations");
-
-            print_info("Running migrations...");
-
-            let mut client = pool
-                .get()
-                .await
-                .map_err(|e| SetupError::Database(format!("Pool error: {}", e)))?;
-
-            migrations::runner()
-                .run_async(&mut **client)
-                .await
-                .map_err(|e| SetupError::Database(format!("Migration failed: {}", e)))?;
-
-            print_success("Migrations applied");
-        }
         Ok(())
     }
 
@@ -525,24 +404,6 @@ impl SetupWizard {
 
     /// Initialize secrets context for channel setup.
     async fn init_secrets_context(&mut self) -> Result<SecretsContext, SetupError> {
-        // Get database pool (should be set from step 1)
-        let pool = if let Some(ref p) = self.db_pool {
-            p.clone()
-        } else {
-            // Fall back to creating one from settings/env
-            let url = self
-                .settings
-                .database_url
-                .clone()
-                .or_else(|| std::env::var("DATABASE_URL").ok())
-                .ok_or_else(|| SetupError::Config("Database URL not configured".to_string()))?;
-
-            self.test_database_connection(&url).await?;
-            // Ensure secrets-related tables exist for channels-only onboarding flows.
-            self.run_migrations().await?;
-            self.db_pool.clone().unwrap()
-        };
-
         // Get crypto (should be set from step 2, or load from keychain/env)
         let crypto = if let Some(ref c) = self.secrets_crypto {
             Arc::clone(c)
@@ -564,7 +425,7 @@ impl SetupWizard {
             Arc::clone(self.secrets_crypto.as_ref().unwrap())
         };
 
-        Ok(SecretsContext::new(pool, crypto, "default"))
+        SecretsContext::new(crypto, "default").map_err(SetupError::Config)
     }
 
     /// Step 6: Channel configuration.
@@ -867,34 +728,6 @@ impl Default for SetupWizard {
     }
 }
 
-/// Mask password in a database URL for display.
-fn mask_password_in_url(url: &str) -> String {
-    // URL format: scheme://user:password@host/database
-    // Find "://" to locate start of credentials
-    let Some(scheme_end) = url.find("://") else {
-        return url.to_string();
-    };
-    let credentials_start = scheme_end + 3; // After "://"
-
-    // Find "@" to locate end of credentials
-    let Some(at_pos) = url[credentials_start..].find('@') else {
-        return url.to_string();
-    };
-    let at_abs = credentials_start + at_pos;
-
-    // Find ":" in the credentials section (separates user from password)
-    let credentials = &url[credentials_start..at_abs];
-    let Some(colon_pos) = credentials.find(':') else {
-        return url.to_string();
-    };
-
-    // Build masked URL: scheme://user:****@host/database
-    let scheme = &url[..credentials_start]; // "postgres://"
-    let username = &credentials[..colon_pos]; // "user"
-    let after_at = &url[at_abs..]; // "@localhost/db"
-
-    format!("{}{}:****{}", scheme, username, after_at)
-}
 
 /// Discover WASM channels in a directory.
 ///
@@ -1055,20 +888,6 @@ mod tests {
         };
         let wizard = SetupWizard::with_config(config);
         assert!(wizard.config.skip_auth);
-    }
-
-    #[test]
-    fn test_mask_password_in_url() {
-        assert_eq!(
-            mask_password_in_url("postgres://user:secret@localhost/db"),
-            "postgres://user:****@localhost/db"
-        );
-
-        // URL without password
-        assert_eq!(
-            mask_password_in_url("postgres://localhost/db"),
-            "postgres://localhost/db"
-        );
     }
 
     #[test]

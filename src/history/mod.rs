@@ -11,4 +11,4 @@ mod store;
 
 pub use analytics::{CategoryHistoryEntry, EstimationAccuracy, JobStats, ToolStats};
 pub use fjall_store::FjallHistoryStore;
-pub use store::{LlmCallRecord, Store};
+pub use store::LlmCallRecord;

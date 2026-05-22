@@ -12,7 +12,7 @@ use reqwest::Client;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
-use crate::secrets::{CreateSecretParams, PostgresSecretsStore, SecretsCrypto, SecretsStore};
+use crate::secrets::{CreateSecretParams, FjallSecretsStore, SecretsCrypto, SecretsStore};
 use crate::settings::Settings;
 use crate::setup::prompts::{
     confirm, input, optional_input, print_error, print_info, print_success, secret_input,
@@ -20,17 +20,23 @@ use crate::setup::prompts::{
 
 /// Context for saving secrets during setup.
 pub struct SecretsContext {
-    store: PostgresSecretsStore,
+    store: FjallSecretsStore,
     user_id: String,
 }
 
 impl SecretsContext {
-    /// Create a new secrets context.
-    pub fn new(pool: deadpool_postgres::Pool, crypto: Arc<SecretsCrypto>, user_id: &str) -> Self {
-        Self {
-            store: PostgresSecretsStore::new(pool, crypto),
+    /// Create a new secrets context backed by the embedded Fjall secret store.
+    pub fn new(crypto: Arc<SecretsCrypto>, user_id: &str) -> Result<Self, String> {
+        let dir = dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".ironclaw");
+        let _ = std::fs::create_dir_all(&dir);
+        let store = FjallSecretsStore::open(&dir.join("secrets-index").to_string_lossy(), crypto)
+            .map_err(|e| format!("Failed to open secrets store: {e}"))?;
+        Ok(Self {
+            store,
             user_id: user_id.to_string(),
-        }
+        })
     }
 
     /// Save a secret to the database.
