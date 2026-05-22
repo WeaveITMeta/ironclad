@@ -839,11 +839,6 @@ async fn main() -> anyhow::Result<()> {
 fn check_onboard_needed() -> Option<&'static str> {
     let settings = Settings::load();
 
-    // Database not configured (and not in env)
-    if settings.database_url.is_none() && std::env::var("DATABASE_URL").is_err() {
-        return Some("Database not configured");
-    }
-
     // Secrets not configured (and not in env)
     if settings.secrets_master_key_source == ironclaw::settings::KeySource::None
         && std::env::var("SECRETS_MASTER_KEY").is_err()

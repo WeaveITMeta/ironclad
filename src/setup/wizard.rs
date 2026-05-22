@@ -648,9 +648,7 @@ impl SetupWizard {
         println!("Configuration Summary:");
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-        if self.settings.database_url.is_some() {
-            println!("  Database: configured");
-        }
+        println!("  Storage:  Fjall (embedded, ~/.ironclaw)");
 
         match self.settings.secrets_master_key_source {
             KeySource::Keychain => println!("  Security: OS keychain"),
