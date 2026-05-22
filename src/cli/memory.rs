@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use clap::Subcommand;
 
-use crate::workspace::{EmbeddingProvider, SearchConfig, Workspace};
+use crate::workspace::{EmbeddingProvider, Repository, SearchConfig, Workspace};
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum MemoryCommand {
@@ -58,10 +58,13 @@ pub enum MemoryCommand {
 /// Run a memory command.
 pub async fn run_memory_command(
     cmd: MemoryCommand,
-    pool: deadpool_postgres::Pool,
+    repository: Option<Repository>,
     embeddings: Option<Arc<dyn EmbeddingProvider>>,
 ) -> anyhow::Result<()> {
-    let mut workspace = Workspace::new("default", pool);
+    let Some(repository) = repository else {
+        anyhow::bail!("Memory stores unavailable; cannot run memory commands.");
+    };
+    let mut workspace = Workspace::new("default", repository);
     if let Some(emb) = embeddings {
         workspace = workspace.with_embeddings(emb);
     }

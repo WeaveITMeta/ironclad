@@ -457,15 +457,17 @@ mod tests {
     use super::*;
 
     fn make_test_workspace() -> Arc<Workspace> {
-        Arc::new(Workspace::new(
-            "test_user",
-            deadpool_postgres::Pool::builder(deadpool_postgres::Manager::new(
-                tokio_postgres::Config::new(),
-                tokio_postgres::NoTls,
-            ))
-            .build()
-            .unwrap(),
-        ))
+        // Embedded stores in a unique temp dir (no database). Schema tests don't
+        // touch storage; the dir is left as a test artifact.
+        let base = std::env::temp_dir().join(format!("ironclaw-test-{}", uuid::Uuid::new_v4()));
+        let docs = std::sync::Arc::new(
+            crate::workspace::FjallStore::open(&base.join("docs").to_string_lossy()).unwrap(),
+        );
+        let fts = std::sync::Arc::new(
+            crate::workspace::FtsIndex::open(&base.join("fts").to_string_lossy()).unwrap(),
+        );
+        let repo = crate::workspace::Repository::new(docs, fts, None);
+        Arc::new(Workspace::new("test_user", repo))
     }
 
     #[test]

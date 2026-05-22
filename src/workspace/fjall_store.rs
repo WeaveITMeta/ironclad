@@ -20,7 +20,7 @@ use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle, PersistMo
 use uuid::Uuid;
 
 use crate::error::WorkspaceError;
-use crate::workspace::document::{MemoryDocument, WorkspaceEntry};
+use crate::workspace::document::{MemoryChunk, MemoryDocument, WorkspaceEntry};
 
 /// Field separator for composite keys (ASCII unit separator; absent from paths).
 const SEP: u8 = 0x1f;
@@ -345,6 +345,22 @@ impl FjallStore {
             .map_err(|e| store_err("put chunk_doc", e))?;
         self.persist()?;
         Ok(chunk.id)
+    }
+
+    /// Load a single chunk by id.
+    pub fn get_chunk(&self, id: Uuid) -> Result<Option<MemoryChunk>, WorkspaceError> {
+        match self
+            .chunks
+            .get(id.as_bytes())
+            .map_err(|e| store_err("get chunk", e))?
+        {
+            Some(bytes) => {
+                let chunk =
+                    serde_json::from_slice(&bytes).map_err(|e| store_err("decode chunk", e))?;
+                Ok(Some(chunk))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Delete all chunks for a document. Returns the deleted chunk ids so the

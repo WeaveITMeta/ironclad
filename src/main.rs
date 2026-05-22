@@ -33,8 +33,54 @@ use ironclaw::{
         mcp::{McpClient, McpSessionManager, config::load_mcp_servers, is_authenticated},
         wasm::{WasmToolLoader, WasmToolRuntime},
     },
-    workspace::{EmbeddingProvider, NearAiEmbeddings, OpenAiEmbeddings, VectorStore, Workspace},
+    workspace::{
+        EmbeddingProvider, FjallStore, FtsIndex, NearAiEmbeddings, OpenAiEmbeddings, Repository,
+        VectorStore, Workspace,
+    },
 };
+
+/// Open the embedded memory stores (Fjall KV + tantivy FTS + embedvec vectors),
+/// shared by every workspace in the process. Replaces PostgreSQL for memory;
+/// returns None only if the KV or FTS store fails to open.
+async fn open_memory_repository(
+    embeddings: &Option<Arc<dyn EmbeddingProvider>>,
+) -> Option<Repository> {
+    let dir = dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".ironclaw");
+    let _ = std::fs::create_dir_all(&dir);
+
+    let docs = match FjallStore::open(&dir.join("memory-index").to_string_lossy()) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!("Memory KV store open failed; memory disabled: {}", e);
+            return None;
+        }
+    };
+    let fts = match FtsIndex::open(&dir.join("fts-index").to_string_lossy()) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!("FTS index open failed; memory disabled: {}", e);
+            return None;
+        }
+    };
+    let vectors = if let Some(emb) = embeddings {
+        match VectorStore::open(&dir.join("vector-index").to_string_lossy(), emb.dimension()).await {
+            Ok(vs) => Some(Arc::new(vs)),
+            Err(e) => {
+                tracing::warn!("Vector store open failed; semantic search disabled: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    tracing::info!(
+        "Memory stores ready: Fjall + tantivy{}",
+        if vectors.is_some() { " + embedvec" } else { "" }
+    );
+    Some(Repository::new(Arc::new(docs), Arc::new(fts), vectors))
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -118,7 +164,8 @@ async fn main() -> anyhow::Result<()> {
                     None
                 };
 
-            return run_memory_command(mem_cmd.clone(), store.pool(), embeddings).await;
+            let repository = open_memory_repository(&embeddings).await;
+            return run_memory_command(mem_cmd.clone(), repository, embeddings).await;
         }
         Some(Command::Status) => {
             let _ = dotenvy::dotenv();
@@ -279,38 +326,15 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // Open the shared embedvec vector index (Fjall) when embeddings are on.
-    // One instance per process: the Fjall keyspace allows a single writer, so
-    // every workspace shares this Arc. On failure, semantic search is disabled
-    // (full-text search still works).
-    let vector_store: Option<Arc<VectorStore>> = if let Some(ref emb) = embeddings {
-        let dir = dirs::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".ironclaw");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("vector-index");
-        match VectorStore::open(&path.to_string_lossy(), emb.dimension()).await {
-            Ok(vs) => {
-                tracing::info!("Vector store (embedvec/Fjall) ready at {}", path.display());
-                Some(Arc::new(vs))
-            }
-            Err(e) => {
-                tracing::warn!("Vector store open failed; semantic search disabled: {}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
+    // Open the embedded memory stores (Fjall + tantivy + embedvec), shared by
+    // every workspace. No database needed for memory.
+    let repository = open_memory_repository(&embeddings).await;
 
-    // Register memory tools if database is available
-    if let Some(ref store) = store {
-        let mut workspace = Workspace::new("default", store.pool());
+    // Register memory tools when the memory stores are available.
+    if let Some(ref repo) = repository {
+        let mut workspace = Workspace::new("default", repo.clone());
         if let Some(ref emb) = embeddings {
             workspace = workspace.with_embeddings(emb.clone());
-        }
-        if let Some(ref vs) = vector_store {
-            workspace = workspace.with_vector_store(vs.clone());
         }
         let workspace = Arc::new(workspace);
         tools.register_memory_tools(workspace);
@@ -712,13 +736,10 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Create workspace for agent (shared with memory tools)
-    let workspace = store.as_ref().map(|s| {
-        let mut ws = Workspace::new("default", s.pool());
+    let workspace = repository.as_ref().map(|repo| {
+        let mut ws = Workspace::new("default", repo.clone());
         if let Some(ref emb) = embeddings {
             ws = ws.with_embeddings(emb.clone());
-        }
-        if let Some(ref vs) = vector_store {
-            ws = ws.with_vector_store(vs.clone());
         }
         Arc::new(ws)
     });

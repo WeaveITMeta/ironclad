@@ -1,341 +1,236 @@
 //! Integration tests for the workspace module.
 //!
-//! Requires a running PostgreSQL with pgvector extension.
-//! Set DATABASE_URL=postgres://localhost/ironclaw_test
+//! Fully embedded: documents/chunks in Fjall, full-text in tantivy, vectors in
+//! embedvec. No database required — each test gets its own temp-dir stores.
 
 use std::sync::Arc;
 
-use ironclaw::workspace::{MockEmbeddings, SearchConfig, Workspace, paths};
+use ironclaw::workspace::{
+    FjallStore, FtsIndex, MockEmbeddings, Repository, SearchConfig, VectorStore, Workspace, paths,
+};
+use tempfile::TempDir;
 
-fn get_pool() -> deadpool_postgres::Pool {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://localhost/ironclaw_test".to_string());
-
-    let config: tokio_postgres::Config = database_url.parse().expect("Invalid DATABASE_URL");
-
-    let mgr = deadpool_postgres::Manager::new(config, tokio_postgres::NoTls);
-    deadpool_postgres::Pool::builder(mgr)
-        .max_size(4)
-        .build()
-        .expect("Failed to create pool")
-}
-
-async fn cleanup_user(pool: &deadpool_postgres::Pool, user_id: &str) {
-    let conn = pool.get().await.expect("Failed to get connection");
-    conn.execute(
-        "DELETE FROM memory_documents WHERE user_id = $1",
-        &[&user_id],
-    )
-    .await
-    .ok();
+/// Build an isolated repository over temp-dir stores. The returned `TempDir`
+/// must be kept alive for the duration of the test (it owns the on-disk data).
+/// Pass `dim = Some(n)` to enable a vector store of dimension `n`.
+async fn make_repo(dim: Option<usize>) -> (Repository, TempDir) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let docs = Arc::new(
+        FjallStore::open(&dir.path().join("docs").to_string_lossy()).expect("open fjall store"),
+    );
+    let fts = Arc::new(
+        FtsIndex::open(&dir.path().join("fts").to_string_lossy()).expect("open fts index"),
+    );
+    let vectors = match dim {
+        Some(d) => Some(Arc::new(
+            VectorStore::open(&dir.path().join("vec").to_string_lossy(), d)
+                .await
+                .expect("open vector store"),
+        )),
+        None => None,
+    };
+    (Repository::new(docs, fts, vectors), dir)
 }
 
 #[tokio::test]
 async fn test_workspace_write_and_read() {
-    let pool = get_pool();
-    let user_id = "test_write_read";
-    cleanup_user(&pool, user_id).await;
+    let (repo, _tmp) = make_repo(None).await;
+    let workspace = Workspace::new("test_write_read", repo);
 
-    let workspace = Workspace::new(user_id, pool.clone());
-
-    // Write a file
     let doc = workspace
         .write("README.md", "# Hello World\n\nThis is a test.")
         .await
         .expect("Failed to write");
-
     assert_eq!(doc.path, "README.md");
     assert!(doc.content.contains("Hello World"));
 
-    // Read it back
     let doc2 = workspace.read("README.md").await.expect("Failed to read");
     assert_eq!(doc2.content, "# Hello World\n\nThis is a test.");
-
-    // Cleanup
-    cleanup_user(&pool, user_id).await;
 }
 
 #[tokio::test]
 async fn test_workspace_append() {
-    let pool = get_pool();
-    let user_id = "test_append";
-    cleanup_user(&pool, user_id).await;
+    let (repo, _tmp) = make_repo(None).await;
+    let workspace = Workspace::new("test_append", repo);
 
-    let workspace = Workspace::new(user_id, pool.clone());
+    workspace.write("notes.md", "Line 1").await.expect("write");
+    workspace.append("notes.md", "Line 2").await.expect("append");
 
-    // Write initial content
-    workspace
-        .write("notes.md", "Line 1")
-        .await
-        .expect("Failed to write");
-
-    // Append more
-    workspace
-        .append("notes.md", "Line 2")
-        .await
-        .expect("Failed to append");
-
-    // Read and verify
-    let doc = workspace.read("notes.md").await.expect("Failed to read");
+    let doc = workspace.read("notes.md").await.expect("read");
     assert_eq!(doc.content, "Line 1\nLine 2");
-
-    cleanup_user(&pool, user_id).await;
 }
 
 #[tokio::test]
 async fn test_workspace_nested_paths() {
-    let pool = get_pool();
-    let user_id = "test_nested";
-    cleanup_user(&pool, user_id).await;
+    let (repo, _tmp) = make_repo(None).await;
+    let workspace = Workspace::new("test_nested", repo);
 
-    let workspace = Workspace::new(user_id, pool.clone());
-
-    // Write nested files
     workspace
         .write("projects/alpha/README.md", "# Alpha")
         .await
-        .expect("Failed to write alpha");
+        .expect("write alpha");
     workspace
         .write("projects/alpha/notes.md", "Notes here")
         .await
-        .expect("Failed to write notes");
+        .expect("write notes");
     workspace
         .write("projects/beta/README.md", "# Beta")
         .await
-        .expect("Failed to write beta");
+        .expect("write beta");
 
-    // List root
-    let root = workspace.list("").await.expect("Failed to list root");
+    let root = workspace.list("").await.expect("list root");
     assert_eq!(root.len(), 1); // just "projects/"
     assert!(root[0].is_directory);
     assert_eq!(root[0].name(), "projects");
 
-    // List projects
-    let projects = workspace
-        .list("projects")
-        .await
-        .expect("Failed to list projects");
+    let projects = workspace.list("projects").await.expect("list projects");
     assert_eq!(projects.len(), 2); // alpha/, beta/
 
-    // List alpha
-    let alpha = workspace
-        .list("projects/alpha")
-        .await
-        .expect("Failed to list alpha");
+    let alpha = workspace.list("projects/alpha").await.expect("list alpha");
     assert_eq!(alpha.len(), 2); // README.md, notes.md
-
-    cleanup_user(&pool, user_id).await;
 }
 
 #[tokio::test]
 async fn test_workspace_delete() {
-    let pool = get_pool();
-    let user_id = "test_delete";
-    cleanup_user(&pool, user_id).await;
+    let (repo, _tmp) = make_repo(None).await;
+    let workspace = Workspace::new("test_delete", repo);
 
-    let workspace = Workspace::new(user_id, pool.clone());
+    workspace.write("temp.md", "temporary").await.expect("write");
+    assert!(workspace.exists("temp.md").await.expect("exists"));
 
-    // Write and verify exists
-    workspace
-        .write("temp.md", "temporary")
-        .await
-        .expect("Failed to write");
-    assert!(workspace.exists("temp.md").await.expect("exists failed"));
-
-    // Delete
-    workspace.delete("temp.md").await.expect("Failed to delete");
-
-    // Verify gone
-    assert!(!workspace.exists("temp.md").await.expect("exists failed"));
-
-    cleanup_user(&pool, user_id).await;
+    workspace.delete("temp.md").await.expect("delete");
+    assert!(!workspace.exists("temp.md").await.expect("exists"));
 }
 
 #[tokio::test]
 async fn test_workspace_memory_operations() {
-    let pool = get_pool();
-    let user_id = "test_memory_ops";
-    cleanup_user(&pool, user_id).await;
+    let (repo, _tmp) = make_repo(None).await;
+    let workspace = Workspace::new("test_memory_ops", repo);
 
-    let workspace = Workspace::new(user_id, pool.clone());
-
-    // Append to memory
     workspace
         .append_memory("User prefers dark mode")
         .await
-        .expect("Failed to append memory");
+        .expect("append memory");
     workspace
         .append_memory("User's timezone is PST")
         .await
-        .expect("Failed to append memory");
+        .expect("append memory");
 
-    // Read memory
-    let memory = workspace.memory().await.expect("Failed to get memory");
+    let memory = workspace.memory().await.expect("get memory");
     assert!(memory.content.contains("dark mode"));
     assert!(memory.content.contains("PST"));
-    // Entries should be separated by double newline
     assert!(memory.content.contains("\n\n"));
-
-    cleanup_user(&pool, user_id).await;
 }
 
 #[tokio::test]
 async fn test_workspace_daily_log() {
-    let pool = get_pool();
-    let user_id = "test_daily_log";
-    cleanup_user(&pool, user_id).await;
+    let (repo, _tmp) = make_repo(None).await;
+    let workspace = Workspace::new("test_daily_log", repo);
 
-    let workspace = Workspace::new(user_id, pool.clone());
-
-    // Append to daily log (timestamped)
     workspace
         .append_daily_log("Started working on feature X")
         .await
-        .expect("Failed to append daily log");
+        .expect("append daily log");
 
-    // Read today's log
-    let log = workspace
-        .today_log()
-        .await
-        .expect("Failed to get today log");
+    let log = workspace.today_log().await.expect("today log");
     assert!(log.content.contains("feature X"));
-    // Should have timestamp prefix like [HH:MM:SS]
-    assert!(log.content.contains("["));
-
-    cleanup_user(&pool, user_id).await;
+    assert!(log.content.contains("[")); // timestamp prefix
 }
 
 #[tokio::test]
 async fn test_workspace_fts_search() {
-    let pool = get_pool();
-    let user_id = "test_fts_search";
-    cleanup_user(&pool, user_id).await;
+    let (repo, _tmp) = make_repo(None).await;
+    let workspace = Workspace::new("test_fts_search", repo);
 
-    let workspace = Workspace::new(user_id, pool.clone());
-
-    // Write some documents
     workspace
         .write(
             "docs/authentication.md",
             "# Authentication\n\nThe system uses JWT tokens for authentication.",
         )
         .await
-        .expect("write failed");
+        .expect("write");
     workspace
         .write(
             "docs/database.md",
             "# Database\n\nWe use PostgreSQL with pgvector for vector search.",
         )
         .await
-        .expect("write failed");
+        .expect("write");
     workspace
         .write(
             "docs/api.md",
             "# API\n\nThe REST API uses JSON for request and response bodies.",
         )
         .await
-        .expect("write failed");
+        .expect("write");
 
-    // Search for JWT (FTS only since no embeddings)
     let results = workspace
         .search_with_config("JWT authentication", SearchConfig::default().fts_only())
         .await
-        .expect("search failed");
-
+        .expect("search");
     assert!(!results.is_empty(), "Should find results for JWT");
     assert!(
         results[0].content.contains("JWT"),
         "Top result should contain JWT"
     );
 
-    // Search for PostgreSQL
     let results = workspace
         .search_with_config("PostgreSQL database", SearchConfig::default().fts_only())
         .await
-        .expect("search failed");
-
+        .expect("search");
     assert!(!results.is_empty(), "Should find results for PostgreSQL");
     assert!(
         results[0].content.contains("PostgreSQL"),
         "Top result should contain PostgreSQL"
     );
-
-    cleanup_user(&pool, user_id).await;
 }
 
 #[tokio::test]
 async fn test_workspace_hybrid_search_with_mock_embeddings() {
-    let pool = get_pool();
-    let user_id = "test_hybrid_search";
-    cleanup_user(&pool, user_id).await;
-
-    // Create workspace with mock embeddings (1536 dimensions to match OpenAI)
+    // 1536 dims to match the mock embedding provider.
+    let (repo, _tmp) = make_repo(Some(1536)).await;
     let embeddings = Arc::new(MockEmbeddings::new(1536));
-    let workspace = Workspace::new(user_id, pool.clone()).with_embeddings(embeddings);
+    let workspace = Workspace::new("test_hybrid_search", repo).with_embeddings(embeddings);
 
-    // Write documents
     workspace
-        .write(
-            "memory.md",
-            "The user prefers dark mode and vim keybindings.",
-        )
+        .write("memory.md", "The user prefers dark mode and vim keybindings.")
         .await
-        .expect("write failed");
+        .expect("write");
     workspace
-        .write(
-            "prefs.md",
-            "Settings: theme=dark, editor=vim, font=monospace",
-        )
+        .write("prefs.md", "Settings: theme=dark, editor=vim, font=monospace")
         .await
-        .expect("write failed");
+        .expect("write");
 
-    // Hybrid search
     let results = workspace
         .search("dark theme preference", 5)
         .await
-        .expect("search failed");
-
+        .expect("search");
     assert!(!results.is_empty(), "Should find results");
-    // At least one result should be a hybrid match (found by both FTS and vector)
-    // or we should have results from either method
-
-    cleanup_user(&pool, user_id).await;
 }
 
 #[tokio::test]
 async fn test_workspace_list_all() {
-    let pool = get_pool();
-    let user_id = "test_list_all";
-    cleanup_user(&pool, user_id).await;
+    let (repo, _tmp) = make_repo(None).await;
+    let workspace = Workspace::new("test_list_all", repo);
 
-    let workspace = Workspace::new(user_id, pool.clone());
-
-    // Write files at various depths
     workspace.write("README.md", "root").await.unwrap();
     workspace.write("docs/intro.md", "intro").await.unwrap();
     workspace.write("docs/api/rest.md", "rest").await.unwrap();
     workspace.write("src/main.md", "main").await.unwrap();
 
-    // List all
-    let all = workspace.list_all().await.expect("list_all failed");
+    let all = workspace.list_all().await.expect("list_all");
     assert_eq!(all.len(), 4);
     assert!(all.contains(&"README.md".to_string()));
     assert!(all.contains(&"docs/intro.md".to_string()));
     assert!(all.contains(&"docs/api/rest.md".to_string()));
     assert!(all.contains(&"src/main.md".to_string()));
-
-    cleanup_user(&pool, user_id).await;
 }
 
 #[tokio::test]
 async fn test_workspace_system_prompt() {
-    let pool = get_pool();
-    let user_id = "test_system_prompt";
-    cleanup_user(&pool, user_id).await;
+    let (repo, _tmp) = make_repo(None).await;
+    let workspace = Workspace::new("test_system_prompt", repo);
 
-    let workspace = Workspace::new(user_id, pool.clone());
-
-    // Write identity files
     workspace
         .write(paths::AGENTS, "You are a helpful assistant.")
         .await
@@ -346,21 +241,8 @@ async fn test_workspace_system_prompt() {
         .unwrap();
     workspace.write(paths::USER, "Name: Alice").await.unwrap();
 
-    // Get system prompt
-    let prompt = workspace
-        .system_prompt()
-        .await
-        .expect("system_prompt failed");
-
-    assert!(
-        prompt.contains("helpful assistant"),
-        "Should include AGENTS.md"
-    );
-    assert!(
-        prompt.contains("kind and thorough"),
-        "Should include SOUL.md"
-    );
+    let prompt = workspace.system_prompt().await.expect("system_prompt");
+    assert!(prompt.contains("helpful assistant"), "Should include AGENTS.md");
+    assert!(prompt.contains("kind and thorough"), "Should include SOUL.md");
     assert!(prompt.contains("Alice"), "Should include USER.md");
-
-    cleanup_user(&pool, user_id).await;
 }

@@ -61,7 +61,6 @@ pub use vector_store::{VectorHit, VectorStore};
 use std::sync::Arc;
 
 use chrono::{NaiveDate, Utc};
-use deadpool_postgres::Pool;
 use uuid::Uuid;
 
 use crate::error::WorkspaceError;
@@ -99,12 +98,12 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    /// Create a new workspace for a user.
-    pub fn new(user_id: impl Into<String>, pool: Pool) -> Self {
+    /// Create a new workspace for a user over the given (shared) repository.
+    pub fn new(user_id: impl Into<String>, repo: Repository) -> Self {
         Self {
             user_id: user_id.into(),
             agent_id: None,
-            repo: Repository::new(pool),
+            repo,
             embeddings: None,
         }
     }
@@ -119,25 +118,6 @@ impl Workspace {
     pub fn with_embeddings(mut self, provider: Arc<dyn EmbeddingProvider>) -> Self {
         self.embeddings = Some(provider);
         self
-    }
-
-    /// Attach a shared embedvec-backed vector store for semantic search.
-    ///
-    /// Pass the same `Arc` to every workspace in the process: the underlying
-    /// Fjall keyspace allows a single writer, so the index must be shared.
-    pub fn with_vector_store(self, vector_store: Arc<VectorStore>) -> Self {
-        let Self {
-            user_id,
-            agent_id,
-            repo,
-            embeddings,
-        } = self;
-        Self {
-            user_id,
-            agent_id,
-            repo: repo.with_vector_store(vector_store),
-            embeddings,
-        }
     }
 
     /// Get the user ID.
@@ -464,6 +444,8 @@ impl Workspace {
                 .await?;
         }
 
+        // Make the freshly-indexed chunks searchable (single FTS commit).
+        self.repo.commit_search_index().await?;
         Ok(())
     }
 
