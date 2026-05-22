@@ -59,11 +59,13 @@
 //! ```
 
 mod crypto;
+mod fjall_store;
 pub mod keychain;
 mod store;
 mod types;
 
 pub use crypto::SecretsCrypto;
+pub use fjall_store::FjallSecretsStore;
 pub use store::{PostgresSecretsStore, SecretsStore};
 pub use types::{
     CreateSecretParams, CredentialLocation, CredentialMapping, DecryptedSecret, Secret,

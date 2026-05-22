@@ -13,7 +13,7 @@ use uuid::Uuid;
 /// A stored secret with encrypted value.
 ///
 /// The plaintext is never stored; only the encrypted form exists in the database.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Secret {
     pub id: Uuid,
     pub user_id: String,
