@@ -43,6 +43,8 @@
 mod chunker;
 mod document;
 mod embeddings;
+mod fjall_store;
+mod fts_index;
 mod repository;
 mod search;
 mod vector_store;
@@ -50,6 +52,8 @@ mod vector_store;
 pub use chunker::{ChunkConfig, chunk_document};
 pub use document::{MemoryChunk, MemoryDocument, WorkspaceEntry, paths};
 pub use embeddings::{EmbeddingProvider, MockEmbeddings, NearAiEmbeddings, OpenAiEmbeddings};
+pub use fjall_store::FjallStore;
+pub use fts_index::{FtsHit, FtsIndex};
 pub use repository::Repository;
 pub use search::{SearchConfig, SearchResult};
 pub use vector_store::{VectorHit, VectorStore};

@@ -96,6 +96,8 @@ http-body-util = "0.1"
 bytes = "1"
 base64 = "0.22.1"
 embedvec = "0.8.0"
+fjall = "2.11"
+tantivy = "0.25.0"
 
 # macOS keychain
 [target.'cfg(target_os = "macos")'.dependencies]
