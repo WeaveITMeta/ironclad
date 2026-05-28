@@ -873,10 +873,34 @@ impl Agent {
                     // into making up tool calls). Trust the model: if it
                     // wanted tools it would have called them.
                     let _ = tools_executed; // silence dead-warn until removed
+                    let preview = if text.len() > 800 {
+                        format!("{}... ({} chars total)", &text[..800], text.len())
+                    } else {
+                        text.clone()
+                    };
+                    tracing::info!("💬 claude (text, iter {}): {}", iteration, preview);
                     return Ok(AgenticLoopResult::Response(text));
                 }
                 RespondResult::ToolCalls(tool_calls) => {
                     tools_executed = true;
+                    let call_summary: Vec<String> = tool_calls
+                        .iter()
+                        .map(|tc| {
+                            let args = tc.arguments.to_string();
+                            let short = if args.len() > 200 {
+                                format!("{}...", &args[..200])
+                            } else {
+                                args
+                            };
+                            format!("{}({})", tc.name, short)
+                        })
+                        .collect();
+                    tracing::info!(
+                        "🔧 claude (iter {}) wants {} tool(s): [{}]",
+                        iteration,
+                        tool_calls.len(),
+                        call_summary.join(", ")
+                    );
 
                     // Add the assistant message with tool_calls to context.
                     // OpenAI-compatible APIs require this before tool-result messages.
@@ -996,9 +1020,20 @@ impl Agent {
                             )
                             .await;
 
-                        let tool_result = self
-                            .execute_chat_tool(&tc.name, &tc.arguments, &job_ctx)
-                            .await;
+                        // Use the full variant so we can plumb any images
+                        // the tool attached into the Claude tool_result.
+                        // Split the tuple immediately so the rest of the
+                        // bookkeeping (status updates, thread logging,
+                        // auth-await detection) can keep operating on a
+                        // plain `Result<String, _>`.
+                        let (tool_result, tool_images): (Result<String, Error>, Vec<String>) =
+                            match self
+                                .execute_chat_tool_full(&tc.name, &tc.arguments, &job_ctx)
+                                .await
+                            {
+                                Ok((text, images)) => (Ok(text), images),
+                                Err(e) => (Err(e), Vec::new()),
+                            };
 
                         let _ = self
                             .channels
@@ -1091,10 +1126,11 @@ impl Agent {
                             Err(e) => format!("Error: {}", e),
                         };
 
-                        context_messages.push(ChatMessage::tool_result(
+                        context_messages.push(ChatMessage::tool_result_with_images(
                             &tc.id,
                             &tc.name,
                             result_content,
+                            tool_images,
                         ));
                     }
                 }
@@ -1103,12 +1139,29 @@ impl Agent {
     }
 
     /// Execute a tool for chat (without full job context).
+    /// Backwards-compatible wrapper that returns just the serialized text
+    /// result. Used by callers that don't care about vision content.
     async fn execute_chat_tool(
         &self,
         tool_name: &str,
         params: &serde_json::Value,
         job_ctx: &JobContext,
     ) -> Result<String, Error> {
+        self.execute_chat_tool_full(tool_name, params, job_ctx)
+            .await
+            .map(|(text, _images)| text)
+    }
+
+    /// Returns the tool's text result plus any base64 PNG images it
+    /// attached via `ToolOutput::with_images`. The agent loop calls this
+    /// version so it can plumb image content into the `tool_result`
+    /// message that goes back to Claude.
+    async fn execute_chat_tool_full(
+        &self,
+        tool_name: &str,
+        params: &serde_json::Value,
+        job_ctx: &JobContext,
+    ) -> Result<(String, Vec<String>), Error> {
         let tool =
             self.tools()
                 .get(tool_name)
@@ -1133,28 +1186,58 @@ impl Agent {
             .into());
         }
 
-        // Execute with timeout
-        let result = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        // Verbose tool-call logging. Truncate args so a 30KB image base64
+        // doesn't fill the terminal.
+        let args_preview = {
+            let s = params.to_string();
+            if s.len() > 400 { format!("{}... ({} bytes)", &s[..400], s.len()) } else { s }
+        };
+        tracing::info!("→ tool '{}' invoked with {}", tool_name, args_preview);
+        let started = std::time::Instant::now();
+
+        // Execute with timeout. 180s ceiling because browser tool calls
+        // (Playwright navigate, snapshot a heavy page, wait_for) can take
+        // 60-120s legitimately. The MCP HTTP client itself has a 120s
+        // per-request budget; we want the outer wrapper to give it room
+        // to surface a clean error instead of pre-empting it.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(180), async {
             tool.execute(params.clone(), job_ctx).await
         })
         .await
-        .map_err(|_| crate::error::ToolError::Timeout {
-            name: tool_name.to_string(),
-            timeout: std::time::Duration::from_secs(60),
+        .map_err(|_| {
+            tracing::error!("← tool '{}' TIMED OUT after 180s", tool_name);
+            crate::error::ToolError::Timeout {
+                name: tool_name.to_string(),
+                timeout: std::time::Duration::from_secs(180),
+            }
         })?
-        .map_err(|e| crate::error::ToolError::ExecutionFailed {
-            name: tool_name.to_string(),
-            reason: e.to_string(),
+        .map_err(|e| {
+            tracing::error!("← tool '{}' FAILED in {:?}: {}", tool_name, started.elapsed(), e);
+            crate::error::ToolError::ExecutionFailed {
+                name: tool_name.to_string(),
+                reason: e.to_string(),
+            }
         })?;
+        let result_preview = {
+            let s = serde_json::to_string(&result.result).unwrap_or_default();
+            if s.len() > 400 { format!("{}... ({} bytes)", &s[..400], s.len()) } else { s }
+        };
+        tracing::info!(
+            "← tool '{}' ok in {:?}: {}",
+            tool_name,
+            started.elapsed(),
+            result_preview
+        );
 
-        // Convert result to string
-        serde_json::to_string_pretty(&result.result).map_err(|e| {
+        // Convert result to string + harvest the images list for the
+        // caller to splice into the tool_result message.
+        let text = serde_json::to_string_pretty(&result.result).map_err(|e| {
             crate::error::ToolError::ExecutionFailed {
                 name: tool_name.to_string(),
                 reason: format!("Failed to serialize result: {}", e),
             }
-            .into()
-        })
+        })?;
+        Ok((text, result.images))
     }
 
     /// Handle job-related intents without turn tracking.

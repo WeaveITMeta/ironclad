@@ -226,9 +226,23 @@ async fn main() -> anyhow::Result<()> {
 
     // LLM auth is done via API key (ANTHROPIC_API_KEY). No session manager needed.
 
-    // Initialize tracing
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("ironclad=info,tower_http=debug"));
+    // Initialize tracing. Default filter is verbose by design so the
+    // terminal shows what Claude says, what tools fire, and the MCP
+    // request/response chatter without the user having to set RUST_LOG.
+    // Specific subsystems are bumped to DEBUG where the bulk of the
+    // observability lives (MCP transport, tool execution, gateway HTTP).
+    // Override with `RUST_LOG=ironclad=info` if you want it quieter.
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(
+            "ironclad=debug,\
+             ironclad::tools::mcp=debug,\
+             ironclad::agent::agent_loop=info,\
+             ironclad::llm::anthropic=debug,\
+             tower_http=debug,\
+             hyper=info,\
+             reqwest=info",
+        )
+    });
 
     // Create log broadcaster before tracing init so the WebLogLayer can capture all events.
     // This gets wired to the gateway's /api/logs/events SSE endpoint later.
@@ -334,6 +348,9 @@ async fn main() -> anyhow::Result<()> {
     // plus monitor enumeration and snap-zone window placement. Reads
     // auto-approve; writes pop the banner.
     tools.register_windows_desktop_tools();
+    // Self-diagnostic log query. Needs the LogBroadcaster which was
+    // built before tracing init.
+    tools.register_recent_logs_tool(Arc::clone(&log_broadcaster));
 
     // Build Sonnet + Opus providers up-front (cheap; just clones the
     // AnthropicConfig with model override). We hold them here and register
@@ -532,7 +549,11 @@ async fn main() -> anyhow::Result<()> {
                                     return;
                                 }
                                 (false, _) => {
-                                    McpClient::new_with_name(&server_name, &server.url)
+                                    McpClient::new_with_name(
+                                        &server_name,
+                                        &server.url,
+                                        Arc::clone(&mcp_sm),
+                                    )
                                 }
                             };
 
@@ -929,13 +950,141 @@ async fn main() -> anyhow::Result<()> {
     // sub-agent dispatcher so spawn_agent's background tasks can broadcast
     // their completion summaries back to McKale as unsolicited assistant
     // messages.
-    if let Some((sonnet, opus)) = subagent_providers {
-        tools.register_spawn_agent_tool(
-            sonnet,
-            opus,
-            Arc::clone(&channels),
-            Arc::clone(&context_manager),
-        );
+    let sonnet_for_autonomous: Option<Arc<dyn ironclad::llm::LlmProvider>> =
+        if let Some((sonnet, opus)) = subagent_providers {
+            let sonnet_clone = Arc::clone(&sonnet);
+            tools.register_spawn_agent_tool(
+                sonnet,
+                opus,
+                Arc::clone(&channels),
+                Arc::clone(&context_manager),
+            );
+            Some(sonnet_clone)
+        } else {
+            None
+        };
+
+    // Autonomous loop: opt-in via AUTONOMOUS_LOOP_ENABLED=true. Runs in
+    // parallel with the main agent message loop on its own timer; uses
+    // Sonnet so it's cheaper than the main brain. Pushes summaries
+    // through a notify channel into the broadcaster so they land in the
+    // JARVIS transcript like any other assistant message. Voice is
+    // gated by a sentinel the model writes in its final response.
+    if std::env::var("AUTONOMOUS_LOOP_ENABLED").as_deref() == Ok("true") {
+        match (sonnet_for_autonomous, workspace.as_ref()) {
+            (Some(sonnet_llm), Some(workspace_arc)) => {
+                let workspace_for_loop = Arc::clone(workspace_arc);
+                let interval_secs: u64 = std::env::var("AUTONOMOUS_LOOP_INTERVAL_SECS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(300);
+                let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel::<
+                    ironclad::channels::OutgoingResponse,
+                >(32);
+                let channels_fwd = Arc::clone(&channels);
+                let notify_user = std::env::var("AUTONOMOUS_LOOP_USER")
+                    .unwrap_or_else(|_| "default".to_string());
+                tokio::spawn(async move {
+                    while let Some(resp) = notify_rx.recv().await {
+                        let results = channels_fwd.broadcast_all(&notify_user, resp).await;
+                        for (ch, result) in results {
+                            if let Err(e) = result {
+                                tracing::warn!(
+                                    "autonomous loop broadcast to {} failed: {}",
+                                    ch,
+                                    e
+                                );
+                            }
+                        }
+                    }
+                });
+
+                // Least-privilege allow list for stabilization. Pulled
+                // from the conversation: observe widely, act narrowly,
+                // never delete or create desktops.
+                let allowed: std::collections::HashSet<String> = [
+                    // observe / read
+                    "recent_logs",
+                    "claude_code_transcript_tail",
+                    "windows_get_input_focus",
+                    "windows_screenshot_foreground",
+                    "windows_list_monitors",
+                    "windows_list_desktops",
+                    "vault_read",
+                    "vault_search",
+                    "vault_list",
+                    "memory_read",
+                    "memory_search",
+                    "memory_tree",
+                    "list_my_tools",
+                    "mission_lookup",
+                    "time",
+                    "json",
+                    "github_list_prs",
+                    "github_list_issues",
+                    "github_list_repos",
+                    "github_recent_commits",
+                    "github_get_pr",
+                    "read_file",
+                    "list_dir",
+                    // act / write — narrow but covers the build-itself loop
+                    "spawn_agent",
+                    "windows_focus_window",
+                    "windows_type_text",
+                    "windows_press_key",
+                    "windows_switch_desktop",
+                    "windows_snap_window",
+                    "windows_move_window_to_desktop",
+                    "vault_write",
+                    "vault_move",
+                    "memory_write",
+                    "write_file",
+                    "apply_patch",
+                    "shell",
+                ]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+
+                let mut denied = std::collections::HashSet::new();
+                denied.insert("vault_delete".to_string());
+                denied.insert("windows_new_desktop".to_string());
+
+                let config = ironclad::agent::AutonomousLoopConfig {
+                    interval: std::time::Duration::from_secs(interval_secs),
+                    enabled: true,
+                    max_iterations_per_tick: 6,
+                    max_failures: 3,
+                    notify_user_id: std::env::var("AUTONOMOUS_LOOP_USER")
+                        .unwrap_or_else(|_| "default".to_string()),
+                    notify_channel: "gateway".to_string(),
+                    allowed: Some(allowed),
+                    denied,
+                };
+
+                ironclad::agent::spawn_autonomous_loop(
+                    config,
+                    workspace_for_loop,
+                    sonnet_llm,
+                    Arc::clone(&tools),
+                    Some(notify_tx),
+                );
+                tracing::info!(
+                    "🤖 autonomous loop spawned, interval={}s, model=Sonnet",
+                    interval_secs
+                );
+            }
+            (None, _) => {
+                tracing::warn!(
+                    "AUTONOMOUS_LOOP_ENABLED=true but Sonnet provider not built; skipping"
+                );
+            }
+            (_, None) => {
+                tracing::warn!(
+                    "AUTONOMOUS_LOOP_ENABLED=true but no workspace (DB unavailable); skipping"
+                );
+            }
+        }
     }
 
     // Create and run the agent
@@ -980,10 +1129,11 @@ async fn bootstrap_jarvis_identity(workspace: &Arc<ironclad::workspace::Workspac
     // and reach the LLM on the next restart. USER.md is create-once so
     // McKale's edits survive.
     let defaults: &[(&str, &str, bool)] = &[
-        ("IDENTITY.md", include_str!("../workspace_seed/IDENTITY.md"), true),
-        ("SOUL.md",     include_str!("../workspace_seed/SOUL.md"),     true),
-        ("AGENTS.md",   include_str!("../workspace_seed/AGENTS.md"),   true),
-        ("USER.md",     include_str!("../workspace_seed/USER.md"),     false),
+        ("IDENTITY.md",   include_str!("../workspace_seed/IDENTITY.md"),   true),
+        ("SOUL.md",       include_str!("../workspace_seed/SOUL.md"),       true),
+        ("AGENTS.md",     include_str!("../workspace_seed/AGENTS.md"),     true),
+        ("AUTONOMOUS.md", include_str!("../workspace_seed/AUTONOMOUS.md"), true),
+        ("USER.md",       include_str!("../workspace_seed/USER.md"),       false),
     ];
     for (path, content, always_overwrite) in defaults {
         if *always_overwrite {

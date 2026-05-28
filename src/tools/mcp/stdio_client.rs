@@ -196,6 +196,15 @@ impl StdioMcpClient {
         });
         let mut line = serde_json::to_string(&req)
             .map_err(|e| ToolError::ExternalService(format!("serialize request: {}", e)))?;
+        let req_preview = if line.len() > 400 {
+            format!("{}... ({} bytes)", &line[..400], line.len())
+        } else {
+            line.clone()
+        };
+        tracing::debug!(
+            "mcp[{}/stdio] → {} :: {}",
+            self.server_name, method, req_preview
+        );
         line.push('\n');
 
         let (tx, rx) = oneshot::channel();
@@ -210,7 +219,16 @@ impl StdioMcpClient {
         }
 
         match tokio::time::timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS), rx).await {
-            Ok(Ok(resp)) => Ok(resp),
+            Ok(Ok(resp)) => {
+                let resp_preview = serde_json::to_string(&resp).unwrap_or_default();
+                let p = if resp_preview.len() > 400 {
+                    format!("{}... ({} bytes)", &resp_preview[..400], resp_preview.len())
+                } else {
+                    resp_preview
+                };
+                tracing::debug!("mcp[{}/stdio] ← :: {}", self.server_name, p);
+                Ok(resp)
+            }
             Ok(Err(_)) => {
                 self.pending.lock().await.remove(&id);
                 Err(ToolError::ExternalService(format!(

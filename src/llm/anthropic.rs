@@ -650,12 +650,31 @@ fn convert_messages(msgs: Vec<ChatMessage>) -> (Option<String>, Vec<AnthropicMes
             }
             Role::Tool => {
                 let tool_use_id = m.tool_call_id.unwrap_or_default();
+                // If the tool attached images, emit them as standalone
+                // image blocks AFTER the text-only tool_result. Anthropic's
+                // tool_result content field is strict text-only, but the
+                // adjacent image blocks in the same user message get
+                // associated with the just-completed tool call by Claude
+                // automatically — this is the documented pattern for
+                // tools returning vision content.
+                let mut blocks: Vec<ContentBlock> = vec![ContentBlock::ToolResult {
+                    tool_use_id,
+                    content: m.content,
+                }];
+                if let Some(imgs) = m.images.as_ref().filter(|v| !v.is_empty()) {
+                    for data in imgs {
+                        blocks.push(ContentBlock::Image {
+                            source: ImageSource {
+                                source_type: "base64".to_string(),
+                                media_type: "image/png".to_string(),
+                                data: data.clone(),
+                            },
+                        });
+                    }
+                }
                 out.push(AnthropicMessage {
                     role: "user".to_string(),
-                    content: AnthropicContent::Blocks(vec![ContentBlock::ToolResult {
-                        tool_use_id,
-                        content: m.content,
-                    }]),
+                    content: AnthropicContent::Blocks(blocks),
                 });
             }
         }

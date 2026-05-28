@@ -254,6 +254,7 @@ pub(crate) struct MonitorInfo {
 #[cfg(target_os = "windows")]
 pub(crate) fn enumerate_monitors() -> Result<Vec<MonitorInfo>, String> {
     use std::cell::RefCell;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
     use windows::Win32::Foundation::{BOOL, LPARAM, RECT, TRUE};
     use windows::Win32::Graphics::Gdi::{
         EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
@@ -296,13 +297,26 @@ pub(crate) fn enumerate_monitors() -> Result<Vec<MonitorInfo>, String> {
         TRUE
     }
 
-    MONS.with(|v| v.borrow_mut().clear());
-    unsafe {
-        if !EnumDisplayMonitors(HDC(0), None, Some(cb), LPARAM(0)).as_bool() {
-            return Err("EnumDisplayMonitors returned false".to_string());
+    // Wrap the unsafe FFI in catch_unwind so a Rust panic inside the
+    // callback (or a downstream slice/copy issue) returns a clean error
+    // instead of unwinding through the extern "system" boundary, which
+    // would be UB. Doesn't catch a native access violation from the OS —
+    // those bypass Rust's unwind machinery — but it does close the
+    // most-likely failure modes.
+    let result: Result<Result<(), String>, _> = catch_unwind(AssertUnwindSafe(|| {
+        MONS.with(|v| v.borrow_mut().clear());
+        unsafe {
+            if !EnumDisplayMonitors(HDC(0), None, Some(cb), LPARAM(0)).as_bool() {
+                return Err("EnumDisplayMonitors returned false".to_string());
+            }
         }
+        Ok(())
+    }));
+    match result {
+        Ok(Ok(())) => Ok(MONS.with(|v| v.borrow().clone())),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err("enumerate_monitors panicked inside Win32 callback".to_string()),
     }
-    Ok(MONS.with(|v| v.borrow().clone()))
 }
 
 #[cfg(target_os = "windows")]

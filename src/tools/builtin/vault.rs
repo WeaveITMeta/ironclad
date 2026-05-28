@@ -429,14 +429,44 @@ impl Tool for VaultSearchTool {
             )));
         }
 
+        // Tokenize the query. Whole-string substring matching used to be
+        // the algorithm here, which meant "UACI incubator Eustress draft"
+        // never found a file titled "UACI Incubator Application Eustress
+        // Engine" because the exact phrase isn't in the file. JARVIS would
+        // then truthfully report "no results" and the user would assume
+        // the file didn't exist. Real bug.
+        //
+        // New behavior: split the query into tokens, drop stopwords, and
+        // require every remaining token to appear (in filename OR body).
+        // Score by how many distinct tokens matched, sort descending.
+        const STOPWORDS: &[&str] = &[
+            "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if", "in", "into",
+            "is", "it", "no", "not", "of", "on", "or", "such", "that", "the", "their", "then",
+            "there", "these", "they", "this", "to", "was", "will", "with",
+        ];
         let query_lc = query.to_lowercase();
-        let mut hits: Vec<serde_json::Value> = Vec::new();
+        let tokens: Vec<String> = query_lc
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| !t.is_empty() && !STOPWORDS.contains(t))
+            .map(String::from)
+            .collect();
+        // Fall back to the raw query if every token was a stopword.
+        let effective_tokens: Vec<String> = if tokens.is_empty() {
+            vec![query_lc.clone()]
+        } else {
+            tokens
+        };
+
+        struct ScoredHit {
+            path: String,
+            tokens_matched: usize,
+            snippet: String,
+        }
+
+        let mut scored: Vec<ScoredHit> = Vec::new();
         let mut visited_files = 0usize;
         let mut stack: Vec<PathBuf> = vec![base.clone()];
         while let Some(dir) = stack.pop() {
-            if hits.len() >= limit {
-                break;
-            }
             let mut rd = match tokio::fs::read_dir(&dir).await {
                 Ok(r) => r,
                 Err(_) => continue,
@@ -465,48 +495,77 @@ impl Tool for VaultSearchTool {
                 let rel = path.strip_prefix(&base).unwrap_or(&path);
                 let rel_str = rel.to_string_lossy().replace('\\', "/");
                 let name_lc = name.to_lowercase();
-                let mut snippet: Option<String> = None;
-                let mut matched = false;
-                if name_lc.contains(&query_lc) {
-                    matched = true;
-                    snippet = Some(format!("(filename match) {}", rel_str));
-                }
-                if !matched {
-                    if let Ok(body) = tokio::fs::read_to_string(&path).await {
-                        let body_lc = body.to_lowercase();
-                        if let Some(idx) = body_lc.find(&query_lc) {
-                            matched = true;
-                            // Pull ~60 chars on each side as a snippet.
-                            let lo = idx.saturating_sub(60);
-                            let hi = (idx + query.len() + 60).min(body.len());
-                            let raw = &body[lo..hi];
-                            // Collapse internal whitespace runs for readability.
-                            let cleaned: String = raw
-                                .chars()
-                                .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
-                                .collect::<String>()
-                                .split_whitespace()
-                                .collect::<Vec<_>>()
-                                .join(" ");
-                            snippet = Some(cleaned);
+
+                // Read body once (the OS cache makes this cheap on repeats).
+                let body = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+                let body_lc = body.to_lowercase();
+                let haystack = format!("{} {}", name_lc, body_lc);
+
+                let mut tokens_matched = 0;
+                let mut first_body_hit_idx: Option<usize> = None;
+                for tok in &effective_tokens {
+                    if haystack.contains(tok) {
+                        tokens_matched += 1;
+                        if first_body_hit_idx.is_none() {
+                            if let Some(i) = body_lc.find(tok) {
+                                first_body_hit_idx = Some(i);
+                            }
                         }
                     }
                 }
-                if matched {
-                    hits.push(serde_json::json!({
-                        "path": rel_str,
-                        "snippet": snippet.unwrap_or_default(),
-                    }));
-                    if hits.len() >= limit {
-                        break;
-                    }
+
+                if tokens_matched < effective_tokens.len() {
+                    continue;
                 }
+
+                // Snippet: prefer a body excerpt around the first hit; if
+                // every token only matched in the filename, surface that.
+                let snippet = if let Some(idx) = first_body_hit_idx {
+                    let lo = idx.saturating_sub(60);
+                    let hi = (idx + 120).min(body.len());
+                    let raw = &body[lo..hi];
+                    raw.chars()
+                        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+                        .collect::<String>()
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                } else {
+                    format!("(filename match) {}", rel_str)
+                };
+
+                scored.push(ScoredHit {
+                    path: rel_str,
+                    tokens_matched,
+                    snippet,
+                });
             }
         }
+
+        // Rank: most tokens matched first. Within equal scores, shorter
+        // paths win (canonical files tend to live higher in the tree).
+        scored.sort_by(|a, b| {
+            b.tokens_matched
+                .cmp(&a.tokens_matched)
+                .then_with(|| a.path.len().cmp(&b.path.len()))
+        });
+        scored.truncate(limit);
+
+        let hits: Vec<serde_json::Value> = scored
+            .into_iter()
+            .map(|h| {
+                serde_json::json!({
+                    "path": h.path,
+                    "snippet": h.snippet,
+                    "tokens_matched": h.tokens_matched,
+                })
+            })
+            .collect();
 
         Ok(ToolOutput::success(
             serde_json::json!({
                 "query": query,
+                "tokens": effective_tokens,
                 "hits": hits,
                 "count": hits.len(),
                 "files_scanned": visited_files,

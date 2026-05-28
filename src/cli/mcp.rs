@@ -353,8 +353,10 @@ async fn test_server(name: String, user_id: String) -> anyhow::Result<()> {
         println!();
         return Ok(());
     } else {
-        // No OAuth and no tokens - try unauthenticated
-        McpClient::new_with_name(&server.name, &server.url)
+        // No OAuth and no tokens - try unauthenticated. Pass the session
+        // manager so the Streamable HTTP transport can carry the
+        // Mcp-Session-Id header across initialize -> tools/list.
+        McpClient::new_with_name(&server.name, &server.url, session_manager)
     };
 
     // Test connection

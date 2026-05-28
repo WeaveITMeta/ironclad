@@ -46,6 +46,13 @@ pub struct ToolOutput {
     /// Raw output before sanitization (for debugging).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw: Option<String>,
+    /// Optional base64-encoded PNG images this tool wants Claude to see
+    /// as actual vision content (not just text). The agent loop plumbs
+    /// these into the `tool_result` message as image content blocks so
+    /// Anthropic's vision model can read pixel data directly. Strip the
+    /// `data:image/png;base64,` prefix before pushing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
 }
 
 impl ToolOutput {
@@ -56,6 +63,7 @@ impl ToolOutput {
             cost: None,
             duration,
             raw: None,
+            images: Vec::new(),
         }
     }
 
@@ -66,7 +74,14 @@ impl ToolOutput {
             cost: None,
             duration,
             raw: None,
+            images: Vec::new(),
         }
+    }
+
+    /// Attach base64-encoded PNG images so Claude sees them as vision.
+    pub fn with_images(mut self, images: Vec<String>) -> Self {
+        self.images = images;
+        self
     }
 
     /// Set the cost.

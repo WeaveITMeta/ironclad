@@ -54,19 +54,40 @@ impl Tool for WindowsListDesktopsTool {
         #[cfg(target_os = "windows")]
         {
             let (count, current_idx, names) = tokio::task::spawn_blocking(|| {
-                let desktops = winvd::get_desktops()
-                    .map_err(|e| format!("get_desktops: {:?}", e))?;
-                let current = winvd::get_current_desktop()
-                    .map_err(|e| format!("get_current_desktop: {:?}", e))?;
-                let current_idx = current
-                    .get_index()
-                    .map_err(|e| format!("current index: {:?}", e))?;
-                let mut names = Vec::new();
-                for d in &desktops {
-                    let n = d.get_name().unwrap_or_default();
-                    names.push(n);
+                // catch_unwind around the winvd COM calls. winvd talks to
+                // undocumented Windows COM interfaces whose vtable layouts
+                // can shift between Win11 builds — a Rust panic inside its
+                // shim would otherwise propagate as UB. A native SEH
+                // access violation bypasses this and still crashes (those
+                // are the 0xC0000005 exits); for those we need WER /
+                // minidump-level handling, which is out of scope here.
+                use std::panic::{catch_unwind, AssertUnwindSafe};
+                let result: Result<Result<(usize, u32, Vec<String>), String>, _> =
+                    catch_unwind(AssertUnwindSafe(|| {
+                        let desktops = winvd::get_desktops()
+                            .map_err(|e| format!("get_desktops: {:?}", e))?;
+                        let current = winvd::get_current_desktop()
+                            .map_err(|e| format!("get_current_desktop: {:?}", e))?;
+                        let current_idx = current
+                            .get_index()
+                            .map_err(|e| format!("current index: {:?}", e))?;
+                        let mut names = Vec::new();
+                        for d in &desktops {
+                            let n = d.get_name().unwrap_or_default();
+                            names.push(n);
+                        }
+                        Ok((desktops.len(), current_idx, names))
+                    }));
+                match result {
+                    Ok(Ok(v)) => Ok(v),
+                    Ok(Err(e)) => Err(e),
+                    Err(_) => Err(
+                        "winvd panicked inside get_desktops; likely COM vtable mismatch \
+                         (Win11 build vs. winvd 0.0.46). Try WINDOWS_DESKTOP_TOOLS=0 \
+                         to disable these tools."
+                            .to_string(),
+                    ),
                 }
-                Ok::<_, String>((desktops.len(), current_idx, names))
             })
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("join: {e}")))?
@@ -507,6 +528,8 @@ pub(crate) fn find_window_handle(
         }
     }
 
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
     let mut state = State {
         process_lower,
         title_lower,
@@ -516,9 +539,16 @@ pub(crate) fn find_window_handle(
     // returning, so the 'static cast never escapes the function.
     let state_ptr: *mut State<'static> = unsafe { std::mem::transmute(&mut state as *mut State) };
     STATE.with(|s| *s.borrow_mut() = Some(state_ptr));
-    unsafe {
+    // Wrap the EnumWindows call (and the synchronous callbacks it fires
+    // for every top-level window) in catch_unwind. A panic inside the
+    // callback would otherwise unwind through the extern "system" FFI
+    // boundary — undefined behavior on Windows. Native SEH segfaults
+    // bypass this and still crash the process, but at least a stray
+    // Rust panic (slice OOB, OpenProcess returning bad handles, etc.)
+    // gets contained.
+    let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
         let _ = EnumWindows(Some(enum_proc), LPARAM(0));
-    }
+    }));
     STATE.with(|s| *s.borrow_mut() = None);
 
     state.found

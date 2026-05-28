@@ -44,8 +44,14 @@ pub async fn pin_pip() -> Result<(), String> {
                 .dyn_into()
                 .map_err(|_| "not a canvas".to_string())?;
             c.set_id(CANVAS_ID);
-            c.set_width(2);
-            c.set_height(2);
+            // 240x240 is big enough to look sharp in Chrome's PiP overlay
+            // (~300px wide by default) and small enough for the
+            // requestAnimationFrame loop in pip-animation.js to stay
+            // under 1% CPU. The flat 2x2 cyan square it replaced looked
+            // unfinished; this gives the PiP video an arc-reactor pulse
+            // animation that matches the dashboard aesthetic.
+            c.set_width(240);
+            c.set_height(240);
             // Off-screen but in the DOM tree (required for captureStream).
             c.style().set_property("position", "fixed").ok();
             c.style().set_property("left", "-9999px").ok();
@@ -54,12 +60,13 @@ pub async fn pin_pip() -> Result<(), String> {
                 body.append_child(&c)
                     .map_err(|e| format!("append canvas: {:?}", e))?;
             }
-            // Paint one frame so captureStream has content to emit.
+            // Initial paint so the captureStream has SOMETHING before the
+            // animation loop kicks in. The JS animation overwrites this.
             if let Some(Ok(ctx)) = c.get_context("2d").ok().and_then(|opt| {
                 opt.map(|o| o.dyn_into::<web_sys::CanvasRenderingContext2d>())
             }) {
-                ctx.set_fill_style_str("#06b6d4");
-                ctx.fill_rect(0.0, 0.0, 2.0, 2.0);
+                ctx.set_fill_style_str("#020617");
+                ctx.fill_rect(0.0, 0.0, 240.0, 240.0);
             }
             c
         }
@@ -93,6 +100,19 @@ pub async fn pin_pip() -> Result<(), String> {
         }
     };
 
+    // Kick the arc-reactor animation loop. Defined in pip-animation.js
+    // and exposed on window as `__startPipAnimation(canvasId)`. Idempotent
+    // on the JS side, so re-pinning after an unpin restarts cleanly.
+    if let Some(win) = web_sys::window() {
+        if let Ok(start_fn) =
+            js_sys::Reflect::get(&win, &JsValue::from_str("__startPipAnimation"))
+        {
+            if let Ok(f) = start_fn.dyn_into::<js_sys::Function>() {
+                let _ = f.call1(&win, &JsValue::from_str(CANVAS_ID));
+            }
+        }
+    }
+
     // captureStream isn't on HtmlCanvasElement's typed surface; reach for
     // it via Reflect.
     let capture_fn = js_sys::Reflect::get(&canvas, &JsValue::from_str("captureStream"))
@@ -100,8 +120,10 @@ pub async fn pin_pip() -> Result<(), String> {
     let capture_fn: js_sys::Function = capture_fn
         .dyn_into()
         .map_err(|_| "captureStream not a function".to_string())?;
+    // 24 fps capture: cinematic feel, lower CPU than 30, smooth enough
+    // for the arc-reactor pulse to read as motion in the PiP overlay.
     let stream = capture_fn
-        .call1(&canvas, &JsValue::from_f64(1.0))
+        .call1(&canvas, &JsValue::from_f64(24.0))
         .map_err(|e| format!("captureStream call: {:?}", e))?;
     let stream: web_sys::MediaStream = stream
         .dyn_into()
@@ -267,6 +289,17 @@ pub fn install_auto_pip(on_pinned: impl Fn(bool) + 'static) {
 pub async fn unpin_pip() -> Result<(), String> {
     let window = web_sys::window().ok_or("no window")?;
     let document = window.document().ok_or("no document")?;
+
+    // Stop the arc-reactor animation loop so we don't burn CPU drawing
+    // into a canvas nobody's looking at anymore.
+    if let Ok(stop_fn) =
+        js_sys::Reflect::get(&window, &JsValue::from_str("__stopPipAnimation"))
+    {
+        if let Ok(f) = stop_fn.dyn_into::<js_sys::Function>() {
+            let _ = f.call0(&window);
+        }
+    }
+
     let exit = js_sys::Reflect::get(&document, &JsValue::from_str("exitPictureInPicture"))
         .map_err(|e| format!("exitPictureInPicture lookup: {:?}", e))?;
     if exit.is_undefined() || exit.is_null() {

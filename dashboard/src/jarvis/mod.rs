@@ -1443,7 +1443,7 @@ fn JarvisHeader<F: Fn() + 'static + Clone>(
                     <span class="text-arc-700">"·"</span>
                     <span class="text-arc-500">"runtime: Iron Clad"</span>
                     <span class="text-arc-700">"·"</span>
-                    <span class="text-arc-500">"v0.3.0"</span>
+                    <span class="text-arc-500">"v1.3.20"</span>
                 </div>
             </div>
         </header>
@@ -1508,7 +1508,7 @@ fn ChatPanel(
 
             <div
                 node_ref=transcript_ref
-                class="px-6 py-4 max-h-[40vh] overflow-y-auto space-y-3 font-mono text-sm scroll-smooth"
+                class="px-6 py-4 max-h-[40vh] overflow-y-auto space-y-3 font-mono text-sm scroll-smooth hud-scroll"
             >
                 { move || {
                     let m = messages.get();

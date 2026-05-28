@@ -798,7 +798,11 @@ impl ExtensionManager {
                 &self.user_id,
             )
         } else {
-            McpClient::new_with_name(&server.name, &server.url)
+            McpClient::new_with_name(
+                &server.name,
+                &server.url,
+                Arc::clone(&self.mcp_session_manager),
+            )
         };
 
         // Try to list and create tools

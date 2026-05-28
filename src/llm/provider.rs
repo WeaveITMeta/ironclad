@@ -115,6 +115,27 @@ impl ChatMessage {
         }
     }
 
+    /// Create a tool result message that also carries vision-content
+    /// images for Claude. Anthropic's tool_result block supports a
+    /// mixed-content array; this builder is the entry point for tools
+    /// like `windows_screenshot_foreground` that hand Claude actual
+    /// pixels instead of text.
+    pub fn tool_result_with_images(
+        tool_call_id: impl Into<String>,
+        name: impl Into<String>,
+        content: impl Into<String>,
+        images: Vec<String>,
+    ) -> Self {
+        Self {
+            role: Role::Tool,
+            content: content.into(),
+            tool_call_id: Some(tool_call_id.into()),
+            name: Some(name.into()),
+            tool_calls: None,
+            images: if images.is_empty() { None } else { Some(images) },
+        }
+    }
+
     /// Create a user message with one or more base64-encoded PNG images
     /// attached. The Anthropic provider builds image content blocks; other
     /// providers see only the text.

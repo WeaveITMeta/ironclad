@@ -11,19 +11,26 @@ mod json;
 mod marketplace;
 mod memory;
 mod mission_lookup;
+mod recent_logs;
 mod os_control;
 mod restaurant;
 mod shell;
 mod spawn_agent;
 mod taskrabbit;
+mod claude_code_transcript;
 mod time;
 mod tools_inventory;
 mod vault;
 #[cfg(target_os = "windows")]
 mod windows_desktop;
 #[cfg(target_os = "windows")]
+mod windows_input;
+#[cfg(target_os = "windows")]
+mod windows_screenshot;
+#[cfg(target_os = "windows")]
 mod windows_window;
 
+pub use claude_code_transcript::ClaudeCodeTranscriptTailTool;
 pub use echo::EchoTool;
 pub use ecommerce::EcommerceTool;
 pub use extension_tools::{
@@ -40,6 +47,7 @@ pub use json::JsonTool;
 pub use marketplace::MarketplaceTool;
 pub use memory::{MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool};
 pub use mission_lookup::MissionLookupTool;
+pub use recent_logs::RecentLogsTool;
 pub use os_control::{OpenAppTool, OpenUrlTool};
 pub use restaurant::RestaurantTool;
 pub use shell::ShellTool;
@@ -56,5 +64,11 @@ pub use windows_desktop::{
     WindowsListDesktopsTool, WindowsMoveWindowToDesktopTool, WindowsNewDesktopTool,
     WindowsSwitchDesktopTool,
 };
+#[cfg(target_os = "windows")]
+pub use windows_input::{
+    WindowsFocusWindowTool, WindowsGetInputFocusTool, WindowsPressKeyTool, WindowsTypeTextTool,
+};
+#[cfg(target_os = "windows")]
+pub use windows_screenshot::WindowsScreenshotForegroundTool;
 #[cfg(target_os = "windows")]
 pub use windows_window::{WindowsListMonitorsTool, WindowsSnapWindowTool};

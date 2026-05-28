@@ -10,6 +10,7 @@
 //! - Context compaction for long conversations
 
 mod agent_loop;
+pub mod autonomous_loop;
 pub mod compaction;
 pub mod context_monitor;
 mod heartbeat;
@@ -24,6 +25,7 @@ pub mod undo;
 pub mod worker;
 
 pub use agent_loop::{Agent, AgentDeps};
+pub use autonomous_loop::{AutonomousLoopConfig, AutonomousLoopRunner, spawn_autonomous_loop};
 pub use compaction::{CompactionResult, ContextCompactor};
 pub use context_monitor::{CompactionStrategy, ContextBreakdown, ContextMonitor};
 pub use heartbeat::{HeartbeatConfig, HeartbeatResult, HeartbeatRunner, spawn_heartbeat};

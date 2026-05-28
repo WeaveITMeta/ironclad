@@ -273,12 +273,23 @@ fn spawn_playwright(port: u16, user_data_dir: Option<&Path>) -> anyhow::Result<C
     // The IPv4 socket isn't open, so all MCP connections fail with
     // "error sending request" even though Playwright happily prints
     // "Listening on http://localhost:<port>".
+    //
+    // `--allowed-hosts *` disables Playwright MCP's `Host` header check.
+    // The check defaults to "matches the bind host" and rejects anything
+    // else with `403 Forbidden - Access is only allowed at localhost:<port>`.
+    // We bind to 127.0.0.1 above, but Iron Clad's reqwest URL is also
+    // 127.0.0.1, so the check should match — except Playwright's
+    // comparison is keyed on the literal bind STRING, and "127.0.0.1"
+    // doesn't match "localhost". Disabling the check is the simplest
+    // robust path; the loopback bind is the real security boundary.
     cmd.arg("--yes")
         .arg("@playwright/mcp@latest")
         .arg("--host")
         .arg("127.0.0.1")
         .arg("--port")
-        .arg(port.to_string());
+        .arg(port.to_string())
+        .arg("--allowed-hosts")
+        .arg("*");
     if let Some(dir) = user_data_dir {
         // Playwright MCP forwards `--user-data-dir` to Chromium's launch
         // args, so the browser loads with that profile's cookies, saved
@@ -302,6 +313,8 @@ fn spawn_playwright_cdp(mcp_port: u16, cdp_endpoint: &str) -> anyhow::Result<Chi
         .arg("127.0.0.1")
         .arg("--port")
         .arg(mcp_port.to_string())
+        .arg("--allowed-hosts")
+        .arg("*")
         .arg("--cdp-endpoint")
         .arg(cdp_endpoint);
     spawn(cmd)
@@ -648,9 +661,16 @@ fn free_port(port: u16) {
     #[cfg(windows)]
     {
         use std::process::Command as StdCommand;
+        // Free both TCP listeners and UDP endpoints. Playwright uses TCP;
+        // parakeet-wt (QUIC/HTTP3) uses UDP. The TCP-only version of this
+        // function used to let parakeet-wt's UDP socket survive across
+        // restarts, causing `os error 10048` on the next boot which then
+        // cascaded into a full sidecar teardown.
         let script = format!(
             "Get-NetTCPConnection -LocalPort {port} -State Listen -ErrorAction SilentlyContinue \
-             | ForEach-Object {{ Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }}"
+               | ForEach-Object {{ Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }}; \
+             Get-NetUDPEndpoint -LocalPort {port} -ErrorAction SilentlyContinue \
+               | ForEach-Object {{ Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }}"
         );
         let _ = StdCommand::new("powershell")
             .arg("-NoProfile")
@@ -668,6 +688,9 @@ fn free_port(port: u16) {
 
 
 fn spawn_ironclad(exe: &Path, gateway_port: u16, whisper_port: u16) -> anyhow::Result<Child> {
+    // The gateway port can be held by a previous Iron Clad instance that
+    // wasn't cleanly torn down. Reclaim it before the new instance binds.
+    free_port(gateway_port);
     let mut cmd = Command::new(exe);
     cmd.env("GATEWAY_ENABLED", "true")
         .env("GATEWAY_PORT", gateway_port.to_string())
@@ -681,7 +704,12 @@ fn spawn_ironclad(exe: &Path, gateway_port: u16, whisper_port: u16) -> anyhow::R
         .env(
             "WHISPER_SERVER_URL",
             format!("http://127.0.0.1:{whisper_port}"),
-        );
+        )
+        // Force a full backtrace on any Rust panic so the next crash
+        // surfaces the offending stack instead of just an exit code.
+        // Doesn't help with native SEH access violations, but catches
+        // any Rust panic that the catch_unwind wrappers re-raise.
+        .env("RUST_BACKTRACE", "1");
     // Force the `Run` subcommand so we don't fall into the first-run wizard
     // path if onboard_completed somehow flips back to false.
     cmd.arg("run");
@@ -692,6 +720,7 @@ fn spawn_ironclad(exe: &Path, gateway_port: u16, whisper_port: u16) -> anyhow::R
 /// itself lives at `<manifest>/voice/parakeet_server.py`. Returns `Ok(None)`
 /// if the script doesn't exist (so the user can opt out by deleting it).
 fn spawn_parakeet_server(port: u16) -> anyhow::Result<Option<Child>> {
+    free_port(port);
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let script = manifest.join("voice").join("parakeet_server.py");
     if !script.exists() {
@@ -719,6 +748,10 @@ fn spawn_parakeet_server(port: u16) -> anyhow::Result<Option<Child>> {
 ///
 /// Falls back to the Python script only if the Rust binary isn't built.
 fn spawn_parakeet_wt_server() -> anyhow::Result<Option<Child>> {
+    // A leftover process from a prior `cargo run-jarvis` (or a hard kill
+    // that didn't take the child down) can hold UDP:4443. Reclaim it
+    // before binding so the new spawn doesn't fall over with WSAEADDRINUSE.
+    free_port(4443);
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let voice_dir = manifest.join("voice");
 
@@ -785,6 +818,7 @@ fn spawn_whisper_server(port: u16) -> anyhow::Result<Option<Child>> {
         Ok(m) if !m.trim().is_empty() => m,
         _ => return Ok(None),
     };
+    free_port(port);
 
     let mut cmd = Command::new(&bin);
     cmd.arg("-m")

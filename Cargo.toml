@@ -97,6 +97,8 @@ hyper-util = { version = "0.1", features = ["server", "tokio", "http1", "http2"]
 http-body-util = "0.1"
 bytes = "1"
 base64 = "0.22.1"
+# PNG encoding for windows_screenshot_foreground (lean feature set).
+image = { version = "0.25", default-features = false, features = ["png"] }
 embedvec = "0.8.0"
 fjall = "2.11"
 tantivy = "0.25.0"
@@ -132,6 +134,12 @@ windows = { version = "0.52", features = [
     "Win32_System_Threading",
     "Win32_System_ProcessStatus",
     "Win32_Graphics_Gdi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    # PrintWindow lives under Storage::Xps in the windows crate — yes,
+    # really. It's the only way to capture a single window's pixels
+    # without relying on the screen DC, which is why
+    # windows_screenshot_foreground needs this feature.
+    "Win32_Storage_Xps",
 ] }
 
 [dev-dependencies]

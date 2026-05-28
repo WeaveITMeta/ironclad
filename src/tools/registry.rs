@@ -12,12 +12,13 @@ use crate::safety::SafetyLayer;
 use crate::tools::builder::{BuildSoftwareTool, BuilderConfig, LlmSoftwareBuilder};
 use crate::tools::builtin::{
     ApplyPatchTool, CancelJobTool, CreateJobTool, EchoTool, GithubGetPrTool, GithubListIssuesTool,
-    GithubListPrsTool, GithubListReposTool, GithubRecentCommitsTool, HttpTool, JobStatusTool,
-    JsonTool, ListDirTool, ListJobsTool, MemoryReadTool, MemorySearchTool, MemoryTreeTool,
-    MemoryWriteTool, OpenAppTool, OpenUrlTool, ReadFileTool, ShellTool, SpawnAgentTool, TimeTool,
-    ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool,
-    ListMyToolsTool, MissionLookupTool, VaultDeleteTool, VaultListTool, VaultMoveTool,
-    VaultReadTool, VaultSearchTool, VaultWriteTool, WriteFileTool,
+    ClaudeCodeTranscriptTailTool, GithubListPrsTool, GithubListReposTool, GithubRecentCommitsTool,
+    HttpTool, JobStatusTool, JsonTool, ListDirTool, ListJobsTool, MemoryReadTool, MemorySearchTool,
+    MemoryTreeTool, MemoryWriteTool, OpenAppTool, OpenUrlTool, ReadFileTool, ShellTool,
+    SpawnAgentTool, TimeTool, ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool,
+    ToolRemoveTool, ToolSearchTool, ListMyToolsTool, MissionLookupTool, RecentLogsTool,
+    VaultDeleteTool, VaultListTool, VaultMoveTool, VaultReadTool, VaultSearchTool, VaultWriteTool,
+    WriteFileTool,
 };
 use crate::tools::tool::Tool;
 use crate::tools::wasm::{
@@ -122,6 +123,8 @@ impl ToolRegistry {
         // Alpha-2 hands: open URLs and launch desktop apps.
         self.register_sync(Arc::new(OpenUrlTool));
         self.register_sync(Arc::new(OpenAppTool));
+        // Autonomous loop window into the active Claude Code session.
+        self.register_sync(Arc::new(ClaudeCodeTranscriptTailTool));
 
         tracing::info!("Registered {} built-in tools", self.count());
     }
@@ -206,8 +209,10 @@ impl ToolRegistry {
     #[cfg(target_os = "windows")]
     pub fn register_windows_desktop_tools(&self) {
         use crate::tools::builtin::{
-            WindowsListDesktopsTool, WindowsListMonitorsTool, WindowsMoveWindowToDesktopTool,
-            WindowsNewDesktopTool, WindowsSnapWindowTool, WindowsSwitchDesktopTool,
+            WindowsFocusWindowTool, WindowsGetInputFocusTool, WindowsListDesktopsTool,
+            WindowsListMonitorsTool, WindowsMoveWindowToDesktopTool, WindowsNewDesktopTool,
+            WindowsPressKeyTool, WindowsScreenshotForegroundTool, WindowsSnapWindowTool,
+            WindowsSwitchDesktopTool, WindowsTypeTextTool,
         };
         self.register_sync(Arc::new(WindowsListDesktopsTool));
         self.register_sync(Arc::new(WindowsSwitchDesktopTool));
@@ -215,7 +220,23 @@ impl ToolRegistry {
         self.register_sync(Arc::new(WindowsMoveWindowToDesktopTool));
         self.register_sync(Arc::new(WindowsListMonitorsTool));
         self.register_sync(Arc::new(WindowsSnapWindowTool));
-        tracing::info!("Registered 6 Windows desktop + window tools");
+        self.register_sync(Arc::new(WindowsGetInputFocusTool));
+        self.register_sync(Arc::new(WindowsFocusWindowTool));
+        self.register_sync(Arc::new(WindowsTypeTextTool));
+        self.register_sync(Arc::new(WindowsPressKeyTool));
+        self.register_sync(Arc::new(WindowsScreenshotForegroundTool));
+        tracing::info!("Registered 11 Windows desktop + window + input + screenshot tools");
+    }
+
+    /// Register `recent_logs` so JARVIS can introspect Iron Clad's own
+    /// log ring buffer. Needs the LogBroadcaster which is built early
+    /// in main.rs before tracing init.
+    pub fn register_recent_logs_tool(
+        &self,
+        broadcaster: Arc<crate::channels::web::log_layer::LogBroadcaster>,
+    ) {
+        self.register_sync(Arc::new(RecentLogsTool::new(broadcaster)));
+        tracing::info!("Registered recent_logs (self-diagnostic log query)");
     }
 
     #[cfg(not(target_os = "windows"))]

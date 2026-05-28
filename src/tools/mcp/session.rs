@@ -129,6 +129,17 @@ impl McpSessionManager {
         }
     }
 
+    /// Mark a session as uninitialized. Used after a 404 "session not
+    /// found" so the next call re-runs the initialize handshake instead
+    /// of trusting a stale session ID.
+    pub async fn mark_uninitialized(&self, server_name: &str) {
+        let mut sessions = self.sessions.write().await;
+        if let Some(session) = sessions.get_mut(server_name) {
+            session.initialized = false;
+            session.session_id = None;
+        }
+    }
+
     /// Check if a session is initialized.
     pub async fn is_initialized(&self, server_name: &str) -> bool {
         let sessions = self.sessions.read().await;

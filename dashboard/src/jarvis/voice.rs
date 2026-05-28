@@ -113,6 +113,16 @@ struct VadInner {
     /// We keep them at the AudioContext's native sample rate (typically
     /// 44100 / 48000); the wav encoder resamples to 16 kHz on emit.
     samples: Vec<f32>,
+    /// Rolling pre-utterance buffer. Captures the last ~600 ms of audio
+    /// *before* voice_run_ms crosses min_speech_ms. When the utterance
+    /// finally starts, we prepend this onto `samples` so the leading
+    /// edge of speech (which would otherwise be discarded — the user
+    /// said "JARVIS" but the first syllable wasn't recorded because we
+    /// hadn't decided it was speech yet) is preserved.
+    pre_roll: VecDeque<f32>,
+    /// Cap on `pre_roll` length (in samples). Set at init from
+    /// sample_rate * PRE_ROLL_MS / 1000.
+    pre_roll_max: usize,
     /// ms of voice frames accumulated toward `min_speech_ms`. Survives brief
     /// silent gaps (see `pre_utt_silence_ms` hangover) so the natural pauses
     /// inside a word like "testing" don't reset the count.
@@ -227,6 +237,19 @@ impl VadInner {
             }
         }
 
+        // Before we declare an utterance, feed the analyser buffer into
+        // the pre-roll ring. This is what we'll prepend onto `samples`
+        // when speech actually starts, so the user's first syllable
+        // isn't discarded. Cap at pre_roll_max to keep memory bounded.
+        if !self.in_utterance {
+            for &s in &self.analyser_buf {
+                if self.pre_roll.len() >= self.pre_roll_max {
+                    self.pre_roll.pop_front();
+                }
+                self.pre_roll.push_back(s);
+            }
+        }
+
         // Transition into an utterance once we've crossed the min-speech bar.
         // If we were in Speaking state, this is a barge-in — fire the
         // callback so the orchestrator can halt the audio queue gracefully.
@@ -236,9 +259,15 @@ impl VadInner {
                 console_log("[jarvis-vad] barge-in detected");
                 (self.on_barge_in)();
             } else {
-                console_log("[jarvis-vad] utterance started");
+                console_log(&format!(
+                    "[jarvis-vad] utterance started ({} samples of pre-roll preserved)",
+                    self.pre_roll.len()
+                ));
             }
             *self.state.borrow_mut() = MicState::Listening;
+            // Drain pre-roll into samples so the leading edge of speech
+            // is part of the wav we eventually emit.
+            self.samples.extend(self.pre_roll.drain(..));
         }
 
         if self.in_utterance {
@@ -368,6 +397,11 @@ impl ContinuousMic {
         let inner = Rc::new(RefCell::new(VadInner {
             config,
             samples: Vec::with_capacity((sample_rate as usize) * 8),
+            // 600 ms pre-roll at the native sample rate. Long enough to
+            // catch the first syllable of "JARVIS" or "Hey" without
+            // bloating memory: ~115 KB at 48 kHz / f32.
+            pre_roll: VecDeque::with_capacity(((sample_rate as usize) * 600) / 1000),
+            pre_roll_max: ((sample_rate as usize) * 600) / 1000,
             voice_run_ms: 0,
             silence_run_ms: 0,
             pre_utt_silence_ms: 0,

@@ -66,7 +66,16 @@ impl McpClient {
             server_url: url,
             server_name: name,
             http_client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
+                // 120s wall-clock per MCP request. Browser ops via
+                // Playwright (browser_navigate, snapshot of a heavy page,
+                // wait_for that gates on network) can legitimately take
+                // 30-90s. The old 30s ceiling killed every real navigation
+                // with "Failed to read SSE chunk: error decoding response
+                // body" exactly at 30.013s. The outer agent-loop timeout
+                // (60s) and Anthropic's 10-min client timeout are the
+                // upstream backstops; this just stops reqwest from
+                // pre-empting them.
+                .timeout(Duration::from_secs(120))
                 .build()
                 .expect("Failed to create HTTP client"),
             next_id: AtomicU64::new(1),
@@ -80,18 +89,39 @@ impl McpClient {
 
     /// Create a new simple MCP client with a specific name.
     ///
-    /// Use this when you have a configured server name but no authentication.
-    pub fn new_with_name(server_name: impl Into<String>, server_url: impl Into<String>) -> Self {
+    /// `session_manager` is required even for unauthenticated servers
+    /// because MCP's Streamable HTTP transport returns an
+    /// `Mcp-Session-Id` header on `initialize` and requires it on every
+    /// subsequent request. Without it the server treats each call as a
+    /// fresh connection that hasn't been initialized and responds with
+    /// `400 Bad Request: Server not initialized`. The previous shape of
+    /// this constructor (no session manager) is what made Playwright MCP
+    /// look broken — initialize succeeded but the session ID was thrown
+    /// away, so tools/list looked like a bare uninitialized request.
+    pub fn new_with_name(
+        server_name: impl Into<String>,
+        server_url: impl Into<String>,
+        session_manager: Arc<McpSessionManager>,
+    ) -> Self {
         Self {
             server_url: server_url.into(),
             server_name: server_name.into(),
             http_client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
+                // 120s wall-clock per MCP request. Browser ops via
+                // Playwright (browser_navigate, snapshot of a heavy page,
+                // wait_for that gates on network) can legitimately take
+                // 30-90s. The old 30s ceiling killed every real navigation
+                // with "Failed to read SSE chunk: error decoding response
+                // body" exactly at 30.013s. The outer agent-loop timeout
+                // (60s) and Anthropic's 10-min client timeout are the
+                // upstream backstops; this just stops reqwest from
+                // pre-empting them.
+                .timeout(Duration::from_secs(120))
                 .build()
                 .expect("Failed to create HTTP client"),
             next_id: AtomicU64::new(1),
             tools_cache: RwLock::new(None),
-            session_manager: None,
+            session_manager: Some(session_manager),
             secrets: None,
             user_id: "default".to_string(),
             server_config: None,
@@ -111,7 +141,16 @@ impl McpClient {
             server_url: config.url.clone(),
             server_name: config.name.clone(),
             http_client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
+                // 120s wall-clock per MCP request. Browser ops via
+                // Playwright (browser_navigate, snapshot of a heavy page,
+                // wait_for that gates on network) can legitimately take
+                // 30-90s. The old 30s ceiling killed every real navigation
+                // with "Failed to read SSE chunk: error decoding response
+                // body" exactly at 30.013s. The outer agent-loop timeout
+                // (60s) and Anthropic's 10-min client timeout are the
+                // upstream backstops; this just stops reqwest from
+                // pre-empting them.
+                .timeout(Duration::from_secs(120))
                 .build()
                 .expect("Failed to create HTTP client"),
             next_id: AtomicU64::new(1),
@@ -168,6 +207,17 @@ impl McpClient {
     /// Send a request to the MCP server with auth and session headers.
     /// Automatically attempts token refresh on 401 errors.
     async fn send_request(&self, request: McpRequest) -> Result<McpResponse, ToolError> {
+        // Trace every MCP HTTP round-trip so the boot + tool-call paths
+        // are debuggable. Truncate the request body so a giant
+        // `browser_evaluate` doesn't flood the terminal.
+        let req_preview = {
+            let s = serde_json::to_string(&request).unwrap_or_default();
+            if s.len() > 400 { format!("{}... ({} bytes)", &s[..400], s.len()) } else { s }
+        };
+        tracing::debug!(
+            "mcp[{}] → POST {} :: {}",
+            self.server_name, self.server_url, req_preview
+        );
         // Try up to 2 times: first attempt, then retry after token refresh
         for attempt in 0..2 {
             // Request both JSON and SSE as per MCP spec
@@ -194,6 +244,73 @@ impl McpClient {
                 .send()
                 .await
                 .map_err(|e| ToolError::ExternalService(format!("MCP request failed: {}", e)))?;
+
+            // Check for 404 Not Found with a "Session not found" body -
+            // the MCP server forgot our session (server restart, idle
+            // timeout, etc.). Wipe the stored session ID, re-initialize,
+            // and retry once. Self-healing avoids forcing a full
+            // `cargo run-jarvis` restart every time Playwright trims its
+            // session table.
+            if response.status() == reqwest::StatusCode::NOT_FOUND && attempt == 0 {
+                if let Some(ref sm) = self.session_manager {
+                    let body_preview = response
+                        .text()
+                        .await
+                        .unwrap_or_default();
+                    if body_preview.to_ascii_lowercase().contains("session") {
+                        tracing::info!(
+                            "MCP '{}' session expired (404); clearing and re-initializing",
+                            self.server_name
+                        );
+                        sm.update_session_id(&self.server_name, None).await;
+                        sm.mark_uninitialized(&self.server_name).await;
+                        // Send a fresh initialize. parse_response on the
+                        // response will store the new session ID via
+                        // update_session_id().
+                        let init = McpRequest::initialize(self.next_request_id());
+                        let init_resp = self
+                            .http_client
+                            .post(&self.server_url)
+                            .header("Accept", "application/json, text/event-stream")
+                            .header("Content-Type", "application/json")
+                            .json(&init)
+                            .send()
+                            .await;
+                        match init_resp {
+                            Ok(r) => {
+                                let _ = self.parse_response(r).await;
+                                // Fire the initialized notification inline
+                                // (no recursive send_request — that's an
+                                // infinitely-sized future). If Playwright
+                                // requires it strictly we'll get one more
+                                // error and surface it normally.
+                                let notif = McpRequest::initialized_notification();
+                                let _ = self
+                                    .http_client
+                                    .post(&self.server_url)
+                                    .header("Accept", "application/json, text/event-stream")
+                                    .header("Content-Type", "application/json")
+                                    .json(&notif)
+                                    .send()
+                                    .await;
+                                continue;
+                            }
+                            Err(e) => {
+                                return Err(ToolError::ExternalService(format!(
+                                    "MCP '{}' re-initialize failed: {}",
+                                    self.server_name, e
+                                )));
+                            }
+                        }
+                    }
+                    // Body didn't mention session — let the generic
+                    // status handling below report the 404 as-is.
+                    return Err(ToolError::ExternalService(format!(
+                        "MCP server returned status: 404 Not Found - {}",
+                        body_preview
+                    )));
+                }
+            }
 
             // Check for 401 Unauthorized - try to refresh token on first attempt
             if response.status() == reqwest::StatusCode::UNAUTHORIZED {
@@ -293,19 +410,50 @@ impl McpClient {
                     if let Some(json_str) = line.strip_prefix("data: ") {
                         // Try to parse - if valid JSON, we're done
                         if let Ok(response) = serde_json::from_str::<McpResponse>(json_str) {
+                            let p = if json_str.len() > 400 {
+                                format!("{}... ({} bytes)", &json_str[..400], json_str.len())
+                            } else {
+                                json_str.to_string()
+                            };
+                            tracing::debug!(
+                                "mcp[{}] ← SSE result :: {}",
+                                self.server_name,
+                                p
+                            );
                             return Ok(response);
                         }
                     }
                 }
             }
 
+            tracing::warn!(
+                "mcp[{}] no valid SSE data in {} bytes",
+                self.server_name,
+                buffer.len()
+            );
             Err(ToolError::ExternalService(format!(
                 "No valid data in SSE response: {}",
                 buffer
             )))
         } else {
-            // JSON response
-            response.json().await.map_err(|e| {
+            // JSON response. Read the body once so we can log it, then
+            // re-parse.
+            let body = response.text().await.map_err(|e| {
+                ToolError::ExternalService(format!("Failed to read MCP body: {}", e))
+            })?;
+            let p = if body.len() > 400 {
+                format!("{}... ({} bytes)", &body[..400], body.len())
+            } else {
+                body.clone()
+            };
+            tracing::debug!("mcp[{}] ← JSON result :: {}", self.server_name, p);
+            serde_json::from_str(&body).map_err(|e| {
+                tracing::error!(
+                    "mcp[{}] JSON decode failed: {} (body was: {})",
+                    self.server_name,
+                    e,
+                    p
+                );
                 ToolError::ExternalService(format!("Failed to parse MCP response: {}", e))
             })
         }
@@ -371,10 +519,12 @@ impl McpClient {
             return Ok(tools.clone());
         }
 
-        // Ensure initialized for authenticated sessions
-        if self.session_manager.is_some() {
-            self.initialize().await?;
-        }
+        // MCP spec requires `initialize` before any other request.
+        // Earlier this was gated on `session_manager.is_some()` which
+        // meant unauthenticated local servers (Playwright MCP, anything
+        // without OAuth) would skip the handshake and Playwright would
+        // reject with `400 Bad Request: Server not initialized`.
+        self.initialize().await?;
 
         let request = McpRequest::list_tools(self.next_request_id());
         let response = self.send_request(request).await?;

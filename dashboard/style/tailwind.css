@@ -40,4 +40,44 @@
   .badge-building   { @apply bg-yellow-500/20 text-yellow-400; }
   .badge-designed   { @apply bg-jarvis-500/20 text-jarvis-400; }
   .badge-missing    { @apply bg-zinc-700/40 text-zinc-500; }
+
+  /* HUD scrollbar — arc cyan + white highlight on a deep navy track,
+     to match the Stark-suit palette used everywhere else in the
+     dashboard. Applied to any scrollable region that should feel
+     like part of the HUD instead of the default OS chrome. */
+  .hud-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: #22d3ee rgba(10, 15, 28, 0.6);
+  }
+  .hud-scroll::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  .hud-scroll::-webkit-scrollbar-track {
+    background: rgba(10, 15, 28, 0.6);
+    border-left: 1px solid rgba(22, 78, 99, 0.5);
+  }
+  .hud-scroll::-webkit-scrollbar-thumb {
+    background: linear-gradient(
+      180deg,
+      rgba(34, 211, 238, 0.9) 0%,
+      rgba(255, 255, 255, 0.95) 50%,
+      rgba(34, 211, 238, 0.9) 100%
+    );
+    border-radius: 4px;
+    border: 1px solid rgba(34, 211, 238, 0.6);
+    box-shadow: 0 0 6px rgba(34, 211, 238, 0.5);
+  }
+  .hud-scroll::-webkit-scrollbar-thumb:hover {
+    background: linear-gradient(
+      180deg,
+      #22d3ee 0%,
+      #ffffff 50%,
+      #22d3ee 100%
+    );
+    box-shadow: 0 0 10px rgba(34, 211, 238, 0.85);
+  }
+  .hud-scroll::-webkit-scrollbar-corner {
+    background: transparent;
+  }
 }
