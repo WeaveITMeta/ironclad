@@ -1,6 +1,6 @@
 //! User settings persistence.
 //!
-//! Stores user preferences in ~/.ironclaw/settings.json.
+//! Stores user preferences in ~/.ironclad/settings.json.
 //! Settings are loaded with env var > settings.json > default priority.
 
 use std::path::PathBuf;
@@ -97,7 +97,7 @@ pub struct EmbeddingsSettings {
     #[serde(default)]
     pub enabled: bool,
 
-    /// Provider to use: "openai" or "nearai".
+    /// Embeddings provider. Only "openai" is supported.
     #[serde(default = "default_embeddings_provider")]
     pub provider: String,
 
@@ -107,7 +107,7 @@ pub struct EmbeddingsSettings {
 }
 
 fn default_embeddings_provider() -> String {
-    "nearai".to_string()
+    "openai".to_string()
 }
 
 fn default_embeddings_model() -> String {
@@ -237,7 +237,7 @@ pub struct AgentSettings {
 }
 
 fn default_agent_name() -> String {
-    "ironclaw".to_string()
+    "ironclad".to_string()
 }
 
 fn default_max_parallel_jobs() -> u32 {
@@ -482,11 +482,11 @@ impl Default for BuilderSettings {
 }
 
 impl Settings {
-    /// Get the default settings file path (~/.ironclaw/settings.json).
+    /// Get the default settings file path (~/.ironclad/settings.json).
     pub fn default_path() -> PathBuf {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join(".ironclaw")
+            .join(".ironclad")
             .join("settings.json")
     }
 
@@ -735,7 +735,7 @@ mod tests {
     fn test_get_setting() {
         let settings = Settings::default();
 
-        assert_eq!(settings.get("agent.name"), Some("ironclaw".to_string()));
+        assert_eq!(settings.get("agent.name"), Some("ironclad".to_string()));
         assert_eq!(
             settings.get("agent.max_parallel_jobs"),
             Some("5".to_string())
@@ -764,7 +764,7 @@ mod tests {
 
         settings.agent.name = "custom".to_string();
         settings.reset("agent.name").unwrap();
-        assert_eq!(settings.agent.name, "ironclaw");
+        assert_eq!(settings.agent.name, "ironclad");
     }
 
     #[test]
@@ -796,7 +796,7 @@ mod tests {
     fn test_embeddings_defaults() {
         let settings = Settings::default();
         assert!(!settings.embeddings.enabled);
-        assert_eq!(settings.embeddings.provider, "nearai");
+        assert_eq!(settings.embeddings.provider, "openai");
         assert_eq!(settings.embeddings.model, "text-embedding-3-small");
     }
 }

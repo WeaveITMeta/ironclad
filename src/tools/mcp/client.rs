@@ -227,7 +227,7 @@ impl McpClient {
                     }
                 }
                 return Err(ToolError::ExternalService(format!(
-                    "MCP server '{}' requires authentication. Run: ironclaw mcp auth {}",
+                    "MCP server '{}' requires authentication. Run: ironclad mcp auth {}",
                     self.server_name, self.server_name
                 )));
             }
@@ -538,8 +538,13 @@ impl Tool for McpToolWrapper {
     }
 
     fn requires_approval(&self) -> bool {
-        // Check the destructive_hint annotation from the MCP server
-        self.tool.requires_approval()
+        // Respect the server's destructive_hint annotation when present;
+        // fall back to a name-prefix heuristic so MCP servers that omit
+        // annotations (most of them) still get destructive ops gated.
+        if self.tool.requires_approval() {
+            return true;
+        }
+        crate::tools::mcp::stdio_client::is_destructive_tool_name(&self.tool.name)
     }
 }
 

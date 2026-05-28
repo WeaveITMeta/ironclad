@@ -5,7 +5,7 @@
 //! - VaultWriteTool: Write/update files in the Obsidian vault on disk
 //! - VaultListTool: List files and directories in the Obsidian vault
 //!
-//! These tools bridge IronClaw's workspace (PostgreSQL) with the user's
+//! These tools bridge Iron Clad's workspace (PostgreSQL) with the user's
 //! Obsidian vault (filesystem), enabling the agent to read and write
 //! markdown files directly in the life system.
 
@@ -186,7 +186,7 @@ impl Tool for VaultWriteTool {
         // Prevent writing to hidden/system directories
         if rel_path.starts_with('.') || rel_path.contains("/.") || rel_path.contains("\\.") {
             return Err(ToolError::NotAuthorized(
-                "Cannot write to hidden directories (e.g. .ironclaw, .obsidian)".to_string(),
+                "Cannot write to hidden directories (e.g. .ironclad, .obsidian)".to_string(),
             ));
         }
 
@@ -353,6 +353,421 @@ impl Tool for VaultListTool {
 
     fn requires_sanitization(&self) -> bool {
         false // Local filesystem, trusted data
+    }
+}
+
+// ============================================================
+// VaultSearchTool — Grep across the Obsidian vault
+// ============================================================
+
+/// Walk the vault recursively, find markdown files whose content contains
+/// the query (case-insensitive), and return file paths + a snippet around
+/// each first match. Capped at 20 results so the LLM context stays sane.
+pub struct VaultSearchTool;
+
+#[async_trait]
+impl Tool for VaultSearchTool {
+    fn name(&self) -> &str {
+        "vault_search"
+    }
+
+    fn description(&self) -> &str {
+        "Search the Obsidian vault for markdown notes containing a query \
+         string. Case-insensitive contains-match across file contents AND \
+         filenames. Returns up to 20 hits with a short snippet showing where \
+         the match was found. Use this when McKale asks 'what do I have on X' \
+         or 'find my note about Y' — it's faster than vault_list when you \
+         don't already know the folder."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Substring to search for. Case-insensitive. E.g., 'Eustress', 'butter bear', 'taxes 2026'."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max number of hits to return. Default 20, hard cap 50.",
+                    "default": 20,
+                    "minimum": 1,
+                    "maximum": 50
+                }
+            },
+            "required": ["query"]
+        })
+    }
+
+    async fn execute(
+        &self,
+        params: serde_json::Value,
+        _ctx: &JobContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let start = Instant::now();
+
+        let query = params
+            .get("query")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidParameters("missing 'query' parameter".into()))?
+            .trim();
+        if query.is_empty() {
+            return Err(ToolError::InvalidParameters("'query' is empty".into()));
+        }
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(20)
+            .min(50) as usize;
+
+        let base = vault_base_path();
+        if !base.is_dir() {
+            return Err(ToolError::ExecutionFailed(format!(
+                "Vault root missing: {}",
+                base.display()
+            )));
+        }
+
+        let query_lc = query.to_lowercase();
+        let mut hits: Vec<serde_json::Value> = Vec::new();
+        let mut visited_files = 0usize;
+        let mut stack: Vec<PathBuf> = vec![base.clone()];
+        while let Some(dir) = stack.pop() {
+            if hits.len() >= limit {
+                break;
+            }
+            let mut rd = match tokio::fs::read_dir(&dir).await {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            while let Ok(Some(entry)) = rd.next_entry().await {
+                let name = entry.file_name().to_string_lossy().to_string();
+                // Skip dotdirs (.obsidian, .ironclad, .git, etc.)
+                if name.starts_with('.') {
+                    continue;
+                }
+                let path = entry.path();
+                let Ok(meta) = entry.metadata().await else {
+                    continue;
+                };
+                if meta.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if !meta.is_file() {
+                    continue;
+                }
+                if path.extension().and_then(|s| s.to_str()) != Some("md") {
+                    continue;
+                }
+                visited_files += 1;
+                let rel = path.strip_prefix(&base).unwrap_or(&path);
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                let name_lc = name.to_lowercase();
+                let mut snippet: Option<String> = None;
+                let mut matched = false;
+                if name_lc.contains(&query_lc) {
+                    matched = true;
+                    snippet = Some(format!("(filename match) {}", rel_str));
+                }
+                if !matched {
+                    if let Ok(body) = tokio::fs::read_to_string(&path).await {
+                        let body_lc = body.to_lowercase();
+                        if let Some(idx) = body_lc.find(&query_lc) {
+                            matched = true;
+                            // Pull ~60 chars on each side as a snippet.
+                            let lo = idx.saturating_sub(60);
+                            let hi = (idx + query.len() + 60).min(body.len());
+                            let raw = &body[lo..hi];
+                            // Collapse internal whitespace runs for readability.
+                            let cleaned: String = raw
+                                .chars()
+                                .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+                                .collect::<String>()
+                                .split_whitespace()
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            snippet = Some(cleaned);
+                        }
+                    }
+                }
+                if matched {
+                    hits.push(serde_json::json!({
+                        "path": rel_str,
+                        "snippet": snippet.unwrap_or_default(),
+                    }));
+                    if hits.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(ToolOutput::success(
+            serde_json::json!({
+                "query": query,
+                "hits": hits,
+                "count": hits.len(),
+                "files_scanned": visited_files,
+                "truncated": hits.len() >= limit,
+            }),
+            start.elapsed(),
+        ))
+    }
+
+    fn requires_sanitization(&self) -> bool {
+        false
+    }
+}
+
+// ============================================================
+// VaultDeleteTool — Remove a file from the Obsidian vault
+// ============================================================
+
+/// Delete a file from the Obsidian vault. Approval-gated. Refuses to touch
+/// hidden directories or the JARVIS identity/system files.
+pub struct VaultDeleteTool;
+
+#[async_trait]
+impl Tool for VaultDeleteTool {
+    fn name(&self) -> &str {
+        "vault_delete"
+    }
+
+    fn description(&self) -> &str {
+        "Delete a file from the Obsidian vault. Required when finishing a \
+         move (vault_read source → vault_write destination → vault_delete \
+         source) so the file doesn't get duplicated. Approval-gated; refuses \
+         hidden / system paths."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Relative path within the vault, e.g. '00 System/JARVIS/Old_Draft.md'"
+                }
+            },
+            "required": ["path"]
+        })
+    }
+
+    async fn execute(
+        &self,
+        params: serde_json::Value,
+        _ctx: &JobContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let start = Instant::now();
+        let rel_path = params
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidParameters("missing 'path' parameter".to_string()))?;
+
+        if rel_path.starts_with('.') || rel_path.contains("/.") || rel_path.contains("\\.") {
+            return Err(ToolError::NotAuthorized(
+                "Cannot delete from hidden directories (e.g. .ironclad, .obsidian)".to_string(),
+            ));
+        }
+        // Identity files own the agent's behavior — never let a delete reach them.
+        let lower = rel_path.to_ascii_lowercase();
+        for protected in [
+            "agents.md",
+            "soul.md",
+            "identity.md",
+            "user.md",
+            "claude.md",
+            "memory.md",
+            "heartbeat.md",
+            "readme.md",
+        ] {
+            if lower.ends_with(protected) {
+                return Err(ToolError::NotAuthorized(format!(
+                    "Refusing to delete protected identity/system file: {}",
+                    rel_path
+                )));
+            }
+        }
+
+        let base = vault_base_path();
+        let full_path = base.join(rel_path);
+        if !full_path.exists() {
+            return Err(ToolError::ExecutionFailed(format!(
+                "File does not exist: {}",
+                rel_path
+            )));
+        }
+        validate_vault_path(&full_path, &base)?;
+
+        if full_path.is_dir() {
+            return Err(ToolError::NotAuthorized(
+                "vault_delete only deletes files, not directories. Use shell with explicit approval if a directory delete is required.".to_string(),
+            ));
+        }
+
+        tokio::fs::remove_file(&full_path).await.map_err(|e| {
+            ToolError::ExecutionFailed(format!("Failed to delete '{}': {}", rel_path, e))
+        })?;
+
+        Ok(ToolOutput::success(
+            serde_json::json!({
+                "path": rel_path,
+                "status": "deleted"
+            }),
+            start.elapsed(),
+        ))
+    }
+
+    fn requires_approval(&self) -> bool {
+        true
+    }
+
+    fn requires_sanitization(&self) -> bool {
+        false
+    }
+}
+
+// ============================================================
+// VaultMoveTool — Atomically move/rename a file in the vault
+// ============================================================
+
+/// Move (or rename) a vault file. Implemented as a filesystem-level rename
+/// when source and destination are on the same volume, falling back to a
+/// copy + delete otherwise. Single approval covers the whole move (versus
+/// three separate approvals if the agent chained read/write/delete).
+pub struct VaultMoveTool;
+
+#[async_trait]
+impl Tool for VaultMoveTool {
+    fn name(&self) -> &str {
+        "vault_move"
+    }
+
+    fn description(&self) -> &str {
+        "Move or rename a file within the Obsidian vault. Atomic at the \
+         filesystem level when possible; copy+delete fallback otherwise. \
+         Single approval covers the whole move. Use this instead of \
+         vault_read + vault_write + vault_delete for relocations."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "from": {
+                    "type": "string",
+                    "description": "Source path relative to the vault root"
+                },
+                "to": {
+                    "type": "string",
+                    "description": "Destination path relative to the vault root"
+                },
+                "overwrite": {
+                    "type": "boolean",
+                    "description": "If true, allow overwriting an existing destination file. Default: false",
+                    "default": false
+                }
+            },
+            "required": ["from", "to"]
+        })
+    }
+
+    async fn execute(
+        &self,
+        params: serde_json::Value,
+        _ctx: &JobContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let start = Instant::now();
+        let from = params
+            .get("from")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidParameters("missing 'from' parameter".to_string()))?;
+        let to = params
+            .get("to")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidParameters("missing 'to' parameter".to_string()))?;
+        let overwrite = params
+            .get("overwrite")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        for p in [from, to] {
+            if p.starts_with('.') || p.contains("/.") || p.contains("\\.") {
+                return Err(ToolError::NotAuthorized(
+                    "Cannot move into or out of hidden directories".to_string(),
+                ));
+            }
+        }
+
+        let base = vault_base_path();
+        let src = base.join(from);
+        let dst = base.join(to);
+
+        if !src.exists() {
+            return Err(ToolError::ExecutionFailed(format!(
+                "Source does not exist: {}",
+                from
+            )));
+        }
+        if src.is_dir() {
+            return Err(ToolError::NotAuthorized(
+                "vault_move only moves files, not directories".to_string(),
+            ));
+        }
+        if dst.exists() && !overwrite {
+            return Err(ToolError::ExecutionFailed(format!(
+                "Destination already exists (set overwrite=true to replace): {}",
+                to
+            )));
+        }
+        if let Some(parent) = dst.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                ToolError::ExecutionFailed(format!("Failed to create destination directory: {}", e))
+            })?;
+        }
+
+        // Try a fast rename first; fall back to copy + delete if rename
+        // fails (cross-volume, locked, etc.).
+        match tokio::fs::rename(&src, &dst).await {
+            Ok(()) => {}
+            Err(_) => {
+                tokio::fs::copy(&src, &dst).await.map_err(|e| {
+                    ToolError::ExecutionFailed(format!("Copy fallback failed: {}", e))
+                })?;
+                tokio::fs::remove_file(&src).await.map_err(|e| {
+                    ToolError::ExecutionFailed(format!(
+                        "Copy succeeded but source delete failed (file is now duplicated at {}): {}",
+                        to, e
+                    ))
+                })?;
+            }
+        }
+
+        validate_vault_path(&dst, &base)?;
+
+        let size = tokio::fs::metadata(&dst)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        Ok(ToolOutput::success(
+            serde_json::json!({
+                "from": from,
+                "to": to,
+                "size_bytes": size,
+                "status": "moved"
+            }),
+            start.elapsed(),
+        ))
+    }
+
+    fn requires_approval(&self) -> bool {
+        true
+    }
+
+    fn requires_sanitization(&self) -> bool {
+        false
     }
 }
 

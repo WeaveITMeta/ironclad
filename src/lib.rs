@@ -1,6 +1,8 @@
-//! NEAR AI Agentic Worker Framework
+//! Iron Clad Agentic Worker Framework
 //!
-//! An LLM-powered autonomous agent that operates on the NEAR AI marketplace.
+//! Local-first LLM-powered autonomous agent. Default brain is Anthropic Claude
+//! via `ANTHROPIC_API_KEY`. Storage is Fjall + tantivy + embedvec under
+//! `~/.ironclad/`; no external DB.
 //!
 //! # Architecture
 //!
@@ -55,6 +57,7 @@ pub mod secrets;
 pub mod settings;
 pub mod setup;
 pub mod tools;
+pub mod voice;
 pub mod workspace;
 
 pub use config::Config;

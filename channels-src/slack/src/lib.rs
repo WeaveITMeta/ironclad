@@ -1,4 +1,4 @@
-//! Slack Events API channel for IronClaw.
+//! Slack Events API channel for Iron Clad.
 //!
 //! This WASM component implements the channel interface for handling Slack
 //! webhooks and sending messages back to Slack.

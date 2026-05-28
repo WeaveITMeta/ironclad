@@ -38,7 +38,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use ironclaw::secrets::{SecretsStore, FjallSecretsStore, SecretsCrypto, CreateSecretParams};
+//! use ironclad::secrets::{SecretsStore, FjallSecretsStore, SecretsCrypto, CreateSecretParams};
 //! use secrecy::SecretString;
 //!
 //! // Initialize crypto with master key from environment
@@ -46,7 +46,7 @@
 //! let crypto = Arc::new(SecretsCrypto::new(master_key)?);
 //!
 //! // Create store
-//! let store = FjallSecretsStore::open("~/.ironclaw/secrets-index", crypto)?;
+//! let store = FjallSecretsStore::open("~/.ironclad/secrets-index", crypto)?;
 //!
 //! // Store a secret
 //! store.create("user_123", CreateSecretParams::new("openai_key", "sk-...")).await?;

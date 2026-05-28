@@ -1,4 +1,4 @@
-//! Web gateway channel for browser-based access to IronClaw.
+//! Web gateway channel for browser-based access to Iron Clad.
 //!
 //! Provides a single-page web UI with:
 //! - Chat with the agent (via REST + SSE)
@@ -30,7 +30,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::agent::SessionManager;
 use crate::channels::{Channel, IncomingMessage, MessageStream, OutgoingResponse, StatusUpdate};
-use crate::config::GatewayConfig;
+use crate::config::{GatewayConfig, VoiceConfig};
 use crate::context::ContextManager;
 use crate::error::ChannelError;
 use crate::extensions::ExtensionManager;
@@ -78,6 +78,8 @@ impl GatewayChannel {
             user_id: config.user_id.clone(),
             shutdown_tx: tokio::sync::RwLock::new(None),
             ws_tracker: Some(Arc::new(ws::WsConnectionTracker::new())),
+            voice: VoiceConfig::default(),
+            auth_token: auth_token.clone(),
         });
 
         Self {
@@ -101,6 +103,8 @@ impl GatewayChannel {
             user_id: self.state.user_id.clone(),
             shutdown_tx: tokio::sync::RwLock::new(None),
             ws_tracker: self.state.ws_tracker.clone(),
+            voice: self.state.voice.clone(),
+            auth_token: self.state.auth_token.clone(),
         };
         mutate(&mut new_state);
         self.state = Arc::new(new_state);
@@ -139,6 +143,12 @@ impl GatewayChannel {
     /// Inject the tool registry for the extensions API.
     pub fn with_tool_registry(mut self, tr: Arc<ToolRegistry>) -> Self {
         self.rebuild_state(|s| s.tool_registry = Some(tr));
+        self
+    }
+
+    /// Inject the voice gateway config for the /api/voice/* endpoints.
+    pub fn with_voice(mut self, voice: VoiceConfig) -> Self {
+        self.rebuild_state(|s| s.voice = voice);
         self
     }
 

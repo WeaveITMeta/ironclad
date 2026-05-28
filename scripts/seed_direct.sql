@@ -1,5 +1,5 @@
 -- Seed IronClaw workspace with identity files
--- Run: psql -U postgres -h 127.0.0.1 -p 5432 -d ironclaw --no-psqlrc --pset=pager=off -f scripts/seed_direct.sql
+-- Run: psql -U postgres -h 127.0.0.1 -p 5432 -d ironclad --no-psqlrc --pset=pager=off -f scripts/seed_direct.sql
 
 -- USER.md
 INSERT INTO memory_documents (id, user_id, path, content, created_at, updated_at)
@@ -176,7 +176,7 @@ VALUES (gen_random_uuid(), 'default', 'MEMORY.md', $memory_md$# Long-Term Memory
 - Summit Studios (Vehicle Simulator) has 500M+ visits -- closest existing revenue source
 - BookDaddy, GetCSV, and Weave are ranked as closest to first revenue
 - McKale owes taxes and has a mortgage -- debt strategy is critical
-- IronClaw was forked from nearai/ironclaw on Feb 10, 2026 (WeaveITMeta/ironclaw)
+- IronClaw was forked from nearai/ironclad on Feb 10, 2026 (WeaveITMeta/ironclad)
 - PostgreSQL 16 running on port 5432 with pgvector 0.8.1 for IronClaw
 - Obsidian vault has 89+ markdown files across 12 life pillars
 - 8 Windsurf workflow slash commands available for note automation

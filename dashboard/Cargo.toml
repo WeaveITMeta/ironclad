@@ -1,0 +1,52 @@
+[workspace]
+# Isolated workspace root; intentionally not a member of the parent .ironclad crate
+# so upstream merges of nearai/ironclad stay clean.
+
+[package]
+name = "ironclad-dashboard"
+version = "0.1.0"
+edition = "2021"
+description = "JARVIS dashboard frontend: Leptos + Tailwind + Trunk, served on localhost:3000"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+leptos = { version = "0.7", features = ["csr"] }
+console_error_panic_hook = "0.1"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+gloo-net = { version = "0.6", features = ["http"] }
+web-sys = { version = "0.3", features = [
+  "Window", "Location", "Navigator",
+  "HtmlInputElement", "HtmlAudioElement",
+  "MediaDevices", "MediaStream", "MediaStreamConstraints", "MediaStreamTrack",
+  "MediaRecorder", "MediaRecorderOptions", "BlobEvent",
+  "Blob", "BlobPropertyBag",
+  "AudioContext", "AudioContextOptions", "AudioContextState",
+  "OfflineAudioContext",
+  "AudioBuffer", "AudioBufferSourceNode", "AudioDestinationNode", "AudioNode",
+  "AnalyserNode", "MediaStreamAudioSourceNode",
+  "AudioWorklet", "AudioWorkletNode", "AudioWorkletNodeOptions", "Worklet",
+  "MessagePort",
+  "WebTransport", "WebTransportOptions", "WebTransportHash",
+  "WebTransportDatagramDuplexStream", "WebTransportSendStream",
+  "WebTransportReceiveStream", "WebTransportBidirectionalStream",
+  "ReadableStream", "ReadableStreamDefaultReader", "WritableStream",
+  "WritableStreamDefaultWriter",
+  "EventSource", "MessageEvent",
+  "Url",
+  "Document", "Element", "HtmlElement", "HtmlVideoElement", "HtmlCanvasElement",
+  "CanvasRenderingContext2d",
+  "DisplayMediaStreamConstraints",
+  "MediaStreamTrackState",
+  "PictureInPictureWindow",
+] }
+js-sys = "0.3"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

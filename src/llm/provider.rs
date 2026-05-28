@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::LlmError;
 
+
 /// Role in a conversation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -32,6 +33,11 @@ pub struct ChatMessage {
     /// tool_calls when followed by tool result messages.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
+    /// Base64-encoded PNG images attached to a user message. Anthropic
+    /// renders these as image content blocks; other providers ignore them.
+    /// Stored without the `data:image/png;base64,` prefix.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<String>>,
 }
 
 impl ChatMessage {
@@ -43,6 +49,7 @@ impl ChatMessage {
             tool_call_id: None,
             name: None,
             tool_calls: None,
+            images: None,
         }
     }
 
@@ -54,6 +61,7 @@ impl ChatMessage {
             tool_call_id: None,
             name: None,
             tool_calls: None,
+            images: None,
         }
     }
 
@@ -65,6 +73,7 @@ impl ChatMessage {
             tool_call_id: None,
             name: None,
             tool_calls: None,
+            images: None,
         }
     }
 
@@ -86,6 +95,7 @@ impl ChatMessage {
             } else {
                 Some(tool_calls)
             },
+            images: None,
         }
     }
 
@@ -101,6 +111,21 @@ impl ChatMessage {
             tool_call_id: Some(tool_call_id.into()),
             name: Some(name.into()),
             tool_calls: None,
+            images: None,
+        }
+    }
+
+    /// Create a user message with one or more base64-encoded PNG images
+    /// attached. The Anthropic provider builds image content blocks; other
+    /// providers see only the text.
+    pub fn user_with_images(content: impl Into<String>, images: Vec<String>) -> Self {
+        Self {
+            role: Role::User,
+            content: content.into(),
+            tool_call_id: None,
+            name: None,
+            tool_calls: None,
+            images: if images.is_empty() { None } else { Some(images) },
         }
     }
 }
@@ -253,6 +278,38 @@ pub trait LlmProvider: Send + Sync {
         &self,
         request: ToolCompletionRequest,
     ) -> Result<ToolCompletionResponse, LlmError>;
+
+    /// Complete a chat conversation, streaming text chunks to a callback as
+    /// they arrive. Default implementation falls back to non-streaming and
+    /// emits the full text as one chunk; providers that support streaming
+    /// (Anthropic) override this.
+    async fn complete_streaming(
+        &self,
+        request: CompletionRequest,
+        mut on_chunk: Box<dyn FnMut(String) + Send>,
+    ) -> Result<CompletionResponse, LlmError> {
+        let resp = self.complete(request).await?;
+        on_chunk(resp.content.clone());
+        Ok(resp)
+    }
+
+    /// Tool-aware streaming variant. Streams text deltas to `on_chunk` while
+    /// also accumulating tool-use blocks. Returns the full assembled response
+    /// including any tool calls the model made.
+    ///
+    /// Default falls back to non-streaming `complete_with_tools`; providers
+    /// that support streaming (Anthropic) override.
+    async fn complete_with_tools_streaming(
+        &self,
+        request: ToolCompletionRequest,
+        mut on_chunk: Box<dyn FnMut(String) + Send>,
+    ) -> Result<ToolCompletionResponse, LlmError> {
+        let resp = self.complete_with_tools(request).await?;
+        if let Some(ref text) = resp.content {
+            on_chunk(text.clone());
+        }
+        Ok(resp)
+    }
 
     /// List available models from the provider.
     /// Default implementation returns empty list.

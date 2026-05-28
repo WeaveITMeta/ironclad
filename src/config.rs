@@ -1,4 +1,4 @@
-//! Configuration for IronClaw.
+//! Configuration for Iron Clad.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -21,6 +21,7 @@ pub struct Config {
     pub builder: BuilderModeConfig,
     pub heartbeat: HeartbeatConfig,
     pub sandbox: SandboxModeConfig,
+    pub voice: VoiceConfig,
 }
 
 impl Config {
@@ -41,7 +42,64 @@ impl Config {
             builder: BuilderModeConfig::from_env()?,
             heartbeat: HeartbeatConfig::from_env()?,
             sandbox: SandboxModeConfig::from_env()?,
+            voice: VoiceConfig::from_env()?,
         })
+    }
+}
+
+/// Voice gateway configuration.
+///
+/// STT talks to a long-running `whisper-server` over HTTP (the daemon is
+/// launched by `cargo run-jarvis`). TTS shells out to `piper` per-request,
+/// which is cheap because piper loads its model in ~0.4s.
+#[derive(Debug, Clone, Default)]
+pub struct VoiceConfig {
+    /// HTTP base URL for the whisper-server daemon.
+    /// Default: `http://127.0.0.1:8932`. STT endpoint POSTs to `{url}/inference`.
+    pub whisper_url: Option<String>,
+    /// Path to `whisper-server.exe`. Used by `jarvis_up` to spawn the daemon.
+    pub whisper_server_bin: Option<PathBuf>,
+    /// Path to a Whisper model file (e.g., `ggml-large-v3-turbo-q8_0.bin`).
+    /// Used by `jarvis_up` when launching the daemon.
+    pub whisper_model: Option<PathBuf>,
+    /// Path to the `piper` binary.
+    pub piper_path: Option<PathBuf>,
+    /// Path to a Piper voice model (`.onnx`). The matching `.onnx.json` is
+    /// expected alongside it.
+    pub piper_voice: Option<PathBuf>,
+}
+
+impl VoiceConfig {
+    fn from_env() -> Result<Self, ConfigError> {
+        Ok(Self {
+            whisper_url: optional_env("WHISPER_SERVER_URL")?,
+            whisper_server_bin: optional_env("WHISPER_PATH")?.map(PathBuf::from),
+            whisper_model: optional_env("WHISPER_MODEL")?.map(PathBuf::from),
+            piper_path: optional_env("PIPER_PATH")?.map(PathBuf::from),
+            piper_voice: optional_env("PIPER_VOICE")?.map(PathBuf::from),
+        })
+    }
+
+    /// Resolved whisper-server HTTP base URL with default.
+    pub fn whisper_url_or_default(&self) -> String {
+        self.whisper_url
+            .clone()
+            .unwrap_or_else(|| "http://127.0.0.1:8932".to_string())
+    }
+
+    /// True when STT is reachable (we have a URL to call). The status handler
+    /// doesn't ping the daemon; if STT is mis-wired you'll see a 502 at
+    /// transcription time. Keeps `/api/voice/status` fast.
+    pub fn stt_ready(&self) -> bool {
+        // Always ready in principle once the gateway is up; the daemon may
+        // not be running but the URL is. Surface the truth via the actual
+        // STT call's error path.
+        true
+    }
+
+    /// True if TTS is ready (binary + voice both configured).
+    pub fn tts_ready(&self) -> bool {
+        self.piper_path.is_some() && self.piper_voice.is_some()
     }
 }
 
@@ -121,94 +179,48 @@ impl TunnelConfig {
 }
 
 
-/// LLM provider configuration (NEAR AI only).
+/// LLM provider configuration. Single backend: Anthropic Claude API.
 #[derive(Debug, Clone)]
 pub struct LlmConfig {
-    pub nearai: NearAiConfig,
+    pub anthropic: AnthropicConfig,
 }
 
-/// API mode for NEAR AI.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum NearAiApiMode {
-    /// Use the Responses API (chat-api proxy) - session-based auth
-    #[default]
-    Responses,
-    /// Use the Chat Completions API (cloud-api) - API key auth
-    ChatCompletions,
+/// Anthropic Claude API configuration.
+#[derive(Debug, Clone)]
+pub struct AnthropicConfig {
+    /// Model alias or dated ID (e.g., "claude-sonnet-4-6" or "claude-sonnet-4-6-20251001").
+    pub model: String,
+    /// Base URL for the Anthropic API. Default: https://api.anthropic.com
+    pub base_url: String,
+    /// API key from `ANTHROPIC_API_KEY` (`sk-ant-...`). Required at runtime.
+    pub api_key: Option<SecretString>,
+    /// Default max_tokens applied when a request omits the field.
+    pub default_max_tokens: u32,
 }
 
-impl std::str::FromStr for NearAiApiMode {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "responses" | "response" => Ok(Self::Responses),
-            "chat_completions" | "chatcompletions" | "chat" | "completions" => {
-                Ok(Self::ChatCompletions)
-            }
-            _ => Err(format!(
-                "invalid API mode '{}', expected 'responses' or 'chat_completions'",
-                s
-            )),
+impl Default for AnthropicConfig {
+    fn default() -> Self {
+        Self {
+            model: "claude-sonnet-4-6".to_string(),
+            base_url: "https://api.anthropic.com".to_string(),
+            api_key: None,
+            default_max_tokens: 4096,
         }
     }
 }
 
-/// NEAR AI chat-api configuration.
-#[derive(Debug, Clone)]
-pub struct NearAiConfig {
-    /// Model to use (e.g., "claude-3-5-sonnet-20241022", "gpt-4o")
-    pub model: String,
-    /// Base URL for the NEAR AI API (default: https://api.near.ai)
-    pub base_url: String,
-    /// Base URL for auth/refresh endpoints (default: https://private.near.ai)
-    pub auth_base_url: String,
-    /// Path to session file (default: ~/.ironclaw/session.json)
-    pub session_path: PathBuf,
-    /// API mode: "responses" (chat-api) or "chat_completions" (cloud-api)
-    pub api_mode: NearAiApiMode,
-    /// API key for cloud-api (required for chat_completions mode)
-    pub api_key: Option<SecretString>,
-}
-
 impl LlmConfig {
     fn from_env() -> Result<Self, ConfigError> {
-        let api_key = optional_env("NEARAI_API_KEY")?.map(SecretString::from);
-
-        // Determine API mode: explicit setting, or infer from API key presence
-        let api_mode = if let Some(mode_str) = optional_env("NEARAI_API_MODE")? {
-            mode_str.parse().map_err(|e| ConfigError::InvalidValue {
-                key: "NEARAI_API_MODE".to_string(),
-                message: e,
-            })?
-        } else if api_key.is_some() {
-            // If API key is provided, default to chat_completions mode
-            NearAiApiMode::ChatCompletions
-        } else {
-            NearAiApiMode::Responses
+        let api_key = optional_env("ANTHROPIC_API_KEY")?.map(SecretString::from);
+        let anthropic = AnthropicConfig {
+            model: optional_env("ANTHROPIC_MODEL")?
+                .unwrap_or_else(|| "claude-sonnet-4-6".to_string()),
+            base_url: optional_env("ANTHROPIC_BASE_URL")?
+                .unwrap_or_else(|| "https://api.anthropic.com".to_string()),
+            api_key,
+            default_max_tokens: parse_optional_env("ANTHROPIC_DEFAULT_MAX_TOKENS", 4096u32)?,
         };
-
-        Ok(Self {
-            nearai: NearAiConfig {
-                // Load model from saved settings first, then env, then default
-                model: crate::settings::Settings::load()
-                    .selected_model
-                    .or_else(|| optional_env("NEARAI_MODEL").ok().flatten())
-                    .unwrap_or_else(|| {
-                        "fireworks::accounts/fireworks/models/llama4-maverick-instruct-basic"
-                            .to_string()
-                    }),
-                base_url: optional_env("NEARAI_BASE_URL")?
-                    .unwrap_or_else(|| "https://cloud-api.near.ai".to_string()),
-                auth_base_url: optional_env("NEARAI_AUTH_URL")?
-                    .unwrap_or_else(|| "https://private.near.ai".to_string()),
-                session_path: optional_env("NEARAI_SESSION_PATH")?
-                    .map(PathBuf::from)
-                    .unwrap_or_else(default_session_path),
-                api_mode,
-                api_key,
-            },
-        })
+        Ok(Self { anthropic })
     }
 }
 
@@ -217,7 +229,7 @@ impl LlmConfig {
 pub struct EmbeddingsConfig {
     /// Whether embeddings are enabled.
     pub enabled: bool,
-    /// Provider to use: "openai" or "nearai"
+    /// Embeddings provider. Only "openai" is supported.
     pub provider: String,
     /// OpenAI API key (for OpenAI provider).
     pub openai_api_key: Option<SecretString>,
@@ -277,21 +289,13 @@ impl EmbeddingsConfig {
     }
 }
 
-/// Get the default session file path (~/.ironclaw/session.json).
-fn default_session_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".ironclaw")
-        .join("session.json")
-}
-
 /// Channel configurations.
 #[derive(Debug, Clone)]
 pub struct ChannelsConfig {
     pub cli: CliConfig,
     pub http: Option<HttpConfig>,
     pub gateway: Option<GatewayConfig>,
-    /// Directory containing WASM channel modules (default: ~/.ironclaw/channels/).
+    /// Directory containing WASM channel modules (default: ~/.ironclad/channels/).
     pub wasm_channels_dir: std::path::PathBuf,
     /// Whether WASM channels are enabled.
     pub wasm_channels_enabled: bool,
@@ -386,11 +390,11 @@ impl ChannelsConfig {
     }
 }
 
-/// Get the default channels directory (~/.ironclaw/channels/).
+/// Get the default channels directory (~/.ironclad/channels/).
 fn default_channels_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".ironclaw")
+        .join(".ironclad")
         .join("channels")
 }
 
@@ -512,7 +516,7 @@ impl SafetyConfig {
 pub struct WasmConfig {
     /// Whether WASM tool execution is enabled.
     pub enabled: bool,
-    /// Directory containing installed WASM tools (default: ~/.ironclaw/tools/).
+    /// Directory containing installed WASM tools (default: ~/.ironclad/tools/).
     pub tools_dir: PathBuf,
     /// Default memory limit in bytes (default: 10 MB).
     pub default_memory_limit: u64,
@@ -573,7 +577,7 @@ impl SecretsConfig {
                             // This might happen if keychain was cleared
                             tracing::warn!(
                                 "Secrets configured for keychain but key not found. \
-                                 Run 'ironclaw onboard' to reconfigure."
+                                 Run 'ironclad onboard' to reconfigure."
                             );
                             (None, KeySource::None)
                         }
@@ -629,11 +633,11 @@ impl Default for WasmConfig {
     }
 }
 
-/// Get the default tools directory (~/.ironclaw/tools/).
+/// Get the default tools directory (~/.ironclad/tools/).
 fn default_tools_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".ironclaw")
+        .join(".ironclad")
         .join("tools")
 }
 

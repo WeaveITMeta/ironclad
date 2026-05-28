@@ -29,11 +29,15 @@
 pub mod auth;
 mod client;
 pub mod config;
+mod namespace_router;
 mod protocol;
 pub mod session;
+mod stdio_client;
 
 pub use auth::{is_authenticated, refresh_access_token};
 pub use client::McpClient;
 pub use config::{McpServerConfig, McpServersFile, OAuthConfig};
+pub use namespace_router::install_namespace_routers;
 pub use protocol::{InitializeResult, McpRequest, McpResponse, McpTool};
 pub use session::McpSessionManager;
+pub use stdio_client::StdioMcpClient;

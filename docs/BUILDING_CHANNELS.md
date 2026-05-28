@@ -1,6 +1,6 @@
 # Building WASM Channels
 
-This guide covers how to build WASM channel modules for IronClaw.
+This guide covers how to build WASM channel modules for Iron Clad.
 
 ## Overview
 
@@ -19,7 +19,7 @@ channels/                    # Or channels-src/
 
 After building, deploy to:
 ```
-~/.ironclaw/channels/
+~/.ironclad/channels/
 ├── my-channel.wasm
 └── my-channel.capabilities.json
 ```
@@ -31,7 +31,7 @@ After building, deploy to:
 name = "my-channel"
 version = "0.1.0"
 edition = "2021"
-description = "My messaging platform channel for IronClaw"
+description = "My messaging platform channel for Iron Clad"
 
 [lib]
 crate-type = ["cdylib"]
@@ -251,9 +251,9 @@ Create `my-channel.capabilities.json`:
 cd channels/my-channel
 cargo component build --release
 
-# Deploy to ~/.ironclaw/channels/
-cp target/wasm32-wasip1/release/my_channel.wasm ~/.ironclaw/channels/my-channel.wasm
-cp my-channel.capabilities.json ~/.ironclaw/channels/
+# Deploy to ~/.ironclad/channels/
+cp target/wasm32-wasip1/release/my_channel.wasm ~/.ironclad/channels/my-channel.wasm
+cp my-channel.capabilities.json ~/.ironclad/channels/
 ```
 
 ## Host Functions Available

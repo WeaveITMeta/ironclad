@@ -1,11 +1,11 @@
-//! IronClaw - Main entry point.
+//! Iron Clad - Main entry point.
 
 use std::sync::Arc;
 
 use clap::Parser;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
-use ironclaw::{
+use ironclad::{
     agent::{Agent, AgentDeps, SessionManager},
     channels::{
         ChannelManager, GatewayChannel, HttpChannel, ReplChannel, WebhookServer,
@@ -23,27 +23,27 @@ use ironclaw::{
     context::ContextManager,
     extensions::ExtensionManager,
     history::FjallHistoryStore as Store,
-    llm::{SessionConfig, create_llm_provider, create_session_manager},
+    llm::create_llm_provider,
     safety::SafetyLayer,
     secrets::{FjallSecretsStore, SecretsCrypto, SecretsStore},
     settings::Settings,
-    setup::{SetupConfig, SetupWizard},
+    setup::run_onboard_mode,
     tools::{
         ToolRegistry,
         mcp::{McpClient, McpSessionManager, config::load_mcp_servers, is_authenticated},
         wasm::{WasmToolLoader, WasmToolRuntime},
     },
     workspace::{
-        EmbeddingProvider, FjallStore, FtsIndex, NearAiEmbeddings, OpenAiEmbeddings, Repository,
-        VectorStore, Workspace,
+        EmbeddingProvider, FjallStore, FtsIndex, OpenAiEmbeddings, Repository, VectorStore,
+        Workspace,
     },
 };
 
-/// IronClaw's local data directory (`~/.ironclaw`), created if missing.
-fn ironclaw_data_dir() -> std::path::PathBuf {
+/// Iron Clad's local data directory (`~/.ironclad`), created if missing.
+fn ironclad_data_dir() -> std::path::PathBuf {
     let dir = dirs::home_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".ironclaw");
+        .join(".ironclad");
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
@@ -56,7 +56,7 @@ async fn open_memory_repository(
 ) -> Option<Repository> {
     let dir = dirs::home_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".ironclaw");
+        .join(".ironclad");
     let _ = std::fs::create_dir_all(&dir);
 
     let docs = match FjallStore::open(&dir.join("memory-index").to_string_lossy()) {
@@ -109,7 +109,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Config(config_cmd)) => {
             // Config commands don't need logging setup
-            return ironclaw::cli::run_config_command(config_cmd.clone())
+            return ironclad::cli::run_config_command(config_cmd.clone())
                 .map_err(|e| anyhow::anyhow!("{}", e));
         }
         Some(Command::Mcp(mcp_cmd)) => {
@@ -133,39 +133,21 @@ async fn main() -> anyhow::Result<()> {
             let _ = dotenvy::dotenv();
             let config = Config::from_env().map_err(|e| anyhow::anyhow!("{}", e))?;
 
-            // Set up embeddings if available
-            let session = ironclaw::llm::create_session_manager(ironclaw::llm::SessionConfig {
-                auth_base_url: config.llm.nearai.auth_base_url.clone(),
-                session_path: config.llm.nearai.session_path.clone(),
-                ..Default::default()
-            })
-            .await;
-
-            let embeddings: Option<Arc<dyn ironclaw::workspace::EmbeddingProvider>> =
+            // Set up embeddings if available (OpenAI only)
+            let embeddings: Option<Arc<dyn ironclad::workspace::EmbeddingProvider>> =
                 if config.embeddings.enabled {
-                    match config.embeddings.provider.as_str() {
-                        "nearai" => Some(Arc::new(
-                            ironclaw::workspace::NearAiEmbeddings::new(
-                                &config.llm.nearai.base_url,
-                                session,
-                            )
-                            .with_model(&config.embeddings.model, 1536),
-                        )),
-                        _ => {
-                            if let Some(api_key) = config.embeddings.openai_api_key() {
-                                let dim = match config.embeddings.model.as_str() {
-                                    "text-embedding-3-large" => 3072,
-                                    _ => 1536,
-                                };
-                                Some(Arc::new(ironclaw::workspace::OpenAiEmbeddings::with_model(
-                                    api_key,
-                                    &config.embeddings.model,
-                                    dim,
-                                )))
-                            } else {
-                                None
-                            }
-                        }
+                    if let Some(api_key) = config.embeddings.openai_api_key() {
+                        let dim = match config.embeddings.model.as_str() {
+                            "text-embedding-3-large" => 3072,
+                            _ => 1536,
+                        };
+                        Some(Arc::new(ironclad::workspace::OpenAiEmbeddings::with_model(
+                            api_key,
+                            &config.embeddings.model,
+                            dim,
+                        )))
+                    } else {
+                        None
                     }
                 } else {
                     None
@@ -185,19 +167,23 @@ async fn main() -> anyhow::Result<()> {
             return run_status_command().await;
         }
         Some(Command::Onboard {
-            skip_auth,
-            channels_only,
+            skip_auth: _,
+            channels_only: _,
         }) => {
-            // Load .env before running onboarding wizard
+            // Onboarding now runs entirely in the Leptos dashboard. The legacy
+            // CLI prompts are gone; this subcommand fires up the web-only
+            // wizard backend and waits for the user to drive it from the
+            // dashboard (or `cargo run-jarvis`).
             let _ = dotenvy::dotenv();
 
-            let config = SetupConfig {
-                skip_auth: *skip_auth,
-                channels_only: *channels_only,
-            };
-            let mut wizard = SetupWizard::with_config(config);
-            wizard.run().await?;
-            return Ok(());
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+                )
+                .init();
+
+            let (host, port) = onboard_bind_addr();
+            return run_onboard_mode(&host, port).await;
         }
         None | Some(Command::Run) => {
             // Continue to run agent
@@ -207,45 +193,42 @@ async fn main() -> anyhow::Result<()> {
     // Load .env if present
     let _ = dotenvy::dotenv();
 
-    // Enhanced first-run detection
-    if !cli.no_onboard {
-        if let Some(reason) = check_onboard_needed() {
-            println!("Onboarding needed: {}", reason);
-            println!();
-            let mut wizard = SetupWizard::new();
-            wizard.run().await?;
-        }
+    // First-run check: if the user hasn't completed onboarding, run the web
+    // wizard backend instead of the agent. The Leptos dashboard (served by
+    // Trunk via `cargo run-jarvis`) hits these endpoints to drive setup; once
+    // the user posts to `/api/onboard/complete`, they restart Iron Clad to
+    // enter full mode. The legacy CLI wizard no longer exists.
+    if !cli.no_onboard && !Settings::load().onboard_completed {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .init();
+
+        let (host, port) = onboard_bind_addr();
+        return run_onboard_mode(&host, port).await;
     }
 
     // Load configuration (after potential setup)
     let config = match Config::from_env() {
         Ok(c) => c,
-        Err(ironclaw::error::ConfigError::MissingRequired { key, hint }) => {
+        Err(ironclad::error::ConfigError::MissingRequired { key, hint }) => {
             eprintln!("Configuration error: Missing required setting '{}'", key);
             eprintln!("  {}", hint);
             eprintln!();
             eprintln!(
-                "Run 'ironclaw onboard' to configure, or set the required environment variables."
+                "Run 'ironclad onboard' to configure, or set the required environment variables."
             );
             std::process::exit(1);
         }
         Err(e) => return Err(e.into()),
     };
 
-    // Initialize session manager and authenticate before channel setup
-    let session_config = SessionConfig {
-        auth_base_url: config.llm.nearai.auth_base_url.clone(),
-        session_path: config.llm.nearai.session_path.clone(),
-        ..Default::default()
-    };
-    let session = create_session_manager(session_config).await;
-
-    // Ensure we're authenticated before proceeding (may trigger login flow)
-    session.ensure_authenticated().await?;
+    // LLM auth is done via API key (ANTHROPIC_API_KEY). No session manager needed.
 
     // Initialize tracing
     let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("ironclaw=info,tower_http=debug"));
+        .unwrap_or_else(|_| EnvFilter::new("ironclad=info,tower_http=debug"));
 
     // Create log broadcaster before tracing init so the WebLogLayer can capture all events.
     // This gets wired to the gateway's /api/logs/events SSE endpoint later.
@@ -266,66 +249,51 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    tracing::info!("Starting IronClaw...");
+    tracing::info!("Starting Iron Clad...");
     tracing::info!("Loaded configuration for agent: {}", config.agent.name);
-    tracing::info!("NEAR AI session authenticated");
+    tracing::info!("LLM: Anthropic Claude API ({})", config.llm.anthropic.model);
 
     // Initialize the embedded history store (optional for testing)
     let store = if cli.no_db {
         tracing::warn!("Running without history store");
         None
     } else {
-        let store = Store::open(&ironclaw_data_dir().join("history-index").to_string_lossy())?;
+        let store = Store::open(&ironclad_data_dir().join("history-index").to_string_lossy())?;
         tracing::info!("History store (Fjall) ready");
         Some(Arc::new(store))
     };
 
-    // Initialize LLM provider (clone session so we can reuse it for embeddings)
-    let llm = create_llm_provider(&config.llm, session.clone())?;
+    // Initialize LLM provider (Anthropic Claude API via ANTHROPIC_API_KEY)
+    let llm = create_llm_provider(&config.llm)?;
     tracing::info!("LLM provider initialized: {}", llm.model_name());
 
     // Initialize safety layer
     let safety = Arc::new(SafetyLayer::new(&config.safety));
     tracing::info!("Safety layer initialized");
 
-    // Initialize tool registry
+    // Initialize tool registry. `register_builtin_tools()` already emits a
+    // "Registered N built-in tools" line, so don't double-log it here.
     let tools = Arc::new(ToolRegistry::new());
     tools.register_builtin_tools();
-    tracing::info!("Registered {} built-in tools", tools.count());
 
-    // Create embeddings provider if configured
+    // Create embeddings provider if configured (OpenAI only)
     let embeddings: Option<Arc<dyn EmbeddingProvider>> = if config.embeddings.enabled {
-        match config.embeddings.provider.as_str() {
-            "nearai" => {
-                tracing::info!(
-                    "Embeddings enabled via NEAR AI (model: {})",
-                    config.embeddings.model
-                );
-                Some(Arc::new(
-                    NearAiEmbeddings::new(&config.llm.nearai.base_url, session.clone())
-                        .with_model(&config.embeddings.model, 1536),
-                ))
-            }
-            _ => {
-                // Default to OpenAI for unknown providers
-                if let Some(api_key) = config.embeddings.openai_api_key() {
-                    tracing::info!(
-                        "Embeddings enabled via OpenAI (model: {})",
-                        config.embeddings.model
-                    );
-                    Some(Arc::new(OpenAiEmbeddings::with_model(
-                        api_key,
-                        &config.embeddings.model,
-                        match config.embeddings.model.as_str() {
-                            "text-embedding-3-large" => 3072,
-                            _ => 1536, // text-embedding-3-small and ada-002
-                        },
-                    )))
-                } else {
-                    tracing::warn!("Embeddings configured but OPENAI_API_KEY not set");
-                    None
-                }
-            }
+        if let Some(api_key) = config.embeddings.openai_api_key() {
+            tracing::info!(
+                "Embeddings enabled via OpenAI (model: {})",
+                config.embeddings.model
+            );
+            Some(Arc::new(OpenAiEmbeddings::with_model(
+                api_key,
+                &config.embeddings.model,
+                match config.embeddings.model.as_str() {
+                    "text-embedding-3-large" => 3072,
+                    _ => 1536, // text-embedding-3-small and ada-002
+                },
+            )))
+        } else {
+            tracing::warn!("Embeddings configured but OPENAI_API_KEY not set");
+            None
         }
     } else {
         tracing::info!("Embeddings disabled (set OPENAI_API_KEY or EMBEDDING_ENABLED=true)");
@@ -343,8 +311,58 @@ async fn main() -> anyhow::Result<()> {
             workspace = workspace.with_embeddings(emb.clone());
         }
         let workspace = Arc::new(workspace);
+
+        // Bootstrap JARVIS identity files if missing. These get loaded into
+        // every Claude system prompt by Workspace::system_prompt(), so they
+        // set JARVIS's voice and behavior across all chats. Idempotent: only
+        // writes when the path doesn't already exist.
+        bootstrap_jarvis_identity(&workspace).await;
+
         tools.register_memory_tools(workspace);
+        // Vault bridge: read / list / write tools scoped to VAULT_PATH.
+        // Reads + lists are auto-approved (the LLM can recon the vault
+        // freely); writes still pop the approval banner.
+        tools.register_vault_tools();
     }
+    // Native GitHub tools (no-op when GITHUB_PAT is unset).
+    tools.register_github_tools();
+    // Self-introspection so JARVIS can ask "what can I do?" mid-conversation.
+    tools.register_tool_inventory_tool();
+    // Workspaces.md parser for mission-driven desktop layouts.
+    tools.register_mission_lookup_tool();
+    // Native Win11 virtual-desktop control (list / switch / new / move-window)
+    // plus monitor enumeration and snap-zone window placement. Reads
+    // auto-approve; writes pop the banner.
+    tools.register_windows_desktop_tools();
+
+    // Build Sonnet + Opus providers up-front (cheap; just clones the
+    // AnthropicConfig with model override). We hold them here and register
+    // `spawn_agent` later, AFTER the ChannelManager is built, so the tool
+    // can broadcast completion summaries back to McKale.
+    let subagent_providers: Option<(
+        Arc<dyn ironclad::llm::LlmProvider>,
+        Arc<dyn ironclad::llm::LlmProvider>,
+    )> = {
+        use ironclad::llm::AnthropicProvider;
+        let mut sonnet_cfg = config.llm.anthropic.clone();
+        sonnet_cfg.model = std::env::var("SUBAGENT_SONNET_MODEL")
+            .unwrap_or_else(|_| "claude-sonnet-4-6".to_string());
+        let mut opus_cfg = config.llm.anthropic.clone();
+        opus_cfg.model = std::env::var("SUBAGENT_OPUS_MODEL")
+            .unwrap_or_else(|_| "claude-opus-4-7".to_string());
+        match (AnthropicProvider::new(sonnet_cfg), AnthropicProvider::new(opus_cfg)) {
+            (Ok(s), Ok(o)) => Some((
+                Arc::new(s) as Arc<dyn ironclad::llm::LlmProvider>,
+                Arc::new(o) as Arc<dyn ironclad::llm::LlmProvider>,
+            )),
+            (Err(e), _) | (_, Err(e)) => {
+                tracing::warn!(
+                    "spawn_agent not registered (failed to build Sonnet/Opus providers): {e}"
+                );
+                None
+            }
+        }
+    };
 
     // Register builder tool if enabled
     if config.builder.enabled {
@@ -363,7 +381,7 @@ async fn main() -> anyhow::Result<()> {
         if let Some(master_key) = config.secrets.master_key() {
             match SecretsCrypto::new(master_key.clone()) {
                 Ok(crypto) => match FjallSecretsStore::open(
-                    &ironclaw_data_dir().join("secrets-index").to_string_lossy(),
+                    &ironclad_data_dir().join("secrets-index").to_string_lossy(),
                     Arc::new(crypto),
                 ) {
                     Ok(s) => Some(Arc::new(s)),
@@ -423,37 +441,99 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let mcp_servers_future = async {
-        if let Some(ref secrets) = secrets_store {
-            match load_mcp_servers().await {
-                Ok(servers) => {
-                    let enabled: Vec<_> = servers.enabled_servers().cloned().collect();
-                    if !enabled.is_empty() {
-                        tracing::info!("Loading {} configured MCP server(s)...", enabled.len());
-                    }
+        // MCP loading used to be entirely gated on `secrets_store` being
+        // Some, which silently disabled the whole loader when
+        // `SECRETS_MASTER_KEY` wasn't in `.env`. That broke Playwright +
+        // Eustress (neither needs a secrets store; only OAuth-authenticated
+        // remote MCPs do). Now we load every server, and only skip the
+        // ones that genuinely require auth when no secrets store is open.
+        match load_mcp_servers().await {
+            Ok(servers) => {
+                let enabled: Vec<_> = servers.enabled_servers().cloned().collect();
+                if !enabled.is_empty() {
+                    tracing::info!("Loading {} configured MCP server(s)...", enabled.len());
+                }
 
-                    let mut join_set = tokio::task::JoinSet::new();
-                    for server in enabled {
-                        let mcp_sm = Arc::clone(&mcp_session_manager);
-                        let secrets = Arc::clone(secrets);
-                        let tools = Arc::clone(&tools);
+                let mut join_set = tokio::task::JoinSet::new();
+                for server in enabled {
+                    let mcp_sm = Arc::clone(&mcp_session_manager);
+                    let secrets_opt = secrets_store.as_ref().map(Arc::clone);
+                    let tools = Arc::clone(&tools);
 
                         join_set.spawn(async move {
                             let server_name = server.name.clone();
-                            tracing::debug!(
-                                "Checking authentication for MCP server '{}'...",
-                                server_name
-                            );
-                            let has_tokens = is_authenticated(&server, &secrets, "default").await;
-                            tracing::debug!(
-                                "MCP server '{}' has_tokens={}",
-                                server_name,
-                                has_tokens
-                            );
 
-                            let client = if has_tokens || server.requires_auth() {
-                                McpClient::new_authenticated(server, mcp_sm, secrets, "default")
-                            } else {
-                                McpClient::new_with_name(&server_name, &server.url)
+                            // Stdio MCP servers go through a separate transport
+                            // (subprocess + newline-JSON-RPC). The HTTP client's
+                            // OAuth / session machinery doesn't apply.
+                            if server.is_stdio() {
+                                tracing::debug!(
+                                    "Spawning stdio MCP server '{}': {}",
+                                    server_name,
+                                    server.command.as_deref().unwrap_or("(no command)")
+                                );
+                                match ironclad::tools::mcp::StdioMcpClient::spawn(&server).await {
+                                    Ok(client) => {
+                                        let client = std::sync::Arc::new(client);
+                                        match client.create_tools().await {
+                                            Ok(tool_impls) => {
+                                                let n = tool_impls.len();
+                                                for tool in tool_impls {
+                                                    tools.register(tool).await;
+                                                }
+                                                tracing::info!(
+                                                    "Loaded {} tools from stdio MCP '{}'",
+                                                    n,
+                                                    server_name
+                                                );
+                                            }
+                                            Err(e) => tracing::warn!(
+                                                "stdio MCP '{}' create_tools failed: {}",
+                                                server_name,
+                                                e
+                                            ),
+                                        }
+                                    }
+                                    Err(e) => tracing::warn!(
+                                        "stdio MCP '{}' spawn failed: {}",
+                                        server_name,
+                                        e
+                                    ),
+                                }
+                                return;
+                            }
+
+                            // Pick HTTP transport: authenticated when the
+                            // server declares OAuth AND we have a secrets
+                            // store to fetch tokens from, otherwise simple
+                            // unauthenticated (works for the local Playwright
+                            // MCPs that don't require auth).
+                            let client = match (server.requires_auth(), &secrets_opt) {
+                                (true, Some(secrets)) => {
+                                    let has_tokens = is_authenticated(&server, secrets, "default").await;
+                                    tracing::debug!(
+                                        "MCP '{}' requires auth, has_tokens={}",
+                                        server_name,
+                                        has_tokens
+                                    );
+                                    McpClient::new_authenticated(
+                                        server,
+                                        mcp_sm,
+                                        Arc::clone(secrets),
+                                        "default",
+                                    )
+                                }
+                                (true, None) => {
+                                    tracing::warn!(
+                                        "MCP '{}' requires OAuth but no secrets store is open \
+                                         (SECRETS_MASTER_KEY unset). Skipping.",
+                                        server_name
+                                    );
+                                    return;
+                                }
+                                (false, _) => {
+                                    McpClient::new_with_name(&server_name, &server.url)
+                                }
                             };
 
                             tracing::debug!("Fetching tools from MCP server '{}'...", server_name);
@@ -491,7 +571,7 @@ async fn main() -> anyhow::Result<()> {
                                     {
                                         tracing::warn!(
                                             "MCP server '{}' requires authentication. \
-                                             Run: ironclaw mcp auth {}",
+                                             Run: ironclad mcp auth {}",
                                             server_name,
                                             server_name
                                         );
@@ -507,20 +587,58 @@ async fn main() -> anyhow::Result<()> {
                         });
                     }
 
-                    while let Some(result) = join_set.join_next().await {
-                        if let Err(e) = result {
-                            tracing::warn!("MCP server loading task panicked: {}", e);
-                        }
+                while let Some(result) = join_set.join_next().await {
+                    if let Err(e) = result {
+                        tracing::warn!("MCP server loading task panicked: {}", e);
                     }
                 }
-                Err(e) => {
-                    tracing::debug!("No MCP servers configured ({})", e);
-                }
+            }
+            Err(e) => {
+                tracing::debug!("No MCP servers configured ({})", e);
             }
         }
     };
 
     tokio::join!(wasm_tools_future, mcp_servers_future);
+
+    // Collapse big MCP namespaces into single router tools. Cuts the
+    // tool-definition payload sent to Claude on every turn from ~200
+    // schemas down to ~40 (native ~30 + 1 router per MCP namespace).
+    // List the namespaces explicitly: only the ones with >= 3 sub-tools
+    // actually get collapsed, but listing them here is cheap and
+    // documents intent.
+    let mcp_namespaces: &[&str] = &[
+        "playwright_marketing",
+        "playwright_personal",
+        "playwright_state",
+        "playwright_federal",
+        "playwright_tech",
+        "playwright_cdp",
+        "playwright",
+        "eustress",
+    ];
+    let _collapsed = ironclad::tools::mcp::install_namespace_routers(&tools, mcp_namespaces).await;
+
+    // Now that every native + WASM + MCP tool (and any collapsed
+    // namespace routers) is in the registry, refresh TOOLS.md so the
+    // system prompt carries an accurate categorized inventory. This is
+    // what gives Haiku a mental map of his surface without paying for
+    // the full schema list in the prompt.
+    if let Some(ref repo) = repository {
+        let workspace = Arc::new(Workspace::new("default", repo.clone()));
+        let inventory = ironclad::tools::builtin::generate_inventory(&tools).await;
+        if let Err(e) = workspace
+            .write(ironclad::workspace::paths::TOOLS, &inventory)
+            .await
+        {
+            tracing::warn!("Failed to refresh TOOLS.md inventory: {}", e);
+        } else {
+            tracing::info!(
+                "Refreshed TOOLS.md inventory ({} top-level tools)",
+                tools.count()
+            );
+        }
+    }
 
     // Create extension manager for in-chat discovery/install/auth/activate
     let extension_manager = if let Some(ref secrets) = secrets_store {
@@ -788,6 +906,7 @@ async fn main() -> anyhow::Result<()> {
         gw = gw.with_session_manager(Arc::clone(&session_manager));
         gw = gw.with_log_broadcaster(Arc::clone(&log_broadcaster));
         gw = gw.with_tool_registry(Arc::clone(&tools));
+        gw = gw.with_voice(config.voice.clone());
         if let Some(ref ext_mgr) = extension_manager {
             gw = gw.with_extension_manager(Arc::clone(ext_mgr));
         }
@@ -801,6 +920,24 @@ async fn main() -> anyhow::Result<()> {
         channels.add(Box::new(gw));
     }
 
+    // Wrap channels in Arc so spawn_agent can hold a back-reference for
+    // fire-and-forget result broadcasting, and Agent::new can hold the
+    // same shared instance. Must happen AFTER all channels.add(...) calls.
+    let channels = Arc::new(channels);
+
+    // Now that the ChannelManager is built and wrapped, register the
+    // sub-agent dispatcher so spawn_agent's background tasks can broadcast
+    // their completion summaries back to McKale as unsolicited assistant
+    // messages.
+    if let Some((sonnet, opus)) = subagent_providers {
+        tools.register_spawn_agent_tool(
+            sonnet,
+            opus,
+            Arc::clone(&channels),
+            Arc::clone(&context_manager),
+        );
+    }
+
     // Create and run the agent
     let deps = AgentDeps {
         store,
@@ -810,6 +947,7 @@ async fn main() -> anyhow::Result<()> {
         workspace,
         extension_manager,
     };
+
     let agent = Agent::new(
         config.agent.clone(),
         deps,
@@ -833,28 +971,54 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Check if onboarding is needed and return the reason.
+/// Write the JARVIS identity files into the workspace on first boot.
+/// Idempotent: only writes a path if it doesn't already exist, so users can
+/// customise them in-place via memory_write or the dashboard.
+async fn bootstrap_jarvis_identity(workspace: &Arc<ironclad::workspace::Workspace>) {
+    // (path, content, always_overwrite). Agent-managed files are rewritten
+    // every boot so changes to workspace_seed/*.md ship via `cargo build`
+    // and reach the LLM on the next restart. USER.md is create-once so
+    // McKale's edits survive.
+    let defaults: &[(&str, &str, bool)] = &[
+        ("IDENTITY.md", include_str!("../workspace_seed/IDENTITY.md"), true),
+        ("SOUL.md",     include_str!("../workspace_seed/SOUL.md"),     true),
+        ("AGENTS.md",   include_str!("../workspace_seed/AGENTS.md"),   true),
+        ("USER.md",     include_str!("../workspace_seed/USER.md"),     false),
+    ];
+    for (path, content, always_overwrite) in defaults {
+        if *always_overwrite {
+            if let Err(e) = workspace.write(path, content).await {
+                tracing::warn!("failed to refresh {}: {}", path, e);
+            } else {
+                tracing::info!("refreshed {} from seed", path);
+            }
+            continue;
+        }
+        match workspace.read(path).await {
+            Ok(_) => { /* user-editable file already there, leave it alone */ }
+            Err(_) => {
+                if let Err(e) = workspace.write(path, content).await {
+                    tracing::warn!("failed to seed {}: {}", path, e);
+                } else {
+                    tracing::info!("seeded {} into workspace", path);
+                }
+            }
+        }
+    }
+}
+
+/// Resolve the host:port the onboarding wizard should bind to.
 ///
-/// Returns `Some(reason)` if onboarding should be triggered, `None` otherwise.
-fn check_onboard_needed() -> Option<&'static str> {
-    let settings = Settings::load();
-
-    // Secrets not configured (and not in env)
-    if settings.secrets_master_key_source == ironclaw::settings::KeySource::None
-        && std::env::var("SECRETS_MASTER_KEY").is_err()
-        && !ironclaw::secrets::keychain::has_master_key()
-    {
-        // Only require secrets setup if user hasn't explicitly disabled it
-        // For now, we don't require it for first run
-    }
-
-    // First run (onboarding never completed and no session)
-    let session_path = ironclaw::llm::session::default_session_path();
-    if !settings.onboard_completed && !session_path.exists() {
-        return Some("First run");
-    }
-
-    None
+/// Honors `GATEWAY_HOST` / `GATEWAY_PORT` so `cargo run-jarvis` and the eventual
+/// full-mode gateway use the same address — restarting after onboarding swaps
+/// the onboard server out for the real gateway on the exact same socket.
+fn onboard_bind_addr() -> (String, u16) {
+    let host = std::env::var("GATEWAY_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let port = std::env::var("GATEWAY_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(3030);
+    (host, port)
 }
 
 /// Inject credentials for a channel based on naming convention.
@@ -864,7 +1028,7 @@ fn check_onboard_needed() -> Option<&'static str> {
 ///
 /// Returns the number of credentials injected.
 async fn inject_channel_credentials(
-    channel: &Arc<ironclaw::channels::wasm::WasmChannel>,
+    channel: &Arc<ironclad::channels::wasm::WasmChannel>,
     secrets: &dyn SecretsStore,
     channel_name: &str,
 ) -> anyhow::Result<usize> {

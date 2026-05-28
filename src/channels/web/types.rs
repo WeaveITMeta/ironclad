@@ -1,23 +1,29 @@
 //! Request and response DTOs for the web gateway API.
 
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 // --- Chat ---
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct SendMessageRequest {
     pub content: String,
     pub thread_id: Option<String>,
+    /// Base64-encoded PNG screenshots to send alongside the text turn.
+    /// Stored without the `data:image/png;base64,` prefix. The dashboard's
+    /// "look at screen" button captures a frame and inlines it here.
+    #[serde(default)]
+    pub images: Option<Vec<String>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SendMessageResponse {
     pub message_id: Uuid,
     pub status: &'static str,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ThreadInfo {
     pub id: Uuid,
     pub state: String,
@@ -26,13 +32,13 @@ pub struct ThreadInfo {
     pub updated_at: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ThreadListResponse {
     pub threads: Vec<ThreadInfo>,
     pub active_thread: Option<Uuid>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct TurnInfo {
     pub turn_number: usize,
     pub user_input: String,
@@ -43,14 +49,14 @@ pub struct TurnInfo {
     pub tool_calls: Vec<ToolCallInfo>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ToolCallInfo {
     pub name: String,
     pub has_result: bool,
     pub has_error: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct HistoryResponse {
     pub thread_id: Uuid,
     pub turns: Vec<TurnInfo>,
@@ -58,7 +64,7 @@ pub struct HistoryResponse {
 
 // --- Approval ---
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct ApprovalRequest {
     pub request_id: String,
     /// "approve", "always", or "deny"
@@ -99,24 +105,24 @@ pub enum SseEvent {
 
 // --- Memory ---
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct MemoryTreeResponse {
     pub entries: Vec<TreeEntry>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct TreeEntry {
     pub path: String,
     pub is_dir: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct MemoryListResponse {
     pub path: String,
     pub entries: Vec<ListEntry>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ListEntry {
     pub name: String,
     pub path: String,
@@ -124,37 +130,37 @@ pub struct ListEntry {
     pub updated_at: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct MemoryReadResponse {
     pub path: String,
     pub content: String,
     pub updated_at: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct MemoryWriteRequest {
     pub path: String,
     pub content: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct MemoryWriteResponse {
     pub path: String,
     pub status: &'static str,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct MemorySearchRequest {
     pub query: String,
     pub limit: Option<usize>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct MemorySearchResponse {
     pub results: Vec<SearchHit>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SearchHit {
     pub path: String,
     pub content: String,
@@ -163,7 +169,7 @@ pub struct SearchHit {
 
 // --- Jobs ---
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct JobInfo {
     pub id: Uuid,
     pub title: String,
@@ -173,12 +179,12 @@ pub struct JobInfo {
     pub started_at: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct JobListResponse {
     pub jobs: Vec<JobInfo>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct JobSummaryResponse {
     pub total: usize,
     pub pending: usize,
@@ -190,7 +196,7 @@ pub struct JobSummaryResponse {
 
 // --- Extensions ---
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ExtensionInfo {
     pub name: String,
     pub kind: String,
@@ -202,30 +208,30 @@ pub struct ExtensionInfo {
     pub tools: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ExtensionListResponse {
     pub extensions: Vec<ExtensionInfo>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ToolInfo {
     pub name: String,
     pub description: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ToolListResponse {
     pub tools: Vec<ToolInfo>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct InstallExtensionRequest {
     pub name: String,
     pub url: Option<String>,
     pub kind: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ActionResponse {
     pub success: bool,
     pub message: String,
@@ -331,7 +337,7 @@ impl WsServerMessage {
 
 // --- Health ---
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct HealthResponse {
     pub status: &'static str,
     pub channel: &'static str,

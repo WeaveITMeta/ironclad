@@ -1,0 +1,5 @@
+[alias]
+# `cargo run-jarvis` — boot Playwright MCP (:8931), Trunk dashboard (:3000),
+# and Iron Clad with the web gateway (:3030) as one orchestrated process.
+# Ctrl+C tears all three down.
+run-jarvis = "run --release --bin jarvis_up --"

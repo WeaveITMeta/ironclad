@@ -428,9 +428,19 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         // Record action in memory and get the ActionRecord for persistence
         let action = match &result {
             Ok(Ok(output)) => {
+                // Same trusted-source bypass as agent_loop.rs: vault/memory
+                // tools own their data and shouldn't be hit by the external-
+                // data policy heuristics.
+                let trusted = !tool.requires_sanitization();
                 let output_str = serde_json::to_string_pretty(&output.result)
                     .ok()
-                    .map(|s| safety.sanitize_tool_output(tool_name, &s).content);
+                    .map(|s| {
+                        if trusted {
+                            s
+                        } else {
+                            safety.sanitize_tool_output(tool_name, &s).content
+                        }
+                    });
                 context_manager
                     .update_memory(job_id, |mem| {
                         let rec = mem.create_action(tool_name, params.clone()).succeed(

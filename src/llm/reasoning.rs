@@ -326,6 +326,48 @@ Respond in JSON format:
         }
     }
 
+    /// Streaming variant of `respond_with_tools`. Text chunks flow into
+    /// `on_chunk` as they arrive from the LLM. Tool-use blocks (if any) are
+    /// captured and returned as `RespondResult::ToolCalls` — the caller is
+    /// expected to execute them and re-invoke. If the model produces text,
+    /// `RespondResult::Text` is returned with the fully-assembled response.
+    pub async fn respond_with_tools_streaming<F>(
+        &self,
+        context: &ReasoningContext,
+        on_chunk: F,
+    ) -> Result<RespondResult, LlmError>
+    where
+        F: FnMut(String) + Send + 'static,
+    {
+        let system_prompt = self.build_conversation_prompt(context);
+        let mut messages = vec![ChatMessage::system(system_prompt)];
+        messages.extend(context.messages.clone());
+
+        let on_chunk: Box<dyn FnMut(String) + Send> = Box::new(on_chunk);
+
+        if !context.available_tools.is_empty() {
+            let request = ToolCompletionRequest::new(messages, context.available_tools.clone())
+                .with_max_tokens(4096)
+                .with_temperature(0.7)
+                .with_tool_choice("auto");
+
+            let response = self.llm.complete_with_tools_streaming(request, on_chunk).await?;
+            if !response.tool_calls.is_empty() {
+                return Ok(RespondResult::ToolCalls(response.tool_calls));
+            }
+            let content = response
+                .content
+                .unwrap_or_else(|| "I'm not sure how to respond to that.".to_string());
+            Ok(RespondResult::Text(clean_response(&content)))
+        } else {
+            let request = CompletionRequest::new(messages)
+                .with_max_tokens(4096)
+                .with_temperature(0.7);
+            let response = self.llm.complete_streaming(request, on_chunk).await?;
+            Ok(RespondResult::Text(clean_response(&response.content)))
+        }
+    }
+
     fn build_planning_prompt(&self, context: &ReasoningContext) -> String {
         let tools_desc = if context.available_tools.is_empty() {
             "No tools available.".to_string()
@@ -392,28 +434,24 @@ Respond with a JSON plan in this format:
         };
 
         format!(
-            r#"You are NEAR AI Agent, an autonomous assistant.
+            r#"You are JARVIS, the autonomous assistant running on Iron Clad and Anthropic's Claude API.
 
-## Response Format
+## Response Format — VOICE FIRST
 
-If you need to think through a problem, wrap your thinking in <thinking> tags. Everything outside these tags goes directly to the user.
+Every token you emit is **spoken aloud through TTS**. Write like you're talking, not like you're writing a document. The user hears your reply before they ever read it.
 
-Example:
-<thinking>
-Let me consider the options...
-Option 1: ...
-Option 2: ...
-I'll go with option 1.
-</thinking>
-Here's the solution: [actual response to user]
+Hard rules:
+- **No markdown formatting in spoken responses.** No `**bold**`, no `## headers`, no `- bullet lists`, no `1. numbered lists`, no backticks, no `[link](url)` syntax. Use plain prose sentences.
+- **Lead with the headline, not the table of contents.** If McKale asks "what do we have?", reply with the one or two things that actually matter. Don't enumerate every category.
+- **Keep replies short.** Aim for 1-3 sentences for most turns. If the topic genuinely needs more, weave the structure into the prose ("First X, then Y, finally Z") instead of formatting it.
+- **No meta-commentary.** Don't narrate what you're about to do, don't wrap reasoning in `<thinking>` tags, don't summarize what the user just said.
 
-## Guidelines
-- Be concise and direct
-- Use markdown formatting where helpful
-- For code, use appropriate code blocks with language tags
-- Call tools when they would help accomplish the task{}
+The exception: if the user explicitly asks for a list, table, or code, format it. The dashboard renders markdown visually; the TTS layer strips it out before speaking. So formatted answers are still readable on screen — but default to spoken-prose because that's how the user interacts.
 
-The user sees ONLY content outside <thinking> tags.{}"#,
+## Tools
+Call tools when they would help accomplish the task. Don't announce that you're calling a tool — just call it.
+
+**Call one tool per response.** Wait for its result before deciding the next tool. Don't batch multiple tool_use blocks in a single response — that breaks the approval flow because the user can only approve one at a time and the others orphan in conversation history.{}{}"#,
             tools_section, identity_section
         )
     }

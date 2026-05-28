@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>J.A.R.V.I.S</title>
+    <meta name="description" content="J.A.R.V.I.S — Just A Rather Very Intelligent System. Iron Clad HUD on localhost:3000." />
+    <link data-trunk rel="copy-file" href="favicon.svg" />
+    <link rel="icon" type="image/svg+xml" href="favicon.svg" />
+    <link data-trunk rel="copy-file" href="audio-worklet.js" />
+    <link data-trunk rel="copy-file" href="silero.js" />
+    <!-- Silero VAD v5 via @ricky0123/vad-web. The package bundles ONNX
+         Runtime Web + the Silero VAD model and exposes a clean API for
+         browser voice-activity detection. ~2MB model loads once on first
+         use, then ~1ms per 32ms frame on CPU. Much more robust than our
+         RMS-threshold heuristic.
+         silero.js wraps NonRealTimeVAD as a single async-scoring fn so
+         the Rust side can gate utterances with one call: voice.rs detects
+         the endpoint, then `window.__sileroScore(samples_16k)` returns a
+         speech-fraction; below 0.5 means music/noise, drop. -->
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.14.0/dist/ort.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.27/dist/bundle.min.js"></script>
+    <script src="/silero.js"></script>
+    <link data-trunk rel="tailwind-css" href="style/tailwind.css" />
+    <link data-trunk rel="rust" />
+</head>
+<body class="bg-zinc-950 text-zinc-100 font-sans antialiased">
+</body>
+</html>

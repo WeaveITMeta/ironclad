@@ -2,7 +2,7 @@
 name = "gmail-tool"
 version = "0.1.0"
 edition = "2021"
-description = "Gmail integration tool for IronClaw (WASM component)"
+description = "Gmail integration tool for Iron Clad (WASM component)"
 license = "MIT OR Apache-2.0"
 publish = false
 

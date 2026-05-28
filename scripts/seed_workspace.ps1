@@ -2,7 +2,7 @@
 # Usage: pwsh scripts/seed_workspace.ps1
 
 $seedDir = "$PSScriptRoot\..\workspace_seed"
-$connStr = "-U postgres -h 127.0.0.1 -p 5432 -d ironclaw --no-psqlrc --pset=pager=off"
+$connStr = "-U postgres -h 127.0.0.1 -p 5432 -d ironclad --no-psqlrc --pset=pager=off"
 
 $files = @(
     "USER.md",
@@ -29,7 +29,7 @@ ON CONFLICT (user_id, path) WHERE agent_id IS NULL
 DO UPDATE SET content = EXCLUDED.content, updated_at = NOW();
 "@
 
-    $result = $sql | psql -U postgres -h 127.0.0.1 -p 5432 -d ironclaw --no-psqlrc --pset=pager=off -f - 2>&1
+    $result = $sql | psql -U postgres -h 127.0.0.1 -p 5432 -d ironclad --no-psqlrc --pset=pager=off -f - 2>&1
     if ($LASTEXITCODE -eq 0) {
         Write-Host "OK: Seeded $file" -ForegroundColor Green
     } else {
@@ -38,4 +38,4 @@ DO UPDATE SET content = EXCLUDED.content, updated_at = NOW();
 }
 
 Write-Host "`nDone. Verifying..." -ForegroundColor Cyan
-psql -U postgres -h 127.0.0.1 -p 5432 -d ironclaw --no-psqlrc --pset=pager=off -t -A -c "SELECT path, length(content) as chars FROM memory_documents WHERE user_id='default' ORDER BY path;"
+psql -U postgres -h 127.0.0.1 -p 5432 -d ironclad --no-psqlrc --pset=pager=off -t -A -c "SELECT path, length(content) as chars FROM memory_documents WHERE user_id='default' ORDER BY path;"

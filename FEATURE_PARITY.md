@@ -1,6 +1,6 @@
-# IronClaw ↔ OpenClaw Feature Parity Matrix
+# Iron Clad ↔ OpenClaw Feature Parity Matrix
 
-This document tracks feature parity between IronClaw (Rust implementation) and OpenClaw (TypeScript reference implementation). Use this to coordinate work across developers.
+This document tracks feature parity between Iron Clad (Rust implementation) and OpenClaw (TypeScript reference implementation). Use this to coordinate work across developers.
 
 **Legend:**
 - ✅ Implemented
@@ -14,9 +14,9 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 
 ## 1. Architecture
 
-| Feature | OpenClaw | IronClaw | Notes |
+| Feature | OpenClaw | Iron Clad | Notes |
 |---------|----------|----------|-------|
-| Hub-and-spoke architecture | ✅ | 🚧 | IronClaw has channels but no central gateway |
+| Hub-and-spoke architecture | ✅ | 🚧 | Iron Clad has channels but no central gateway |
 | WebSocket control plane | ✅ | ❌ | Gateway with ws://127.0.0.1:18789 |
 | Single-user system | ✅ | ✅ | |
 | Multi-agent routing | ✅ | ❌ | Workspace isolation per-agent |
@@ -29,7 +29,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 
 ## 2. Gateway System
 
-| Feature | OpenClaw | IronClaw | Notes |
+| Feature | OpenClaw | Iron Clad | Notes |
 |---------|----------|----------|-------|
 | Gateway control plane | ✅ | ❌ | Central WebSocket server |
 | HTTP endpoints for Control UI | ✅ | ❌ | Web dashboard |
@@ -52,12 +52,12 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 
 ## 3. Messaging Channels
 
-| Channel | OpenClaw | IronClaw | Priority | Notes |
+| Channel | OpenClaw | Iron Clad | Priority | Notes |
 |---------|----------|----------|----------|-------|
 | CLI/TUI | ✅ | ✅ | - | Ratatui-based TUI |
 | HTTP webhook | ✅ | ✅ | - | axum with secret validation |
 | REPL (simple) | ✅ | ✅ | - | For testing |
-| WASM channels | ❌ | ✅ | - | IronClaw innovation |
+| WASM channels | ❌ | ✅ | - | Iron Clad innovation |
 | WhatsApp | ✅ | ❌ | P1 | Baileys (Web) |
 | Telegram | ✅ | ❌ | P1 | grammY (Bot API) |
 | Discord | ✅ | ❌ | P2 | discord.js |
@@ -77,7 +77,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 
 ### Channel Features
 
-| Feature | OpenClaw | IronClaw | Notes |
+| Feature | OpenClaw | Iron Clad | Notes |
 |---------|----------|----------|-------|
 | DM pairing codes | ✅ | ❌ | Verification for unknown senders |
 | Allowlist/blocklist | ✅ | ❌ | Per-channel access control |
@@ -94,7 +94,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 
 ## 4. CLI Commands
 
-| Command | OpenClaw | IronClaw | Priority | Notes |
+| Command | OpenClaw | Iron Clad | Priority | Notes |
 |---------|----------|----------|----------|-------|
 | `run` (agent) | ✅ | ✅ | - | Default command |
 | `tool install/list/remove` | ✅ | ✅ | - | WASM tools |
@@ -129,9 +129,9 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 
 ## 5. Agent System
 
-| Feature | OpenClaw | IronClaw | Notes |
+| Feature | OpenClaw | Iron Clad | Notes |
 |---------|----------|----------|-------|
-| Pi agent runtime | ✅ | ➖ | IronClaw uses custom runtime |
+| Pi agent runtime | ✅ | ➖ | Iron Clad uses custom runtime |
 | RPC-based execution | ✅ | 🚧 | Worker isolation |
 | Multi-provider failover | ✅ | ❌ | Provider fallback chains |
 | Per-sender sessions | ✅ | ✅ | |
@@ -156,7 +156,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 
 ## 6. Model & Provider Support
 
-| Provider | OpenClaw | IronClaw | Priority | Notes |
+| Provider | OpenClaw | Iron Clad | Priority | Notes |
 |----------|----------|----------|----------|-------|
 | NEAR AI | ✅ | ✅ | - | Primary provider |
 | Anthropic (Claude) | ✅ | 🚧 | - | Via NEAR AI proxy |
@@ -170,7 +170,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 
 ### Model Features
 
-| Feature | OpenClaw | IronClaw | Notes |
+| Feature | OpenClaw | Iron Clad | Notes |
 |---------|----------|----------|-------|
 | Auto-discovery | ✅ | ❌ | |
 | Failover chains | ✅ | ❌ | Provider fallback |
@@ -184,7 +184,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 
 ## 7. Media Handling
 
-| Feature | OpenClaw | IronClaw | Priority | Notes |
+| Feature | OpenClaw | Iron Clad | Priority | Notes |
 |---------|----------|----------|----------|-------|
 | Image processing (Sharp) | ✅ | ❌ | P2 | Resize, format convert |
 | Audio transcription | ✅ | ❌ | P2 | |
@@ -203,12 +203,12 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 
 ## 8. Plugin & Extension System
 
-| Feature | OpenClaw | IronClaw | Notes |
+| Feature | OpenClaw | Iron Clad | Notes |
 |---------|----------|----------|-------|
 | Dynamic loading | ✅ | ✅ | WASM modules |
 | Manifest validation | ✅ | ✅ | WASM metadata |
 | HTTP path registration | ✅ | ❌ | Plugin routes |
-| Workspace-relative install | ✅ | ✅ | ~/.ironclaw/tools/ |
+| Workspace-relative install | ✅ | ✅ | ~/.ironclad/tools/ |
 | Channel plugins | ✅ | ✅ | WASM channels |
 | Auth plugins | ✅ | ❌ | |
 | Memory plugins | ✅ | ❌ | Custom backends |
@@ -224,7 +224,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 
 ## 9. Configuration System
 
-| Feature | OpenClaw | IronClaw | Notes |
+| Feature | OpenClaw | Iron Clad | Notes |
 |---------|----------|----------|-------|
 | Primary config file | ✅ `~/.openclaw/openclaw.json` | ✅ `.env` | Different formats |
 | JSON5 support | ✅ | ❌ | Comments, trailing commas |
@@ -233,7 +233,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | Config validation/schema | ✅ | ✅ | Type-safe Config struct |
 | Hot-reload | ✅ | ❌ | |
 | Legacy migration | ✅ | ➖ | |
-| State directory | ✅ `~/.openclaw-state/` | ✅ `~/.ironclaw/` | |
+| State directory | ✅ `~/.openclaw-state/` | ✅ `~/.ironclad/` | |
 | Credentials directory | ✅ | ✅ | Session files |
 
 ### Owner: _Unassigned_
@@ -242,7 +242,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 
 ## 10. Memory & Knowledge System
 
-| Feature | OpenClaw | IronClaw | Notes |
+| Feature | OpenClaw | Iron Clad | Notes |
 |---------|----------|----------|-------|
 | Vector memory | ✅ | ✅ | pgvector |
 | Session-based memory | ✅ | ✅ | |
@@ -250,7 +250,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | OpenAI embeddings | ✅ | ✅ | |
 | Gemini embeddings | ✅ | ❌ | |
 | Local embeddings | ✅ | ❌ | |
-| SQLite-vec backend | ✅ | ❌ | IronClaw uses PostgreSQL |
+| SQLite-vec backend | ✅ | ❌ | Iron Clad uses PostgreSQL |
 | LanceDB backend | ✅ | ❌ | |
 | QMD backend | ✅ | ❌ | |
 | Atomic reindexing | ✅ | ✅ | |
@@ -268,7 +268,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 
 ## 11. Mobile Apps
 
-| Feature | OpenClaw | IronClaw | Priority | Notes |
+| Feature | OpenClaw | Iron Clad | Priority | Notes |
 |---------|----------|----------|----------|-------|
 | iOS app (SwiftUI) | ✅ | 🚫 | - | Out of scope initially |
 | Android app (Kotlin) | ✅ | 🚫 | - | Out of scope initially |
@@ -285,7 +285,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 
 ## 12. macOS App
 
-| Feature | OpenClaw | IronClaw | Priority | Notes |
+| Feature | OpenClaw | Iron Clad | Priority | Notes |
 |---------|----------|----------|----------|-------|
 | SwiftUI native app | ✅ | 🚫 | - | Out of scope |
 | Menu bar presence | ✅ | 🚫 | - | |
@@ -301,7 +301,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 
 ## 13. Web Interface
 
-| Feature | OpenClaw | IronClaw | Priority | Notes |
+| Feature | OpenClaw | Iron Clad | Priority | Notes |
 |---------|----------|----------|----------|-------|
 | Control UI Dashboard | ✅ | ❌ | P2 | Web status/config |
 | Channel status view | ✅ | ❌ | P2 | |
@@ -318,7 +318,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 
 ## 14. Automation
 
-| Feature | OpenClaw | IronClaw | Priority | Notes |
+| Feature | OpenClaw | Iron Clad | Priority | Notes |
 |---------|----------|----------|----------|-------|
 | Cron jobs | ✅ | ❌ | P2 | Schedule-based tasks |
 | Timezone support | ✅ | ❌ | P2 | |
@@ -344,7 +344,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 
 ## 15. Security Features
 
-| Feature | OpenClaw | IronClaw | Notes |
+| Feature | OpenClaw | Iron Clad | Notes |
 |---------|----------|----------|-------|
 | Gateway token auth | ✅ | 🚧 | HTTP webhook secret |
 | Device pairing | ✅ | ❌ | |
@@ -358,7 +358,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | SSRF protection | ✅ | ✅ | WASM allowlist |
 | Loopback-first | ✅ | 🚧 | HTTP binds 0.0.0.0 |
 | Docker sandbox | ✅ | ❌ | Uses WASM sandbox |
-| WASM sandbox | ❌ | ✅ | IronClaw innovation |
+| WASM sandbox | ❌ | ✅ | Iron Clad innovation |
 | Tool policies | ✅ | ✅ | |
 | Elevated mode | ✅ | ❌ | |
 | Safe bins allowlist | ✅ | ❌ | |
@@ -375,7 +375,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 
 ## 16. Development & Build System
 
-| Feature | OpenClaw | IronClaw | Notes |
+| Feature | OpenClaw | Iron Clad | Notes |
 |---------|----------|----------|-------|
 | Primary language | TypeScript | Rust | Different ecosystems |
 | Build tool | tsdown | cargo | |
@@ -451,7 +451,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 
 ## Deviations from OpenClaw
 
-IronClaw intentionally differs from OpenClaw in these ways:
+Iron Clad intentionally differs from OpenClaw in these ways:
 
 1. **Rust vs TypeScript**: Native performance, memory safety, single binary distribution
 2. **WASM sandbox vs Docker**: Lighter weight, faster startup, capability-based security

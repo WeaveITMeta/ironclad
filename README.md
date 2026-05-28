@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="ironclaw.png" alt="IronClaw" width="200"/>
+  <img src="ironclad.png" alt="Iron Clad" width="200"/>
 </p>
 
-<h1 align="center">IronClaw</h1>
+<h1 align="center">Iron Clad</h1>
 
 <p align="center">
   <strong>Your secure personal AI assistant, always on your side</strong>
@@ -21,16 +21,16 @@
 
 ## Philosophy
 
-IronClaw is built on a simple principle: **your AI assistant should work for you, not against you**.
+Iron Clad is built on a simple principle: **your AI assistant should work for you, not against you**.
 
-In a world where AI systems are increasingly opaque about data handling and aligned with corporate interests, IronClaw takes a different approach:
+In a world where AI systems are increasingly opaque about data handling and aligned with corporate interests, Iron Clad takes a different approach:
 
 - **Your data stays yours** - All information is stored locally, encrypted, and never leaves your control
 - **Transparency by design** - Open source, auditable, no hidden telemetry or data harvesting
 - **Self-expanding capabilities** - Build new tools on the fly without waiting for vendor updates
 - **Defense in depth** - Multiple security layers protect against prompt injection and data exfiltration
 
-IronClaw is the AI assistant you can actually trust with your personal and professional life.
+Iron Clad is the AI assistant you can actually trust with your personal and professional life.
 
 ## Features
 
@@ -50,7 +50,7 @@ IronClaw is the AI assistant you can actually trust with your personal and profe
 
 ### Self-Expanding
 
-- **Dynamic Tool Building** - Describe what you need, and IronClaw builds it as a WASM tool
+- **Dynamic Tool Building** - Describe what you need, and Iron Clad builds it as a WASM tool
 - **MCP Protocol** - Connect to Model Context Protocol servers for additional capabilities
 - **Plugin Architecture** - Drop in new WASM tools and channels without restarting
 
@@ -72,8 +72,8 @@ IronClaw is the AI assistant you can actually trust with your personal and profe
 
 ```bash
 # Clone the repository
-git clone https://github.com/nearai/ironclaw.git
-cd ironclaw
+git clone https://github.com/nearai/ironclad.git
+cd ironclad
 
 # Build
 cargo build --release
@@ -86,27 +86,27 @@ cargo test
 
 ```bash
 # Create database
-createdb ironclaw
+createdb ironclad
 
 # Enable pgvector
-psql ironclaw -c "CREATE EXTENSION IF NOT EXISTS vector;"
+psql ironclad -c "CREATE EXTENSION IF NOT EXISTS vector;"
 ```
 
 ## Configuration
 
-Run the setup wizard to configure IronClaw:
+Run the setup wizard to configure Iron Clad:
 
 ```bash
-ironclaw onboard
+ironclad onboard
 ```
 
 The wizard handles database connection, NEAR AI authentication (via browser OAuth),
 and secrets encryption (using your system keychain). All settings are saved to
-`~/.ironclaw/settings.toml`.
+`~/.ironclad/settings.toml`.
 
 ## Security
 
-IronClaw implements defense in depth to protect your data and prevent misuse.
+Iron Clad implements defense in depth to protect your data and prevent misuse.
 
 ### WASM Sandbox
 
@@ -191,13 +191,13 @@ External content passes through multiple security layers:
 
 ```bash
 # First-time setup (configures database, auth, etc.)
-ironclaw onboard
+ironclad onboard
 
 # Start interactive REPL
 cargo run
 
 # With debug logging
-RUST_LOG=ironclaw=debug cargo run
+RUST_LOG=ironclad=debug cargo run
 ```
 
 ## Development
@@ -210,7 +210,7 @@ cargo fmt
 cargo clippy --all --benches --tests --examples --all-features
 
 # Run tests
-createdb ironclaw_test
+createdb ironclad_test
 cargo test
 
 # Run specific test
@@ -219,7 +219,7 @@ cargo test test_name
 
 ## OpenClaw Heritage
 
-IronClaw is a Rust reimplementation inspired by [OpenClaw](https://github.com/openclaw/openclaw). See [FEATURE_PARITY.md](FEATURE_PARITY.md) for the complete tracking matrix.
+Iron Clad is a Rust reimplementation inspired by [OpenClaw](https://github.com/openclaw/openclaw). See [FEATURE_PARITY.md](FEATURE_PARITY.md) for the complete tracking matrix.
 
 Key differences:
 

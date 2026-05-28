@@ -4,3 +4,8 @@
 
 target/
 
+# GPT-SoVITS Windows pre-built (~8GB archive, ~25GB extracted).
+# Re-downloadable from huggingface.co/lj1995/GPT-SoVITS-windows-package
+voice/gpt-sovits/
+voice/gpt-sovits.7z
+

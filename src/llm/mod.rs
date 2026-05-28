@@ -1,48 +1,26 @@
 //! LLM integration for the agent.
 //!
-//! Supports two API modes:
-//! - **Responses API** (chat-api): Session-based auth, uses `/v1/responses` endpoint
-//! - **Chat Completions API** (cloud-api): API key auth, uses `/v1/chat/completions` endpoint
+//! Single backend: **Anthropic Claude API**, accessed directly via `ANTHROPIC_API_KEY`.
+//! NEAR AI and its session-based auth were removed in the 2026-05-26 rip.
 
-mod nearai;
-mod nearai_chat;
+mod anthropic;
 mod provider;
 mod reasoning;
-pub mod session;
 
-pub use nearai::{ModelInfo, NearAiProvider};
-pub use nearai_chat::NearAiChatProvider;
+pub use anthropic::AnthropicProvider;
 pub use provider::{
     ChatMessage, CompletionRequest, CompletionResponse, LlmProvider, Role, ToolCall,
     ToolCompletionRequest, ToolCompletionResponse, ToolDefinition, ToolResult,
 };
 pub use reasoning::{ActionPlan, Reasoning, ReasoningContext, RespondResult, ToolSelection};
-pub use session::{SessionConfig, SessionManager, create_session_manager};
 
 use std::sync::Arc;
 
-use crate::config::{LlmConfig, NearAiApiMode};
+use crate::config::LlmConfig;
 use crate::error::LlmError;
 
-/// Create an LLM provider based on configuration.
-///
-/// - For `Responses` mode: Requires a session manager for authentication
-/// - For `ChatCompletions` mode: Uses API key from config (session not needed)
-pub fn create_llm_provider(
-    config: &LlmConfig,
-    session: Arc<SessionManager>,
-) -> Result<Arc<dyn LlmProvider>, LlmError> {
-    match config.nearai.api_mode {
-        NearAiApiMode::Responses => {
-            tracing::info!("Using Responses API (chat-api) with session auth");
-            Ok(Arc::new(NearAiProvider::new(
-                config.nearai.clone(),
-                session,
-            )))
-        }
-        NearAiApiMode::ChatCompletions => {
-            tracing::info!("Using Chat Completions API (cloud-api) with API key auth");
-            Ok(Arc::new(NearAiChatProvider::new(config.nearai.clone())?))
-        }
-    }
+/// Create the LLM provider. Single path: Anthropic Claude API.
+pub fn create_llm_provider(config: &LlmConfig) -> Result<Arc<dyn LlmProvider>, LlmError> {
+    tracing::info!("LLM: Anthropic Claude API (model: {})", config.anthropic.model);
+    Ok(Arc::new(AnthropicProvider::new(config.anthropic.clone())?))
 }

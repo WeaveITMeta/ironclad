@@ -1,5 +1,5 @@
 [package]
-name = "ironclaw"
+name = "ironclad"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
@@ -13,7 +13,15 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 futures = "0.3"
 
 # HTTP client
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "multipart"] }
+
+# WebTransport server — replaces the wedgy aioquic Python parakeet-wt sidecar.
+# wtransport is built on quinn (production-grade QUIC), used by Cloudflare and
+# others. Generated certs go through rcgen.
+wtransport = "0.6"
+rcgen = "0.14"
+time = "0.3"  # for cert validity calculations
+pem = "3"     # for parsing the cert back to DER to compute SHA-256
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -93,6 +101,13 @@ embedvec = "0.8.0"
 fjall = "2.11"
 tantivy = "0.25.0"
 
+# Voice gateway: scratch wav/txt files for whisper-cli + piper subprocesses.
+tempfile = "3"
+
+# OpenAPI schema generation + Swagger UI for the gateway and onboarding APIs.
+utoipa = { version = "5", features = ["axum_extras", "uuid", "chrono"] }
+utoipa-swagger-ui = { version = "9", features = ["axum"] }
+
 # macOS keychain
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"
@@ -101,6 +116,23 @@ security-framework = "3"
 [target.'cfg(target_os = "linux")'.dependencies]
 secret-service = { version = "4", features = ["rt-tokio-crypto-rust"] }
 zbus = "4"
+
+# Windows Credential Manager via the keyring crate (uses wincred under the hood).
+# Plus virtual desktop control (winvd) and HWND enumeration (windows crate)
+# for the windows_desktop tool family.
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+winvd = "0.0.46"
+# Pinned to 0.52 to match winvd 0.0.46's HWND/COM types. Without this
+# pin, cargo picks 0.59 transitively and HWND becomes a *mut c_void
+# instead of an isize, breaking interop with winvd.
+windows = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+    "Win32_Graphics_Gdi",
+] }
 
 [dev-dependencies]
 tokio-test = "0.4"

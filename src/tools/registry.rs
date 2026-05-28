@@ -11,11 +11,13 @@ use crate::llm::{LlmProvider, ToolDefinition};
 use crate::safety::SafetyLayer;
 use crate::tools::builder::{BuildSoftwareTool, BuilderConfig, LlmSoftwareBuilder};
 use crate::tools::builtin::{
-    ApplyPatchTool, CancelJobTool, CreateJobTool, EchoTool, HttpTool, JobStatusTool, JsonTool,
-    ListDirTool, ListJobsTool, MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool,
-    ReadFileTool, ShellTool, TimeTool, ToolActivateTool, ToolAuthTool, ToolInstallTool,
-    ToolListTool, ToolRemoveTool, ToolSearchTool, VaultListTool, VaultReadTool, VaultWriteTool,
-    WriteFileTool,
+    ApplyPatchTool, CancelJobTool, CreateJobTool, EchoTool, GithubGetPrTool, GithubListIssuesTool,
+    GithubListPrsTool, GithubListReposTool, GithubRecentCommitsTool, HttpTool, JobStatusTool,
+    JsonTool, ListDirTool, ListJobsTool, MemoryReadTool, MemorySearchTool, MemoryTreeTool,
+    MemoryWriteTool, OpenAppTool, OpenUrlTool, ReadFileTool, ShellTool, SpawnAgentTool, TimeTool,
+    ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool,
+    ListMyToolsTool, MissionLookupTool, VaultDeleteTool, VaultListTool, VaultMoveTool,
+    VaultReadTool, VaultSearchTool, VaultWriteTool, WriteFileTool,
 };
 use crate::tools::tool::Tool;
 use crate::tools::wasm::{
@@ -117,6 +119,9 @@ impl ToolRegistry {
         self.register_sync(Arc::new(TimeTool));
         self.register_sync(Arc::new(JsonTool));
         self.register_sync(Arc::new(HttpTool::new()));
+        // Alpha-2 hands: open URLs and launch desktop apps.
+        self.register_sync(Arc::new(OpenUrlTool));
+        self.register_sync(Arc::new(OpenAppTool));
 
         tracing::info!("Registered {} built-in tools", self.count());
     }
@@ -165,14 +170,104 @@ impl ToolRegistry {
     /// Register Obsidian vault bridge tools (read, write, list).
     ///
     /// These tools allow the agent to read and write files directly in the
-    /// user's Obsidian vault on disk, bridging IronClaw's workspace with
+    /// user's Obsidian vault on disk, bridging Iron Clad's workspace with
     /// the life system.
     pub fn register_vault_tools(&self) {
         self.register_sync(Arc::new(VaultReadTool));
         self.register_sync(Arc::new(VaultWriteTool));
         self.register_sync(Arc::new(VaultListTool));
+        self.register_sync(Arc::new(VaultSearchTool));
+        self.register_sync(Arc::new(VaultDeleteTool));
+        self.register_sync(Arc::new(VaultMoveTool));
 
-        tracing::info!("Registered 3 vault bridge tools");
+        tracing::info!("Registered 6 vault bridge tools");
+    }
+
+    /// Register `list_my_tools` so JARVIS can self-introspect when he
+    /// loses track of which tools he has. Cheap, no side effects.
+    pub fn register_tool_inventory_tool(self: &Arc<Self>) {
+        self.register_sync(Arc::new(ListMyToolsTool::new(Arc::clone(self))));
+        tracing::info!("Registered list_my_tools (self-introspection)");
+    }
+
+    /// Register `mission_lookup` so JARVIS can parse the curated
+    /// `00 System/Workspaces.md` mission-to-profile mapping at the start
+    /// of an "open mission workspace" flow.
+    pub fn register_mission_lookup_tool(&self) {
+        self.register_sync(Arc::new(MissionLookupTool));
+        tracing::info!("Registered mission_lookup (Workspaces.md parser)");
+    }
+
+    /// Register Windows 11 Virtual Desktop tools. Reads (`list_desktops`)
+    /// auto-approve; writes (`switch`, `new`, `move_window_to_desktop`) pop
+    /// the approval banner since they visibly mutate the user's screen.
+    /// Only registers on Windows; on other platforms the tools would
+    /// fail with a "not supported" error so we skip them entirely.
+    #[cfg(target_os = "windows")]
+    pub fn register_windows_desktop_tools(&self) {
+        use crate::tools::builtin::{
+            WindowsListDesktopsTool, WindowsListMonitorsTool, WindowsMoveWindowToDesktopTool,
+            WindowsNewDesktopTool, WindowsSnapWindowTool, WindowsSwitchDesktopTool,
+        };
+        self.register_sync(Arc::new(WindowsListDesktopsTool));
+        self.register_sync(Arc::new(WindowsSwitchDesktopTool));
+        self.register_sync(Arc::new(WindowsNewDesktopTool));
+        self.register_sync(Arc::new(WindowsMoveWindowToDesktopTool));
+        self.register_sync(Arc::new(WindowsListMonitorsTool));
+        self.register_sync(Arc::new(WindowsSnapWindowTool));
+        tracing::info!("Registered 6 Windows desktop + window tools");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    pub fn register_windows_desktop_tools(&self) {
+        // No-op on non-Windows platforms.
+    }
+
+    /// Register the sub-agent dispatcher (`spawn_agent`).
+    ///
+    /// The tool holds:
+    /// - An Arc back-reference to this registry to resolve `tool_names`
+    ///   into `Arc<dyn Tool>` at spawn time.
+    /// - Sonnet + Opus `LlmProvider`s pre-instantiated.
+    /// - The ChannelManager so the BACKGROUND sub-agent task can broadcast
+    ///   its completion summary back as an unsolicited assistant message
+    ///   (fire-and-forget — the main agent loop doesn't block on it).
+    ///
+    /// Must be called AFTER the ChannelManager is built and the gateway
+    /// channel is registered, otherwise the broadcast at completion lands
+    /// in a void.
+    pub fn register_spawn_agent_tool(
+        self: &Arc<Self>,
+        sonnet: Arc<dyn LlmProvider>,
+        opus: Arc<dyn LlmProvider>,
+        channels: Arc<crate::channels::ChannelManager>,
+        context_manager: Arc<crate::context::ContextManager>,
+    ) {
+        let tool =
+            SpawnAgentTool::new(Arc::clone(self), sonnet, opus, channels, context_manager);
+        self.register_sync(Arc::new(tool));
+        tracing::info!(
+            "Registered spawn_agent (Sonnet + Opus sub-agents, fire-and-forget, job-tracked)"
+        );
+    }
+
+    /// Register native GitHub tools. Read-only, auto-approved, scoped to
+    /// the `GITHUB_DEFAULT_ORG` from `.env` unless the LLM overrides.
+    /// Skipped silently if `GITHUB_PAT` isn't set.
+    pub fn register_github_tools(&self) {
+        if std::env::var("GITHUB_PAT")
+            .map(|v| v.trim().is_empty())
+            .unwrap_or(true)
+        {
+            tracing::info!("GITHUB_PAT not set; skipping github_* tool registration");
+            return;
+        }
+        self.register_sync(Arc::new(GithubListReposTool));
+        self.register_sync(Arc::new(GithubListPrsTool));
+        self.register_sync(Arc::new(GithubGetPrTool));
+        self.register_sync(Arc::new(GithubListIssuesTool));
+        self.register_sync(Arc::new(GithubRecentCommitsTool));
+        tracing::info!("Registered 5 GitHub native tools");
     }
 
     /// Register extension management tools (search, install, auth, activate, list, remove).
@@ -269,7 +364,7 @@ impl ToolRegistry {
     /// # Example
     ///
     /// ```ignore
-    /// let store = FjallWasmToolStore::open("~/.ironclaw/wasm-index")?;
+    /// let store = FjallWasmToolStore::open("~/.ironclad/wasm-index")?;
     /// let runtime = Arc::new(WasmToolRuntime::new(WasmRuntimeConfig::default())?);
     ///
     /// registry.register_wasm_from_storage(

@@ -59,12 +59,30 @@ impl SseManager {
     }
 
     /// Create a new SSE stream for a client connection.
+    ///
+    /// Every emitted event carries `retry: 3000ms`. Browser EventSource
+    /// honors this: after any disconnect (gateway restart, Trunk reload,
+    /// transient network blip) it auto-reconnects in 3 s instead of
+    /// silently going dark. Without this the user has to hard-refresh the
+    /// dashboard every time the gateway bounces — was the most common
+    /// "JARVIS didn't reply" symptom.
     pub fn subscribe(
         &self,
     ) -> Sse<impl Stream<Item = Result<Event, Infallible>> + Send + 'static + use<>> {
         let counter = Arc::clone(&self.connection_count);
         counter.fetch_add(1, Ordering::Relaxed);
         let rx = self.tx.subscribe();
+
+        // Prepend a one-shot bootstrap event that pins the retry interval
+        // immediately on connect. Browsers cache `retry:` for the lifetime
+        // of the connection, so even if the next real event takes minutes,
+        // the reconnect-on-drop behavior is already armed.
+        let bootstrap = futures::stream::iter(std::iter::once(Ok(
+            Event::default()
+                .event("ready")
+                .retry(Duration::from_millis(3000))
+                .data("{}"),
+        )));
 
         let stream = BroadcastStream::new(rx)
             .filter_map(|result| result.ok())
@@ -82,8 +100,12 @@ impl SseManager {
                     SseEvent::Error { .. } => "error",
                     SseEvent::Heartbeat => "heartbeat",
                 };
-                Ok(Event::default().event(event_type).data(data))
+                Ok(Event::default()
+                    .event(event_type)
+                    .data(data)
+                    .retry(Duration::from_millis(3000)))
             });
+        let stream = bootstrap.chain(stream);
 
         // Wrap in a stream that decrements on drop
         let counted_stream = CountedStream {

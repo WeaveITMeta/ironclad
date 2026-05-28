@@ -21,6 +21,9 @@ pub mod paths {
     pub const USER: &str = "USER.md";
     /// Periodic checklist for heartbeat.
     pub const HEARTBEAT: &str = "HEARTBEAT.md";
+    /// Auto-generated inventory of the tools the agent has access to.
+    /// Re-written at every boot from the live tool registry.
+    pub const TOOLS: &str = "TOOLS.md";
     /// Root runbook/readme.
     pub const README: &str = "README.md";
     /// Daily logs directory.

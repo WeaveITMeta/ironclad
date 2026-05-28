@@ -20,6 +20,9 @@ use axum::{
 use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::StreamExt;
+use tower_http::cors::{Any, CorsLayer};
+use utoipa::{IntoParams, OpenApi};
+use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
 
 use crate::agent::SessionManager;
@@ -28,10 +31,98 @@ use crate::channels::web::auth::{AuthState, auth_middleware};
 use crate::channels::web::log_layer::LogBroadcaster;
 use crate::channels::web::sse::SseManager;
 use crate::channels::web::types::*;
+use crate::config::VoiceConfig;
 use crate::context::ContextManager;
 use crate::extensions::ExtensionManager;
 use crate::tools::ToolRegistry;
+use crate::voice::{VoiceError, WhisperStt};
 use crate::workspace::Workspace;
+
+/// OpenAPI surface for the full web gateway. Surfaced at `/docs` via Swagger UI.
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "Iron Clad gateway API",
+        version = "0.1.0",
+        description = "Web gateway: chat, memory, jobs, extensions. SSE and WebSocket \
+                       endpoints aren't documented here.",
+    ),
+    tags(
+        (name = "health", description = "Health check"),
+        (name = "chat", description = "Send messages, view threads, drive approvals"),
+        (name = "memory", description = "Workspace document storage and search"),
+        (name = "jobs", description = "Background job inspection and cancellation"),
+        (name = "extensions", description = "MCP servers, WASM tools, WASM channels"),
+        (name = "voice", description = "STT / TTS via whisper.cpp + piper subprocesses"),
+        (name = "gateway", description = "Gateway control plane (connection counts, etc.)"),
+    ),
+    paths(
+        health_handler,
+        chat_send_handler,
+        chat_approval_handler,
+        chat_history_handler,
+        chat_threads_handler,
+        chat_new_thread_handler,
+        memory_tree_handler,
+        memory_list_handler,
+        memory_read_handler,
+        memory_write_handler,
+        memory_search_handler,
+        jobs_list_handler,
+        jobs_summary_handler,
+        jobs_detail_handler,
+        jobs_cancel_handler,
+        extensions_list_handler,
+        extensions_tools_handler,
+        extensions_install_handler,
+        extensions_activate_handler,
+        extensions_remove_handler,
+        voice_status_handler,
+        voice_stt_handler,
+        gateway_status_handler,
+        gateway_token_handler,
+        onboard_status_stub_handler,
+        streaming_stt_config_handler,
+    ),
+    components(schemas(
+        HealthResponse,
+        SendMessageRequest,
+        SendMessageResponse,
+        ApprovalRequest,
+        ThreadInfo,
+        ThreadListResponse,
+        TurnInfo,
+        ToolCallInfo,
+        HistoryResponse,
+        MemoryTreeResponse,
+        TreeEntry,
+        MemoryListResponse,
+        ListEntry,
+        MemoryReadResponse,
+        MemoryWriteRequest,
+        MemoryWriteResponse,
+        MemorySearchRequest,
+        MemorySearchResponse,
+        SearchHit,
+        JobInfo,
+        JobListResponse,
+        JobSummaryResponse,
+        ExtensionInfo,
+        ExtensionListResponse,
+        ToolInfo,
+        ToolListResponse,
+        InstallExtensionRequest,
+        ActionResponse,
+        GatewayStatusResponse,
+        VoiceStatusResponse,
+        VoiceTtsRequest,
+        VoiceSttResponse,
+        GatewayTokenResponse,
+        OnboardStatusStub,
+        StreamingSttConfig,
+    )),
+)]
+pub struct GatewayOpenApi;
 
 /// Shared state for all gateway handlers.
 pub struct GatewayState {
@@ -57,6 +148,13 @@ pub struct GatewayState {
     pub shutdown_tx: tokio::sync::RwLock<Option<oneshot::Sender<()>>>,
     /// WebSocket connection tracker.
     pub ws_tracker: Option<Arc<crate::channels::web::ws::WsConnectionTracker>>,
+    /// Voice gateway config (whisper STT paths). TTS lives in env vars
+    /// (`ELEVENLABS_*`); the gateway calls ElevenLabs directly from the
+    /// `/api/voice/tts_stream` handler — no local TTS daemon.
+    pub voice: VoiceConfig,
+    /// Bearer token for the protected routes. Exposed read-only to localhost
+    /// callers via `/api/gateway/token` so the dashboard can self-bootstrap.
+    pub auth_token: String,
 }
 
 /// Start the gateway HTTP server.
@@ -81,11 +179,28 @@ pub async fn start_server(
                 reason: format!("Failed to get local addr: {}", e),
             })?;
 
-    // Public routes (no auth)
-    let public = Router::new().route("/api/health", get(health_handler));
+    // Public routes (no auth). The gateway binds to localhost by default; the
+    // bind itself is the security boundary, so a dev-mode token-handout
+    // endpoint here is safe and saves the dashboard from prompting the user.
+    let public = Router::new()
+        .route("/api/health", get(health_handler))
+        .route("/api/gateway/token", get(gateway_token_handler))
+        .route("/api/voice/status", get(voice_status_handler))
+        // Public so the dashboard can bootstrap its WebTransport session
+        // without an auth round-trip. Returns the cert hash for
+        // `serverCertificateHashes`; loopback-only sidecar so the hash isn't
+        // sensitive.
+        .route("/api/voice/streaming-config", get(streaming_stt_config_handler))
+        // Stub so the dashboard's onboarding probe doesn't 404 in full mode.
+        // The real onboard server (used only during first-run setup) lives in
+        // `src/setup/onboard_api.rs`; if we're answering here, onboarding is
+        // already done.
+        .route("/api/onboard/status", get(onboard_status_stub_handler));
 
     // Protected routes (require auth)
-    let auth_state = AuthState { token: auth_token };
+    let auth_state = AuthState {
+        token: auth_token.clone(),
+    };
     let protected = Router::new()
         // Chat
         .route("/api/chat/send", post(chat_send_handler))
@@ -120,6 +235,13 @@ pub async fn start_server(
             "/api/extensions/{name}/remove",
             post(extensions_remove_handler),
         )
+        // Voice. STT goes through the parakeet / whisper sidecar pinned in
+        // VoiceConfig. TTS proxies straight to ElevenLabs from
+        // voice_tts_stream_handler (no local sidecar). `voice/status` is in
+        // the public router so the dashboard can probe readiness without a
+        // token.
+        .route("/api/voice/stt", post(voice_stt_handler))
+        .route("/api/voice/tts_stream", post(voice_tts_stream_handler))
         // Gateway control plane
         .route("/api/gateway/status", get(gateway_status_handler))
         .route_layer(middleware::from_fn_with_state(auth_state, auth_middleware));
@@ -130,10 +252,24 @@ pub async fn start_server(
         .route("/style.css", get(css_handler))
         .route("/app.js", get(js_handler));
 
+    // Permissive CORS so the Trunk-served Leptos dashboard (cross-origin
+    // localhost:3000) can hit this gateway. Auth is still enforced via the
+    // bearer token middleware on `protected`.
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
+    // Swagger UI for the gateway lives at /docs; the raw schema at
+    // /api-doc/openapi.json.
+    let swagger = SwaggerUi::new("/docs").url("/api-doc/openapi.json", GatewayOpenApi::openapi());
+
     let app = Router::new()
         .merge(public)
         .merge(statics)
         .merge(protected)
+        .merge(swagger)
+        .layer(cors)
         .with_state(state.clone());
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -174,8 +310,35 @@ async fn js_handler() -> impl IntoResponse {
     )
 }
 
+// --- Public bootstrap ---
+
+#[derive(serde::Serialize, utoipa::ToSchema)]
+struct GatewayTokenResponse {
+    token: String,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/gateway/token",
+    tag = "gateway",
+    responses((status = 200, body = GatewayTokenResponse, description = "Bearer token for the protected routes. Localhost-only by virtue of the gateway's bind.")),
+)]
+async fn gateway_token_handler(
+    State(state): State<Arc<GatewayState>>,
+) -> Json<GatewayTokenResponse> {
+    Json(GatewayTokenResponse {
+        token: state.auth_token.clone(),
+    })
+}
+
 // --- Health ---
 
+#[utoipa::path(
+    get,
+    path = "/api/health",
+    tag = "health",
+    responses((status = 200, body = HealthResponse, description = "Gateway is up")),
+)]
 async fn health_handler() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "healthy",
@@ -183,8 +346,88 @@ async fn health_handler() -> Json<HealthResponse> {
     })
 }
 
+// --- Onboard status stub ---
+//
+// The dashboard probes /api/onboard/status on boot to decide whether to show
+// the setup wizard. The real handler lives in the onboard-only server in
+// `src/setup/onboard_api.rs`, which only runs when onboard is incomplete. In
+// full mode that server is gone, so we answer here with all-true so the
+// dashboard skips the wizard and goes straight to the HUD.
+
+#[derive(serde::Serialize, utoipa::ToSchema)]
+struct OnboardStatusStub {
+    onboard_completed: bool,
+    has_anthropic_key: bool,
+    has_openai_key: bool,
+    has_secrets_master_key: bool,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/onboard/status",
+    tag = "gateway",
+    responses((status = 200, body = OnboardStatusStub, description = "Always-completed onboard stub for the full gateway")),
+)]
+async fn onboard_status_stub_handler() -> Json<OnboardStatusStub> {
+    Json(OnboardStatusStub {
+        onboard_completed: true,
+        has_anthropic_key: true,
+        has_openai_key: false,
+        has_secrets_master_key: true,
+    })
+}
+
+// --- Streaming STT (WebTransport) config ---
+//
+// The Parakeet WebTransport sidecar uses a self-signed cert (loopback-only).
+// The browser pins it via the `serverCertificateHashes` API which needs the
+// SHA-256 of the cert's DER. The sidecar writes the hex hash to
+// `voice/wt_cert.sha256`; the dashboard fetches it from here at boot.
+
+#[derive(serde::Serialize, utoipa::ToSchema)]
+struct StreamingSttConfig {
+    /// `https://host:port` of the WebTransport sidecar.
+    url: String,
+    /// Hex SHA-256 of the DER-encoded cert. Empty string if the sidecar
+    /// hasn't booted yet (dashboard should retry).
+    cert_sha256: String,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/voice/streaming-config",
+    tag = "voice",
+    responses((status = 200, body = StreamingSttConfig, description = "WebTransport URL + cert hash for streaming STT")),
+)]
+async fn streaming_stt_config_handler() -> Json<StreamingSttConfig> {
+    // The sidecar writes its cert hash next to the cert file. We read it
+    // every request because the cert can rotate (14-day expiry); cheap.
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let hash_path = std::path::Path::new(manifest_dir)
+        .join("voice")
+        .join("wt_cert.sha256");
+    let cert_sha256 = std::fs::read_to_string(&hash_path)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    Json(StreamingSttConfig {
+        url: "https://127.0.0.1:4443".to_string(),
+        cert_sha256,
+    })
+}
+
 // --- Chat handlers ---
 
+#[utoipa::path(
+    post,
+    path = "/api/chat/send",
+    tag = "chat",
+    request_body = SendMessageRequest,
+    responses(
+        (status = 202, body = SendMessageResponse, description = "Message accepted"),
+        (status = 503, description = "Channel not started"),
+    ),
+)]
 async fn chat_send_handler(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<SendMessageRequest>,
@@ -193,6 +436,12 @@ async fn chat_send_handler(
 
     if let Some(ref thread_id) = req.thread_id {
         msg = msg.with_thread(thread_id);
+    }
+
+    // Carry attached screenshots through metadata so the agent loop can
+    // bundle them into the user's ChatMessage as image content blocks.
+    if let Some(imgs) = req.images.as_ref().filter(|v| !v.is_empty()) {
+        msg = msg.with_metadata(serde_json::json!({ "images": imgs }));
     }
 
     let msg_id = msg.id;
@@ -219,6 +468,16 @@ async fn chat_send_handler(
     ))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/chat/approval",
+    tag = "chat",
+    request_body = ApprovalRequest,
+    responses(
+        (status = 202, body = SendMessageResponse, description = "Approval submitted"),
+        (status = 400, description = "Invalid action or request_id"),
+    ),
+)]
 async fn chat_approval_handler(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<ApprovalRequest>,
@@ -293,11 +552,23 @@ async fn chat_ws_handler(
     ws.on_upgrade(move |socket| crate::channels::web::ws::handle_ws_connection(socket, state))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 struct HistoryQuery {
     thread_id: Option<String>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/chat/history",
+    tag = "chat",
+    params(HistoryQuery),
+    responses(
+        (status = 200, body = HistoryResponse, description = "Turn-by-turn history"),
+        (status = 404, description = "Thread not found"),
+        (status = 503, description = "Session manager unavailable"),
+    ),
+)]
 async fn chat_history_handler(
     State(state): State<Arc<GatewayState>>,
     Query(query): Query<HistoryQuery>,
@@ -349,6 +620,15 @@ async fn chat_history_handler(
     Ok(Json(HistoryResponse { thread_id, turns }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/chat/threads",
+    tag = "chat",
+    responses(
+        (status = 200, body = ThreadListResponse, description = "All threads for the user"),
+        (status = 503, description = "Session manager unavailable"),
+    ),
+)]
 async fn chat_threads_handler(
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<ThreadListResponse>, (StatusCode, String)> {
@@ -378,6 +658,15 @@ async fn chat_threads_handler(
     }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/chat/thread/new",
+    tag = "chat",
+    responses(
+        (status = 200, body = ThreadInfo, description = "New thread created"),
+        (status = 503, description = "Session manager unavailable"),
+    ),
+)]
 async fn chat_new_thread_handler(
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<ThreadInfo>, (StatusCode, String)> {
@@ -401,12 +690,23 @@ async fn chat_new_thread_handler(
 
 // --- Memory handlers ---
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 struct TreeQuery {
     #[allow(dead_code)]
     depth: Option<usize>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/memory/tree",
+    tag = "memory",
+    params(TreeQuery),
+    responses(
+        (status = 200, body = MemoryTreeResponse, description = "Workspace tree"),
+        (status = 503, description = "Workspace unavailable"),
+    ),
+)]
 async fn memory_tree_handler(
     State(state): State<Arc<GatewayState>>,
     Query(_query): Query<TreeQuery>,
@@ -450,11 +750,22 @@ async fn memory_tree_handler(
     Ok(Json(MemoryTreeResponse { entries }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 struct ListQuery {
     path: Option<String>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/memory/list",
+    tag = "memory",
+    params(ListQuery),
+    responses(
+        (status = 200, body = MemoryListResponse, description = "Directory listing"),
+        (status = 503, description = "Workspace unavailable"),
+    ),
+)]
 async fn memory_list_handler(
     State(state): State<Arc<GatewayState>>,
     Query(query): Query<ListQuery>,
@@ -486,11 +797,22 @@ async fn memory_list_handler(
     }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 struct ReadQuery {
     path: String,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/memory/read",
+    tag = "memory",
+    params(ReadQuery),
+    responses(
+        (status = 200, body = MemoryReadResponse, description = "File contents"),
+        (status = 404, description = "Path not found"),
+    ),
+)]
 async fn memory_read_handler(
     State(state): State<Arc<GatewayState>>,
     Query(query): Query<ReadQuery>,
@@ -512,6 +834,16 @@ async fn memory_read_handler(
     }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/memory/write",
+    tag = "memory",
+    request_body = MemoryWriteRequest,
+    responses(
+        (status = 200, body = MemoryWriteResponse, description = "Path written"),
+        (status = 500, description = "Workspace write failed"),
+    ),
+)]
 async fn memory_write_handler(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<MemoryWriteRequest>,
@@ -532,6 +864,16 @@ async fn memory_write_handler(
     }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/memory/search",
+    tag = "memory",
+    request_body = MemorySearchRequest,
+    responses(
+        (status = 200, body = MemorySearchResponse, description = "Search hits"),
+        (status = 503, description = "Workspace unavailable"),
+    ),
+)]
 async fn memory_search_handler(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<MemorySearchRequest>,
@@ -561,6 +903,15 @@ async fn memory_search_handler(
 
 // --- Jobs handlers ---
 
+#[utoipa::path(
+    get,
+    path = "/api/jobs",
+    tag = "jobs",
+    responses(
+        (status = 200, body = JobListResponse, description = "All jobs for the user"),
+        (status = 503, description = "Context manager unavailable"),
+    ),
+)]
 async fn jobs_list_handler(
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<JobListResponse>, (StatusCode, String)> {
@@ -588,6 +939,14 @@ async fn jobs_list_handler(
     Ok(Json(JobListResponse { jobs }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/jobs/summary",
+    tag = "jobs",
+    responses(
+        (status = 200, body = JobSummaryResponse, description = "Counts by job state"),
+    ),
+)]
 async fn jobs_summary_handler(
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<JobSummaryResponse>, (StatusCode, String)> {
@@ -608,6 +967,16 @@ async fn jobs_summary_handler(
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/jobs/{id}",
+    tag = "jobs",
+    params(("id" = String, Path, description = "Job UUID")),
+    responses(
+        (status = 200, body = JobInfo, description = "Job details"),
+        (status = 404, description = "Job not found"),
+    ),
+)]
 async fn jobs_detail_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
@@ -639,6 +1008,17 @@ async fn jobs_detail_handler(
     }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/jobs/{id}/cancel",
+    tag = "jobs",
+    params(("id" = String, Path, description = "Job UUID")),
+    responses(
+        (status = 200, description = "Job cancelled"),
+        (status = 404, description = "Job not found"),
+        (status = 409, description = "Invalid state transition"),
+    ),
+)]
 async fn jobs_cancel_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
@@ -715,6 +1095,15 @@ async fn logs_events_handler(
 
 // --- Extension handlers ---
 
+#[utoipa::path(
+    get,
+    path = "/api/extensions",
+    tag = "extensions",
+    responses(
+        (status = 200, body = ExtensionListResponse, description = "Installed extensions"),
+        (status = 501, description = "Secrets store required"),
+    ),
+)]
 async fn extensions_list_handler(
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<ExtensionListResponse>, (StatusCode, String)> {
@@ -744,6 +1133,15 @@ async fn extensions_list_handler(
     Ok(Json(ExtensionListResponse { extensions }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/extensions/tools",
+    tag = "extensions",
+    responses(
+        (status = 200, body = ToolListResponse, description = "Registered tools"),
+        (status = 503, description = "Tool registry unavailable"),
+    ),
+)]
 async fn extensions_tools_handler(
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<ToolListResponse>, (StatusCode, String)> {
@@ -764,6 +1162,16 @@ async fn extensions_tools_handler(
     Ok(Json(ToolListResponse { tools }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/extensions/install",
+    tag = "extensions",
+    request_body = InstallExtensionRequest,
+    responses(
+        (status = 200, body = ActionResponse, description = "Install result"),
+        (status = 501, description = "Secrets store required"),
+    ),
+)]
 async fn extensions_install_handler(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<InstallExtensionRequest>,
@@ -789,6 +1197,16 @@ async fn extensions_install_handler(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/extensions/{name}/activate",
+    tag = "extensions",
+    params(("name" = String, Path, description = "Extension name")),
+    responses(
+        (status = 200, body = ActionResponse, description = "Activate result; auth URL if needed"),
+        (status = 501, description = "Secrets store required"),
+    ),
+)]
 async fn extensions_activate_handler(
     State(state): State<Arc<GatewayState>>,
     Path(name): Path<String>,
@@ -841,6 +1259,16 @@ async fn extensions_activate_handler(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/extensions/{name}/remove",
+    tag = "extensions",
+    params(("name" = String, Path, description = "Extension name")),
+    responses(
+        (status = 200, body = ActionResponse, description = "Remove result"),
+        (status = 501, description = "Secrets store required"),
+    ),
+)]
 async fn extensions_remove_handler(
     State(state): State<Arc<GatewayState>>,
     Path(name): Path<String>,
@@ -858,6 +1286,14 @@ async fn extensions_remove_handler(
 
 // --- Gateway control plane handlers ---
 
+#[utoipa::path(
+    get,
+    path = "/api/gateway/status",
+    tag = "gateway",
+    responses(
+        (status = 200, body = GatewayStatusResponse, description = "Live connection counts"),
+    ),
+)]
 async fn gateway_status_handler(
     State(state): State<Arc<GatewayState>>,
 ) -> Json<GatewayStatusResponse> {
@@ -875,9 +1311,209 @@ async fn gateway_status_handler(
     })
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, utoipa::ToSchema)]
 struct GatewayStatusResponse {
     sse_connections: u64,
     ws_connections: u64,
     total_connections: u64,
+}
+
+// --- Voice handlers ---
+
+#[derive(serde::Serialize, utoipa::ToSchema)]
+struct VoiceStatusResponse {
+    /// True if STT is reachable. Parakeet (env-provided HTTP sidecar)
+    /// counts; whisper.cpp fallback also counts. The dashboard uses this
+    /// to enable mic capture.
+    stt_ready: bool,
+    /// True if ElevenLabs credentials are populated. The streaming TTS
+    /// handler reads ELEVENLABS_API_KEY + ELEVENLABS_VOICE_ID at request
+    /// time; this flag just tells the dashboard whether to bother gating
+    /// the sentence-splitter on TTS at all.
+    tts_ready: bool,
+}
+
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+struct VoiceTtsRequest {
+    text: String,
+}
+
+#[derive(serde::Serialize, utoipa::ToSchema)]
+struct VoiceSttResponse {
+    text: String,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/voice/status",
+    tag = "voice",
+    responses((status = 200, body = VoiceStatusResponse, description = "Which voice legs are wired")),
+)]
+async fn voice_status_handler(
+    State(state): State<Arc<GatewayState>>,
+) -> Json<VoiceStatusResponse> {
+    // TTS readiness = ElevenLabs creds present. The streaming handler
+    // re-reads env at each request, so this is just a hint for the
+    // dashboard's `tts_ready` signal.
+    let tts_ready = std::env::var("ELEVENLABS_API_KEY")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+        && std::env::var("ELEVENLABS_VOICE_ID")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
+    Json(VoiceStatusResponse {
+        stt_ready: state.voice.stt_ready(),
+        tts_ready,
+    })
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/voice/stt",
+    tag = "voice",
+    request_body(
+        content = Vec<u8>,
+        description = "Raw audio bytes (wav/mp3/ogg). Pipe directly from MediaRecorder.",
+        content_type = "application/octet-stream",
+    ),
+    responses(
+        (status = 200, body = VoiceSttResponse, description = "Transcribed text"),
+        (status = 503, description = "Whisper not configured"),
+        (status = 500, description = "Whisper subprocess failed"),
+    ),
+)]
+async fn voice_stt_handler(
+    State(state): State<Arc<GatewayState>>,
+    body: axum::body::Bytes,
+) -> Result<Json<VoiceSttResponse>, (StatusCode, String)> {
+    if !state.voice.stt_ready() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "WHISPER_PATH / WHISPER_MODEL not set".to_string(),
+        ));
+    }
+    let stt = WhisperStt::new(&state.voice);
+    match stt.transcribe(&body).await {
+        Ok(text) => Ok(Json(VoiceSttResponse { text })),
+        Err(VoiceError::NotConfigured(k)) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("{k} not set"),
+        )),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+}
+
+/// Streaming TTS handler. POSTs the sentence to ElevenLabs's streaming
+/// endpoint, asks for `pcm_24000` (raw int16 LE @ 24kHz mono), and pipes
+/// it back to the dashboard as:
+///
+///   - First 4 bytes: sample rate as little-endian u32 (24000)
+///   - Then: float32-LE PCM samples in [-1, 1], mono, continuous
+///
+/// The dashboard reads with a streaming fetch, builds AudioBuffers from
+/// each chunk, and enqueues them into the AudioQueue for gapless playback.
+///
+/// No fallback by design. If ElevenLabs is unreachable or misconfigured,
+/// the request fails loudly with the upstream's error body so it's
+/// debuggable, rather than degrading to a worse voice.
+async fn voice_tts_stream_handler(
+    Json(req): Json<VoiceTtsRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // Note: `.map()` and `.chain()` on the upstream byte stream are reached
+    // via fully-qualified `futures::StreamExt::map` / `::chain` calls below
+    // to disambiguate from `tokio_stream::StreamExt` which is also in scope
+    // through file-level imports.
+
+    const SAMPLE_RATE: u32 = 24_000;
+    const OUTPUT_FORMAT: &str = "pcm_24000";
+
+    let api_key = std::env::var("ELEVENLABS_API_KEY")
+        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "ELEVENLABS_API_KEY not set".into()))?;
+    let voice_id = std::env::var("ELEVENLABS_VOICE_ID")
+        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "ELEVENLABS_VOICE_ID not set".into()))?;
+    let model_id = std::env::var("ELEVENLABS_MODEL_ID")
+        .unwrap_or_else(|_| "eleven_flash_v2_5".to_string());
+    if api_key.trim().is_empty() || voice_id.trim().is_empty() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID must be set in .env".into(),
+        ));
+    }
+
+    let url = format!(
+        "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream?output_format={OUTPUT_FORMAT}"
+    );
+    // 120s read+connect cap. ElevenLabs Flash usually finishes streaming a
+    // sentence in 1-5s, but the upstream can stall under load. 60s was tight
+    // enough that long multi-sentence replies sometimes truncated mid-word.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("client: {e}")))?;
+    let text_len = req.text.chars().count();
+    let upstream = client
+        .post(&url)
+        .header("xi-api-key", &api_key)
+        .header("content-type", "application/json")
+        .json(&serde_json::json!({
+            "text": req.text,
+            "model_id": model_id,
+        }))
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::error!(url = %url, error = %e, "elevenlabs POST failed");
+            (StatusCode::BAD_GATEWAY, format!("elevenlabs POST: {e}"))
+        })?;
+    if !upstream.status().is_success() {
+        let code = upstream.status();
+        let body = upstream.text().await.unwrap_or_default();
+        tracing::error!(status = %code, body = %body, "elevenlabs returned non-2xx");
+        return Err((StatusCode::BAD_GATEWAY, format!("elevenlabs http {code}: {body}")));
+    }
+    tracing::debug!(model = %model_id, chars = text_len, "elevenlabs stream open");
+
+    // ElevenLabs streams int16 LE @ 24kHz. We:
+    //   1. Emit the 4-byte LE u32 sample-rate header first.
+    //   2. Convert each upstream chunk from int16 LE -> float32 LE in
+    //      [-1, 1].
+    //   3. Carry odd trailing bytes across chunk boundaries (TCP doesn't
+    //      respect sample alignment; without this we'd get static, the
+    //      same way our local sidecars did before we fixed the dashboard
+    //      reader).
+    let mut pending: Vec<u8> = Vec::new();
+    let header = bytes::Bytes::copy_from_slice(&SAMPLE_RATE.to_le_bytes());
+    let upstream_stream = upstream.bytes_stream();
+
+    let header_stream = futures::stream::once(async move {
+        Ok::<bytes::Bytes, reqwest::Error>(header)
+    });
+    let pcm_stream = futures::StreamExt::map(upstream_stream, move |item| {
+        let chunk = item?;
+        pending.extend_from_slice(&chunk);
+        let aligned = (pending.len() / 2) * 2;
+        if aligned == 0 {
+            return Ok(bytes::Bytes::new());
+        }
+        // Drain only the aligned prefix; leftover odd byte (0 or 1) stays
+        // in `pending` for the next read.
+        let to_convert: Vec<u8> = pending.drain(..aligned).collect();
+        let n = aligned / 2;
+        let mut out = Vec::with_capacity(n * 4);
+        for i in 0..n {
+            let off = i * 2;
+            let sample_i16 = i16::from_le_bytes([to_convert[off], to_convert[off + 1]]);
+            let sample_f32 = (sample_i16 as f32) / 32768.0;
+            out.extend_from_slice(&sample_f32.to_le_bytes());
+        }
+        Ok(bytes::Bytes::from(out))
+    });
+
+    let body = axum::body::Body::from_stream(futures::StreamExt::chain(header_stream, pcm_stream));
+    let mut resp = body.into_response();
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        "application/octet-stream".parse().unwrap(),
+    );
+    Ok(resp)
 }

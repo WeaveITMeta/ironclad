@@ -1,4 +1,4 @@
-# IronClaw Workspace — McKale Olson
+# Iron Clad Workspace — McKale Olson
 
 ## Structure
 

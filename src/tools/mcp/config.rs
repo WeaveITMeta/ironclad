@@ -1,7 +1,7 @@
 //! MCP server configuration.
 //!
 //! Stores configuration for connecting to hosted MCP servers.
-//! Configuration is persisted at ~/.ironclaw/mcp-servers.json.
+//! Configuration is persisted at ~/.ironclad/mcp-servers.json.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -18,6 +18,8 @@ pub struct McpServerConfig {
     pub name: String,
 
     /// Server URL (must be HTTPS for remote servers).
+    /// When `command` is set for a stdio MCP, leave `url` empty.
+    #[serde(default)]
     pub url: String,
 
     /// OAuth configuration (if server requires authentication).
@@ -31,6 +33,22 @@ pub struct McpServerConfig {
     /// Optional description for the server.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+
+    /// stdio MCP transport: path to an executable that speaks MCP over
+    /// newline-delimited JSON-RPC on stdin/stdout. Mutually exclusive with
+    /// `url`. When both are set, `url` wins (HTTP transport). Iron Clad's
+    /// MCP client currently treats this as a forward-compatible config
+    /// hint — the stdio transport itself ships separately.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+
+    /// CLI arguments for the stdio MCP process.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub args: Option<Vec<String>>,
+
+    /// Extra environment variables for the stdio MCP process.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub env: Option<std::collections::HashMap<String, String>>,
 }
 
 fn default_true() -> bool {
@@ -46,7 +64,36 @@ impl McpServerConfig {
             oauth: None,
             enabled: true,
             description: None,
+            command: None,
+            args: None,
+            env: None,
         }
+    }
+
+    /// Create a new stdio-transport MCP server configuration. The given
+    /// executable will be spawned and JSON-RPC will be framed as
+    /// newline-delimited messages over its stdin/stdout. Use this for
+    /// local MCP servers that don't expose HTTP (e.g. Eustress).
+    pub fn new_stdio(
+        name: impl Into<String>,
+        command: impl Into<String>,
+        args: Vec<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            url: String::new(),
+            oauth: None,
+            enabled: true,
+            description: None,
+            command: Some(command.into()),
+            args: if args.is_empty() { None } else { Some(args) },
+            env: None,
+        }
+    }
+
+    /// True if this config points at a stdio MCP (no URL, has command).
+    pub fn is_stdio(&self) -> bool {
+        self.command.is_some() && self.url.is_empty()
     }
 
     /// Set OAuth configuration.
@@ -69,19 +116,23 @@ impl McpServerConfig {
             });
         }
 
-        if self.url.is_empty() {
+        // Either a URL (HTTP transport) or a command (stdio transport)
+        // must be set. Empty-both is invalid.
+        if self.url.is_empty() && self.command.is_none() {
             return Err(ConfigError::InvalidConfig {
-                reason: "Server URL cannot be empty".to_string(),
+                reason: "Either url or command must be set".to_string(),
             });
         }
 
-        // Remote servers must use HTTPS (localhost is allowed for development)
-        let url_lower = self.url.to_lowercase();
-        let is_localhost = url_lower.contains("localhost") || url_lower.contains("127.0.0.1");
-        if !is_localhost && !url_lower.starts_with("https://") {
-            return Err(ConfigError::InvalidConfig {
-                reason: "Remote MCP servers must use HTTPS".to_string(),
-            });
+        // HTTP-mode validation only applies when there's a URL.
+        if !self.url.is_empty() {
+            let url_lower = self.url.to_lowercase();
+            let is_localhost = url_lower.contains("localhost") || url_lower.contains("127.0.0.1");
+            if !is_localhost && !url_lower.starts_with("https://") {
+                return Err(ConfigError::InvalidConfig {
+                    reason: "Remote MCP servers must use HTTPS".to_string(),
+                });
+            }
         }
 
         Ok(())
@@ -243,7 +294,7 @@ impl From<ConfigError> for ToolError {
 pub fn default_config_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".ironclaw")
+        .join(".ironclad")
         .join("mcp-servers.json")
 }
 

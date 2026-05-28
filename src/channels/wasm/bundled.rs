@@ -11,7 +11,7 @@ struct BundledChannel {
     capabilities: &'static [u8],
 }
 
-/// Names of bundled channels shipped with IronClaw.
+/// Names of bundled channels shipped with Iron Clad.
 pub fn bundled_channel_names() -> &'static [&'static str] {
     &["telegram"]
 }

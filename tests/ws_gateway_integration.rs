@@ -19,11 +19,11 @@ use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-use ironclaw::channels::IncomingMessage;
-use ironclaw::channels::web::server::{GatewayState, start_server};
-use ironclaw::channels::web::sse::SseManager;
-use ironclaw::channels::web::types::SseEvent;
-use ironclaw::channels::web::ws::WsConnectionTracker;
+use ironclad::channels::IncomingMessage;
+use ironclad::channels::web::server::{GatewayState, start_server};
+use ironclad::channels::web::sse::SseManager;
+use ironclad::channels::web::types::SseEvent;
+use ironclad::channels::web::ws::WsConnectionTracker;
 
 const AUTH_TOKEN: &str = "test-token-12345";
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -49,6 +49,9 @@ async fn start_test_server() -> (
         user_id: "test-user".to_string(),
         shutdown_tx: tokio::sync::RwLock::new(None),
         ws_tracker: Some(Arc::new(WsConnectionTracker::new())),
+        voice: ironclad::config::VoiceConfig::default(),
+        piper_daemon: None,
+        auth_token: AUTH_TOKEN.to_string(),
     });
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();

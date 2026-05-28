@@ -459,7 +459,7 @@ mod tests {
     fn make_test_workspace() -> Arc<Workspace> {
         // Embedded stores in a unique temp dir (no database). Schema tests don't
         // touch storage; the dir is left as a test artifact.
-        let base = std::env::temp_dir().join(format!("ironclaw-test-{}", uuid::Uuid::new_v4()));
+        let base = std::env::temp_dir().join(format!("ironclad-test-{}", uuid::Uuid::new_v4()));
         let docs = std::sync::Arc::new(
             crate::workspace::FjallStore::open(&base.join("docs").to_string_lossy()).unwrap(),
         );

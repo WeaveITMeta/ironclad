@@ -406,6 +406,9 @@ mod tests {
             user_id: "test".to_string(),
             shutdown_tx: tokio::sync::RwLock::new(None),
             ws_tracker: Some(Arc::new(WsConnectionTracker::new())),
+            voice: crate::config::VoiceConfig::default(),
+            piper_daemon: None,
+            auth_token: "test-token".to_string(),
         }
     }
 }

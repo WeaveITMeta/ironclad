@@ -112,7 +112,7 @@ impl McpRequest {
                     "sampling": {}
                 },
                 "clientInfo": {
-                    "name": "ironclaw",
+                    "name": "ironclad",
                     "version": env!("CARGO_PKG_VERSION")
                 }
             })),

@@ -139,7 +139,7 @@ impl ExtensionManager {
                 ExtensionKind::WasmChannel => {
                     Err(ExtensionError::InstallFailed(
                         "WASM channel installation from URL not yet supported. \
-                         Place the .wasm and .capabilities.json files in ~/.ironclaw/channels/ and restart."
+                         Place the .wasm and .capabilities.json files in ~/.ironclad/channels/ and restart."
                             .to_string(),
                     ))
                 }
@@ -336,7 +336,7 @@ impl ExtensionManager {
                 Ok(format!("Removed WASM tool '{}'", name))
             }
             ExtensionKind::WasmChannel => Err(ExtensionError::Other(
-                "Channel removal requires restart. Delete the .wasm file from ~/.ironclaw/channels/ and restart."
+                "Channel removal requires restart. Delete the .wasm file from ~/.ironclad/channels/ and restart."
                     .to_string(),
             )),
         }

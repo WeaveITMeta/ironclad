@@ -21,7 +21,7 @@ use crate::context::JobContext;
 use crate::error::Error;
 use crate::extensions::ExtensionManager;
 use crate::history::FjallHistoryStore as Store;
-use crate::llm::{ChatMessage, LlmProvider, Reasoning, ReasoningContext, RespondResult};
+use crate::llm::{ChatMessage, LlmProvider, Reasoning, ReasoningContext, RespondResult, Role};
 use crate::safety::SafetyLayer;
 use crate::tools::ToolRegistry;
 use crate::workspace::Workspace;
@@ -87,7 +87,7 @@ impl Agent {
     pub fn new(
         config: AgentConfig,
         deps: AgentDeps,
-        channels: ChannelManager,
+        channels: Arc<ChannelManager>,
         heartbeat_config: Option<HeartbeatConfig>,
         context_manager: Option<Arc<ContextManager>>,
         session_manager: Option<Arc<SessionManager>>,
@@ -109,7 +109,7 @@ impl Agent {
         Self {
             config,
             deps,
-            channels: Arc::new(channels),
+            channels,
             context_manager,
             scheduler,
             router: Router::new(),
@@ -771,6 +771,31 @@ impl Agent {
         // Build context with messages that we'll mutate during the loop
         let mut context_messages = initial_messages;
 
+        // If the channel attached screenshots in metadata.images, bind them
+        // to the most recent user message so the LLM sees them as image
+        // content blocks. We don't persist images on the Turn — they only
+        // flow into the very next LLM call. Compaction/replay loses them
+        // (intentional: vision tokens are pricey and one-shot views age).
+        if let Some(imgs) = message
+            .metadata
+            .get("images")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v: &Vec<String>| !v.is_empty())
+        {
+            if let Some(last_user) = context_messages
+                .iter_mut()
+                .rev()
+                .find(|m| m.role == crate::llm::Role::User)
+            {
+                last_user.images = Some(imgs);
+            }
+        }
+
         // Create a JobContext for tool execution (chat doesn't have a real job)
         let job_ctx = JobContext::with_user(&message.user_id, "chat", "Interactive chat session");
 
@@ -782,7 +807,7 @@ impl Agent {
             iteration += 1;
             if iteration > MAX_TOOL_ITERATIONS {
                 return Err(crate::error::LlmError::InvalidResponse {
-                    provider: "nearai".to_string(),
+                    provider: "anthropic".to_string(),
                     reason: format!("Exceeded maximum tool iterations ({})", MAX_TOOL_ITERATIONS),
                 }
                 .into());
@@ -810,26 +835,44 @@ impl Agent {
                 .with_messages(context_messages.clone())
                 .with_tools(tool_defs);
 
-            let result = reasoning.respond_with_tools(&context).await?;
+            // Streaming path: chunks flow through an mpsc to a pump task
+            // that broadcasts each one as `StatusUpdate::StreamChunk`. The
+            // dashboard appends them to an in-progress assistant message.
+            let (chunk_tx, mut chunk_rx) =
+                tokio::sync::mpsc::unbounded_channel::<String>();
+            let channels_for_pump = Arc::clone(&self.channels);
+            let channel_for_pump = message.channel.clone();
+            let metadata_for_pump = message.metadata.clone();
+            let pump = tokio::spawn(async move {
+                while let Some(chunk) = chunk_rx.recv().await {
+                    let _ = channels_for_pump
+                        .send_status(
+                            &channel_for_pump,
+                            StatusUpdate::StreamChunk(chunk),
+                            &metadata_for_pump,
+                        )
+                        .await;
+                }
+            });
+            let chunk_tx_for_closure = chunk_tx.clone();
+            let result = reasoning
+                .respond_with_tools_streaming(&context, move |chunk: String| {
+                    let _ = chunk_tx_for_closure.send(chunk);
+                })
+                .await?;
+            drop(chunk_tx);
+            let _ = pump.await;
 
             match result {
                 RespondResult::Text(text) => {
-                    // If no tools have been executed yet, prompt the LLM to use tools
-                    // This handles the case where the model explains what it will do
-                    // instead of actually calling tools
-                    if !tools_executed && iteration < 3 {
-                        tracing::debug!(
-                            "No tools executed yet (iteration {}), prompting for tool use",
-                            iteration
-                        );
-                        context_messages.push(ChatMessage::assistant(&text));
-                        context_messages.push(ChatMessage::user(
-                            "Please proceed and use the available tools to complete this task.",
-                        ));
-                        continue;
-                    }
-
-                    // Tools have been executed or we've tried multiple times, return response
+                    // JARVIS is conversational first. When Claude returns
+                    // plain text we ship it back to the user immediately;
+                    // we used to force three re-prompts of "Please proceed
+                    // and use the available tools" which broke chat-style
+                    // turns (the user says "hello" and Claude is heckled
+                    // into making up tool calls). Trust the model: if it
+                    // wanted tools it would have called them.
+                    let _ = tools_executed; // silence dead-warn until removed
                     return Ok(AgenticLoopResult::Response(text));
                 }
                 RespondResult::ToolCalls(tool_calls) => {
@@ -879,7 +922,55 @@ impl Agent {
                                 };
 
                                 if !is_auto_approved {
-                                    // Need approval - store pending request and return
+                                    // Need approval - store pending request and return.
+                                    //
+                                    // Multi-tool defense: the most recent assistant
+                                    // message carries the full tool_calls list, but
+                                    // we're only going to execute (and push a
+                                    // tool_result for) the one the user approves.
+                                    // Any sibling tool_use blocks that haven't
+                                    // already been executed would orphan as
+                                    // `tool_use` without matching `tool_result`,
+                                    // and Anthropic's API rejects the next request
+                                    // with HTTP 400. Trim them out before
+                                    // snapshotting context.
+                                    {
+                                        // Walk back to find the latest assistant
+                                        // message with tool_calls + collect every
+                                        // tool_call_id we've already produced a
+                                        // tool_result for.
+                                        let mut already_resulted: Vec<String> =
+                                            Vec::new();
+                                        let mut assistant_idx: Option<usize> = None;
+                                        for (idx, msg) in
+                                            context_messages.iter().enumerate().rev()
+                                        {
+                                            if matches!(msg.role, Role::Tool) {
+                                                if let Some(id) = &msg.tool_call_id {
+                                                    already_resulted.push(id.clone());
+                                                }
+                                            } else if matches!(msg.role, Role::Assistant)
+                                                && msg.tool_calls.is_some()
+                                            {
+                                                assistant_idx = Some(idx);
+                                                break;
+                                            }
+                                        }
+                                        if let Some(idx) = assistant_idx {
+                                            let pending_id = tc.id.clone();
+                                            if let Some(list) =
+                                                context_messages[idx].tool_calls.as_mut()
+                                            {
+                                                list.retain(|c| {
+                                                    c.id == pending_id
+                                                        || already_resulted
+                                                            .iter()
+                                                            .any(|r| r == &c.id)
+                                                });
+                                            }
+                                        }
+                                    }
+
                                     let pending = PendingApproval {
                                         request_id: Uuid::new_v4(),
                                         tool_name: tc.name.clone(),
@@ -967,17 +1058,35 @@ impl Agent {
                             return Ok(AgenticLoopResult::Response(instructions));
                         }
 
-                        // Add tool result to context for next LLM call
+                        // Add tool result to context for next LLM call.
+                        // Tools that declare `requires_sanitization() == false`
+                        // are reading McKale's own filesystem (vault, memory)
+                        // and should NOT be run through the external-data
+                        // policy heuristics; those policies (e.g. `/etc/passwd`,
+                        // `.ssh/`, `private.?key`) false-positive on legitimate
+                        // vault content and replace the file with
+                        // "[Output blocked by safety policy]", which is what
+                        // made JARVIS look like he was blocking himself from
+                        // reading the vault.
+                        let trusted = self
+                            .tools()
+                            .get(&tc.name)
+                            .await
+                            .map(|t| !t.requires_sanitization())
+                            .unwrap_or(false);
                         let result_content = match tool_result {
                             Ok(output) => {
-                                // Sanitize output before showing to LLM
-                                let sanitized =
-                                    self.safety().sanitize_tool_output(&tc.name, &output);
-                                self.safety().wrap_for_llm(
-                                    &tc.name,
-                                    &sanitized.content,
-                                    sanitized.was_modified,
-                                )
+                                if trusted {
+                                    self.safety().wrap_for_llm(&tc.name, &output, false)
+                                } else {
+                                    let sanitized =
+                                        self.safety().sanitize_tool_output(&tc.name, &output);
+                                    self.safety().wrap_for_llm(
+                                        &tc.name,
+                                        &sanitized.content,
+                                        sanitized.was_modified,
+                                    )
+                                }
                             }
                             Err(e) => format!("Error: {}", e),
                         };

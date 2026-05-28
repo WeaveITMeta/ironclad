@@ -181,7 +181,7 @@ async fn add_server(
 
     if requires_auth {
         println!();
-        println!("  Run 'ironclaw mcp auth {}' to authenticate.", name);
+        println!("  Run 'ironclad mcp auth {}' to authenticate.", name);
     }
 
     println!();
@@ -209,7 +209,7 @@ async fn list_servers(verbose: bool) -> anyhow::Result<()> {
         println!("  No MCP servers configured.");
         println!();
         println!("  Add a server with:");
-        println!("    ironclaw mcp add <name> <url> [--client-id <id>]");
+        println!("    ironclad mcp add <name> <url> [--client-id <id>]");
         println!();
         return Ok(());
     }
@@ -307,9 +307,9 @@ async fn auth_server(name: String, user_id: String) -> anyhow::Result<()> {
             println!("  The server may require a different authentication method,");
             println!("  or you may need to configure OAuth manually:");
             println!();
-            println!("    ironclaw mcp remove {}", name);
+            println!("    ironclad mcp remove {}", name);
             println!(
-                "    ironclaw mcp add {} {} --client-id YOUR_CLIENT_ID",
+                "    ironclad mcp add {} {} --client-id YOUR_CLIENT_ID",
                 name, server.url
             );
             println!();
@@ -347,7 +347,7 @@ async fn test_server(name: String, user_id: String) -> anyhow::Result<()> {
         // OAuth configured but no tokens - need to authenticate
         println!();
         println!(
-            "  ✗ Not authenticated. Run 'ironclaw mcp auth {}' first.",
+            "  ✗ Not authenticated. Run 'ironclad mcp auth {}' first.",
             name
         );
         println!();
@@ -399,12 +399,12 @@ async fn test_server(name: String, user_id: String) -> anyhow::Result<()> {
                     println!(
                         "  ✗ Authentication failed (token may be expired). Try re-authenticating:"
                     );
-                    println!("    ironclaw mcp auth {}", name);
+                    println!("    ironclad mcp auth {}", name);
                 } else {
                     // No tokens - server requires auth
                     println!("  ✗ Server requires authentication.");
                     println!();
-                    println!("  Run 'ironclaw mcp auth {}' to authenticate.", name);
+                    println!("  Run 'ironclad mcp auth {}' to authenticate.", name);
                 }
             } else {
                 println!("  ✗ Connection failed: {}", e);
@@ -450,14 +450,14 @@ async fn get_secrets_store() -> anyhow::Result<Arc<dyn SecretsStore + Send + Syn
 
     let master_key = config.secrets.master_key().ok_or_else(|| {
         anyhow::anyhow!(
-            "SECRETS_MASTER_KEY not set. Run 'ironclaw onboard' first or set it in .env"
+            "SECRETS_MASTER_KEY not set. Run 'ironclad onboard' first or set it in .env"
         )
     })?;
 
     let crypto = SecretsCrypto::new(master_key.clone())?;
     let dir = dirs::home_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".ironclaw");
+        .join(".ironclad");
     let _ = std::fs::create_dir_all(&dir);
     Ok(Arc::new(FjallSecretsStore::open(
         &dir.join("secrets-index").to_string_lossy(),

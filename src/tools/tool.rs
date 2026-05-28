@@ -171,6 +171,7 @@ pub trait Tool: Send + Sync {
 }
 
 /// A simple no-op tool for testing.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct EchoTool;
 

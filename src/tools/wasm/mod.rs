@@ -51,8 +51,8 @@
 //! # Example
 //!
 //! ```ignore
-//! use ironclaw::tools::wasm::{WasmToolRuntime, WasmRuntimeConfig, WasmToolWrapper};
-//! use ironclaw::tools::wasm::Capabilities;
+//! use ironclad::tools::wasm::{WasmToolRuntime, WasmRuntimeConfig, WasmToolWrapper};
+//! use ironclad::tools::wasm::Capabilities;
 //! use std::sync::Arc;
 //!
 //! // Create runtime

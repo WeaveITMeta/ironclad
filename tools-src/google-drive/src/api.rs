@@ -223,7 +223,7 @@ pub fn upload_file(
     parent_id: Option<&str>,
     description: Option<&str>,
 ) -> Result<FileResult, String> {
-    let boundary = "ironclaw_upload_boundary_42";
+    let boundary = "ironclad_upload_boundary_42";
 
     let mut metadata = serde_json::json!({
         "name": name,

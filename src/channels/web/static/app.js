@@ -1,9 +1,15 @@
-// IronClaw Web Gateway - Client
+// Iron Clad Web Gateway - Client
 
 let token = '';
 let eventSource = null;
 let logEventSource = null;
 let currentTab = 'chat';
+
+// Voice state
+let mediaRecorder = null;
+let recordedChunks = [];
+let ttsEnabled = false;
+let voiceStatus = { stt_ready: false, tts_ready: false };
 
 // --- Auth ---
 
@@ -13,8 +19,10 @@ function authenticate() {
     document.getElementById('auth-error').textContent = 'Token required';
     return;
   }
+  enterApp();
+}
 
-  // Test the token against the health-ish endpoint (chat/threads requires auth)
+function enterApp() {
   apiFetch('/api/chat/threads')
     .then(() => {
       document.getElementById('auth-screen').style.display = 'none';
@@ -24,11 +32,24 @@ function authenticate() {
       loadHistory();
       loadMemoryTree();
       loadJobs();
+      loadVoiceStatus();
     })
     .catch(() => {
       document.getElementById('auth-error').textContent = 'Invalid token';
     });
 }
+
+// Auto-fetch the dev token on load. Gateway binds to localhost so this is safe;
+// fall back to the manual auth screen if the endpoint isn't there.
+fetch('/api/gateway/token')
+  .then((r) => (r.ok ? r.json() : null))
+  .then((data) => {
+    if (data && data.token) {
+      token = data.token;
+      enterApp();
+    }
+  })
+  .catch(() => {});
 
 document.getElementById('token-input').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') authenticate();
@@ -71,6 +92,9 @@ function connectSSE() {
     const data = JSON.parse(e.data);
     addMessage('assistant', data.content);
     setStatus('');
+    if (ttsEnabled && voiceStatus.tts_ready) {
+      speakResponse(data.content);
+    }
   });
 
   eventSource.addEventListener('thinking', (e) => {
@@ -110,6 +134,181 @@ function connectSSE() {
       addMessage('system', 'Error: ' + data.message);
     }
   });
+}
+
+// --- Voice ---
+
+function loadVoiceStatus() {
+  // /api/voice/status is public; no bearer needed.
+  fetch('/api/voice/status')
+    .then((r) => (r.ok ? r.json() : null))
+    .then((data) => {
+      if (!data) return;
+      voiceStatus = data;
+      const mic = document.getElementById('mic-btn');
+      const tts = document.getElementById('tts-btn');
+      if (mic) {
+        mic.disabled = !data.stt_ready;
+        mic.title = data.stt_ready
+          ? 'Push-to-talk: whisper.cpp STT'
+          : 'STT unavailable: set WHISPER_PATH + WHISPER_MODEL';
+      }
+      if (tts) {
+        tts.disabled = !data.tts_ready;
+        tts.title = data.tts_ready
+          ? 'Auto-play TTS responses via piper'
+          : 'TTS unavailable: set PIPER_PATH + PIPER_VOICE';
+      }
+    });
+}
+
+async function toggleMic() {
+  if (mediaRecorder && mediaRecorder.state === 'recording') {
+    mediaRecorder.stop();
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    recordedChunks = [];
+    mediaRecorder = new MediaRecorder(stream);
+    mediaRecorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) recordedChunks.push(e.data);
+    };
+    mediaRecorder.onstop = async () => {
+      stream.getTracks().forEach((t) => t.stop());
+      document.getElementById('mic-btn').classList.remove('recording');
+      const blob = new Blob(recordedChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+      await transcribeAndFill(blob);
+    };
+    mediaRecorder.start();
+    document.getElementById('mic-btn').classList.add('recording');
+    setStatus('Listening...', true);
+  } catch (err) {
+    setStatus('');
+    addMessage('system', 'Microphone error: ' + err.message);
+  }
+}
+
+async function transcribeAndFill(blob) {
+  setStatus('Transcribing...', true);
+  try {
+    // Whisper.cpp's bundled Windows build only decodes wav. MediaRecorder
+    // emits webm/opus by default, so we transcode to 16 kHz mono PCM wav in
+    // the browser before posting.
+    const wav = await blobToWav16k(blob);
+    const res = await fetch('/api/voice/stt', {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + token,
+        'Content-Type': 'audio/wav',
+      },
+      body: wav,
+    });
+    if (!res.ok) {
+      const txt = await res.text();
+      throw new Error(res.status + ' ' + txt);
+    }
+    const data = await res.json();
+    const input = document.getElementById('chat-input');
+    input.value = (input.value ? input.value + ' ' : '') + data.text;
+    autoResizeTextarea(input);
+    input.focus();
+    setStatus('');
+  } catch (err) {
+    setStatus('');
+    addMessage('system', 'STT failed: ' + err.message);
+  }
+}
+
+// --- Browser audio -> 16 kHz mono PCM wav ---
+
+async function blobToWav16k(blob) {
+  const buf = await blob.arrayBuffer();
+  // AudioContext sample rate is fixed at construction; OfflineAudioContext
+  // lets us resample to whatever whisper prefers.
+  const decodeCtx = new (window.AudioContext || window.webkitAudioContext)();
+  let decoded;
+  try {
+    decoded = await decodeCtx.decodeAudioData(buf.slice(0));
+  } finally {
+    decodeCtx.close();
+  }
+  const targetRate = 16000;
+  const channels = 1;
+  const offline = new OfflineAudioContext(
+    channels,
+    Math.ceil(decoded.duration * targetRate),
+    targetRate,
+  );
+  const source = offline.createBufferSource();
+  source.buffer = decoded;
+  source.connect(offline.destination);
+  source.start(0);
+  const rendered = await offline.startRendering();
+  return encodePcm16Wav(rendered.getChannelData(0), targetRate);
+}
+
+function encodePcm16Wav(samples, sampleRate) {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+
+  const writeString = (offset, str) => {
+    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+  };
+
+  writeString(0, 'RIFF');
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeString(8, 'WAVE');
+  writeString(12, 'fmt ');
+  view.setUint32(16, 16, true); // fmt chunk size
+  view.setUint16(20, 1, true); // PCM format
+  view.setUint16(22, 1, true); // mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true); // byte rate
+  view.setUint16(32, 2, true); // block align
+  view.setUint16(34, 16, true); // bits per sample
+  writeString(36, 'data');
+  view.setUint32(40, samples.length * 2, true);
+
+  let offset = 44;
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    offset += 2;
+  }
+  return new Blob([buffer], { type: 'audio/wav' });
+}
+
+function toggleTts() {
+  ttsEnabled = !ttsEnabled;
+  const btn = document.getElementById('tts-btn');
+  btn.textContent = ttsEnabled ? '🔊' : '🔇';
+  btn.classList.toggle('active', ttsEnabled);
+}
+
+async function speakResponse(text) {
+  try {
+    const res = await fetch('/api/voice/tts', {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + token,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ text }),
+    });
+    if (!res.ok) return;
+    const buf = await res.arrayBuffer();
+    const blob = new Blob([buf], { type: 'audio/wav' });
+    const url = URL.createObjectURL(blob);
+    const player = document.getElementById('tts-player');
+    player.src = url;
+    await player.play();
+    // Release the object URL once playback ends so we don't leak blobs.
+    player.onended = () => URL.revokeObjectURL(url);
+  } catch (err) {
+    // TTS is best-effort; don't fail the chat path.
+    console.warn('TTS failed:', err);
+  }
 }
 
 // --- Chat ---

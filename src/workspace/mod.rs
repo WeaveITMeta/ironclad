@@ -51,7 +51,7 @@ mod vector_store;
 
 pub use chunker::{ChunkConfig, chunk_document};
 pub use document::{MemoryChunk, MemoryDocument, WorkspaceEntry, paths};
-pub use embeddings::{EmbeddingProvider, MockEmbeddings, NearAiEmbeddings, OpenAiEmbeddings};
+pub use embeddings::{EmbeddingProvider, MockEmbeddings, OpenAiEmbeddings};
 pub use fjall_store::FjallStore;
 pub use fts_index::{FtsHit, FtsIndex};
 pub use repository::Repository;
@@ -335,6 +335,7 @@ impl Workspace {
             (paths::SOUL, "## Core Values"),
             (paths::USER, "## User Context"),
             (paths::IDENTITY, "## Identity"),
+            (paths::TOOLS, "## Tools Available"),
         ];
 
         for (path, header) in identity_files {

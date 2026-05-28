@@ -7,7 +7,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use ironclaw::secrets::keychain::{store_master_key, get_master_key, delete_master_key};
+//! use ironclad::secrets::keychain::{store_master_key, get_master_key, delete_master_key};
 //!
 //! // Generate and store a new master key
 //! let key = generate_master_key();
@@ -20,7 +20,7 @@
 use crate::secrets::SecretError;
 
 /// Service name for keychain entries.
-const SERVICE_NAME: &str = "ironclaw";
+const SERVICE_NAME: &str = "ironclad";
 
 /// Account name for the master key.
 const MASTER_KEY_ACCOUNT: &str = "master_key";
@@ -258,10 +258,54 @@ mod platform {
 }
 
 // ============================================================================
+// Windows implementation using Credential Manager (via the keyring crate).
+// keyring 3.x talks to the Windows Credential Manager (wincred) directly with
+// no extra service. Master key stored as a hex string to keep parity with the
+// macOS/Linux paths.
+// ============================================================================
+
+#[cfg(target_os = "windows")]
+mod platform {
+    use super::*;
+
+    fn entry() -> Result<keyring::Entry, SecretError> {
+        keyring::Entry::new(SERVICE_NAME, MASTER_KEY_ACCOUNT)
+            .map_err(|e| SecretError::KeychainError(format!("WinCred entry: {e}")))
+    }
+
+    pub fn store_master_key(key: &[u8]) -> Result<(), SecretError> {
+        let key_hex: String = key.iter().map(|b| format!("{:02x}", b)).collect();
+        entry()?
+            .set_password(&key_hex)
+            .map_err(|e| SecretError::KeychainError(format!("WinCred write: {e}")))
+    }
+
+    pub fn get_master_key() -> Result<Vec<u8>, SecretError> {
+        let pw = entry()?
+            .get_password()
+            .map_err(|e| SecretError::KeychainError(format!("WinCred read: {e}")))?;
+        hex_to_bytes(&pw)
+    }
+
+    pub fn delete_master_key() -> Result<(), SecretError> {
+        entry()?
+            .delete_credential()
+            .map_err(|e| SecretError::KeychainError(format!("WinCred delete: {e}")))
+    }
+
+    pub fn has_master_key() -> bool {
+        match entry() {
+            Ok(e) => e.get_password().is_ok(),
+            Err(_) => false,
+        }
+    }
+}
+
+// ============================================================================
 // Fallback for unsupported platforms
 // ============================================================================
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 mod platform {
     use super::*;
 

@@ -1,7 +1,7 @@
 // WhatsApp API types have fields reserved for future use (contacts, statuses, etc.)
 #![allow(dead_code)]
 
-//! WhatsApp Cloud API channel for IronClaw.
+//! WhatsApp Cloud API channel for Iron Clad.
 //!
 //! This WASM component implements the channel interface for handling WhatsApp
 //! webhooks and sending messages back via the Cloud API.

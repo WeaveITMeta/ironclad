@@ -1,0 +1,22 @@
+# Trunk config for the JARVIS dashboard.
+# Self-hosted on localhost:3000 per the spec.
+
+[build]
+target = "index.html"
+dist = "dist"
+release = false
+
+[serve]
+# Trunk 0.21+: `addresses` (array) replaces the deprecated `address` field.
+addresses = ["127.0.0.1"]
+port = 3000
+# `open = true` makes trunk spawn the default browser on first build. On
+# Windows under jarvis_up this misbehaves (trunk silently exits 1 right after
+# the rebuild that prepares the open). Leave it false; the user knows the URL.
+open = false
+
+[watch]
+# Trunk's `target/` events confuse its filewatcher on Windows: each wasm
+# rebuild touches files under there, trunk sees the changes, kicks another
+# rebuild, races itself, exits 1. Explicit ignore stops the loop.
+ignore = ["target", "dist"]

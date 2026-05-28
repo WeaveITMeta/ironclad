@@ -1,7 +1,7 @@
 // Telegram API types have fields reserved for future use (entities, reply threading, etc.)
 #![allow(dead_code)]
 
-//! Telegram Bot API channel for IronClaw.
+//! Telegram Bot API channel for Iron Clad.
 //!
 //! This WASM component implements the channel interface for handling Telegram
 //! webhooks and sending messages back via the Bot API.

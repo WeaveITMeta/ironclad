@@ -6,7 +6,7 @@
 //!
 //! Canonical chunk text lives in the Fjall store; the copy here exists only to
 //! assemble search results without a second lookup. Single-tenant: results are
-//! not scoped by user/agent (IronClaw runs one "default" user), matching the
+//! not scoped by user/agent (Iron Clad runs one "default" user), matching the
 //! vector store. Writes go through a Mutex'd IndexWriter; search reads a reader.
 
 // Wired into the workspace in step B3 (Repository swap); tests exercise it now.

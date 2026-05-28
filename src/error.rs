@@ -1,4 +1,4 @@
-//! Error types for IronClaw.
+//! Error types for Iron Clad.
 
 use std::time::Duration;
 

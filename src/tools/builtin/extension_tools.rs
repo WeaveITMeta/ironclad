@@ -546,8 +546,8 @@ mod tests {
             Arc::new(InMemorySecretsStore::new(crypto)),
             Arc::new(ToolRegistry::new()),
             None,
-            std::path::PathBuf::from("/tmp/ironclaw-test-tools"),
-            std::path::PathBuf::from("/tmp/ironclaw-test-channels"),
+            std::path::PathBuf::from("/tmp/ironclad-test-tools"),
+            std::path::PathBuf::from("/tmp/ironclad-test-channels"),
             None,
             "test".to_string(),
         ))

@@ -3,14 +3,14 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>IronClaw</title>
+  <title>Iron Clad</title>
   <link rel="stylesheet" href="/style.css">
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 </head>
 <body>
   <!-- Auth Screen -->
   <div id="auth-screen">
-    <h1>IronClaw</h1>
+    <h1>Iron Clad</h1>
     <div class="auth-form">
       <input type="password" id="token-input" placeholder="Auth token" autofocus>
       <button onclick="authenticate()">Connect</button>
@@ -41,8 +41,11 @@
         <div class="chat-status" id="chat-status"></div>
         <div class="chat-input">
           <textarea id="chat-input" placeholder="Type a message..." rows="1"></textarea>
+          <button id="mic-btn" onclick="toggleMic()" title="Push-to-talk: whisper.cpp STT">🎙</button>
+          <button id="tts-btn" onclick="toggleTts()" title="Auto-play TTS responses via piper">🔇</button>
           <button id="send-btn" onclick="sendMessage()">Send</button>
         </div>
+        <audio id="tts-player" hidden></audio>
       </div>
     </div>
 

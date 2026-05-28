@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use ironclaw::workspace::{
+use ironclad::workspace::{
     FjallStore, FtsIndex, MockEmbeddings, Repository, SearchConfig, VectorStore, Workspace, paths,
 };
 use tempfile::TempDir;

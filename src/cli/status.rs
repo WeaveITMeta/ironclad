@@ -11,7 +11,7 @@ use crate::settings::Settings;
 pub async fn run_status_command() -> anyhow::Result<()> {
     let settings = Settings::load();
 
-    println!("IronClaw Status");
+    println!("Iron Clad Status");
     println!("===============\n");
 
     // Version
@@ -24,7 +24,7 @@ pub async fn run_status_command() -> anyhow::Result<()> {
     // Storage (embedded Fjall stores)
     let data_dir = dirs::home_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".ironclaw");
+        .join(".ironclad");
     print!("  Storage:     ");
     if data_dir.join("history-index").exists() {
         println!("Fjall (embedded) at {}", data_dir.display());
@@ -32,13 +32,12 @@ pub async fn run_status_command() -> anyhow::Result<()> {
         println!("Fjall (embedded), not yet initialized");
     }
 
-    // Session / Auth
-    print!("  Session:     ");
-    let session_path = crate::llm::session::default_session_path();
-    if session_path.exists() {
-        println!("found ({})", session_path.display());
+    // LLM provider
+    print!("  LLM:         ");
+    if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+        println!("Anthropic Claude API (ANTHROPIC_API_KEY set)");
     } else {
-        println!("not found (run `ironclaw onboard`)");
+        println!("Anthropic Claude API (ANTHROPIC_API_KEY missing; set in .env)");
     }
 
     // Secrets
@@ -148,13 +147,13 @@ fn count_wasm_files(dir: &std::path::Path) -> usize {
 fn default_tools_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".ironclaw")
+        .join(".ironclad")
         .join("tools")
 }
 
 fn default_channels_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".ironclaw")
+        .join(".ironclad")
         .join("channels")
 }

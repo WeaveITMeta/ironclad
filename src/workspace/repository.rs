@@ -194,7 +194,7 @@ impl Repository {
 
     /// Hybrid search: tantivy FTS + embedvec vectors, fused with RRF.
     ///
-    /// Single-tenant: results are not scoped by user_id/agent_id (IronClaw runs
+    /// Single-tenant: results are not scoped by user_id/agent_id (Iron Clad runs
     /// one "default" user). Revisit for multi-tenant.
     pub async fn hybrid_search(
         &self,

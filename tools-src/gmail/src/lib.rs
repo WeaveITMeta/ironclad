@@ -1,4 +1,4 @@
-//! Gmail WASM Tool for IronClaw.
+//! Gmail WASM Tool for Iron Clad.
 //!
 //! Provides Gmail integration for reading, searching, sending, drafting,
 //! and replying to emails.
@@ -181,7 +181,7 @@ impl exports::near::agent::tool::Guest for GmailTool {
 fn execute_inner(params: &str) -> Result<String, String> {
     if !crate::near::agent::host::secret_exists("google_oauth_token") {
         return Err(
-            "Google OAuth token not configured. Run `ironclaw tool auth gmail` to set up \
+            "Google OAuth token not configured. Run `ironclad tool auth gmail` to set up \
              OAuth, or set the GOOGLE_OAUTH_TOKEN environment variable."
                 .to_string(),
         );
