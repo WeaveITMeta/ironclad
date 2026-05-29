@@ -480,6 +480,7 @@ component ArcReactor inherits Rectangle {
 component SubAgentRowView inherits Rectangle {
     in property <SubAgentRow> data;
     callback dismiss(string);
+    callback copy_to_clipboard(string);
     property <color> tint: rgba(data.tint_r, data.tint_g, data.tint_b, 1.0);
     height: 62px;
     border-radius: 10px;
@@ -494,6 +495,23 @@ component SubAgentRowView inherits Rectangle {
             ? rgba(244, 63, 94, 0.55)
             : rgba(data.tint_r, data.tint_g, data.tint_b, 0.50));
     border-width: 1.2px;
+
+    // Body-wide double-click target. Declared FIRST so its z-order
+    // sits below the X button below — McKale can double-click the
+    // card to copy the full status (truncated by `overflow: elide`
+    // in the UI but full-length in `data.status`); single clicks on
+    // the X button still resolve to the dismiss handler.
+    body_ta := TouchArea {
+        width: parent.width - 28px;  // leave the X button column free
+        height: parent.height;
+        double-clicked => {
+            // Compose the full payload: name + status. A bare status
+            // line can be "Tool error: ..." which is more useful with
+            // the agent name on top so the paste target knows WHICH
+            // sub-agent the error came from.
+            root.copy_to_clipboard(data.label + " · " + data.status);
+        }
+    }
 
     // Indicator dot — colored by state when done, by category tint
     // while running. Glow drops 50% when complete to de-emphasize
@@ -616,6 +634,7 @@ component SubAgentRowView inherits Rectangle {
 component SubAgentsRightPanel inherits Rectangle {
     in property <[SubAgentRow]> sub_agents;
     callback dismiss_sub_agent(string);
+    callback copy_sub_agent(string);
     background: rgba(2, 6, 23, 0.92);
     border-color: rgba(34, 211, 238, 0.18);
     border-width: 1px;
@@ -649,6 +668,7 @@ component SubAgentsRightPanel inherits Rectangle {
                 for row in sub_agents: SubAgentRowView {
                     data: row;
                     dismiss(id) => { root.dismiss_sub_agent(id); }
+                    copy_to_clipboard(text) => { root.copy_sub_agent(text); }
                 }
             }
         }
@@ -813,19 +833,30 @@ component FullHud inherits Rectangle {
         spacing: 0px;
 
         // ----- header -----
-        // Header strip: just a hairline divider and the version
-        // number. The clear-transcript circle moved out to make
-        // space; the new circular row of action buttons lives on
-        // either side of the arc reactor below (minify · reactor ·
-        // screen share). OS title bar carries the brand.
+        // Header strip: minify button on the left, version label on
+        // the right, hairline divider underneath. Minify moved here
+        // from the reactor row so the reactor sits centered without
+        // the off-balance gap the screen-share removal left behind.
         Rectangle {
             height: 30px;
             background: rgba(10, 15, 28, 0.7);
             HorizontalLayout {
-                padding-left: 16px;
+                padding-left: 12px;
                 padding-right: 16px;
                 spacing: 12px;
-                alignment: end;
+                alignment: stretch;
+                MinifyButton {
+                    width: 22px;
+                    height: 22px;
+                    border-radius: 11px;
+                    border-width: 1px;
+                    source: root.minify_icon;
+                    y: (parent.height - self.height) / 2;
+                    clicked => { root.toggle_expand(); }
+                }
+                Rectangle {
+                    horizontal-stretch: 1;
+                }
                 Text {
                     text: version;
                     color: rgba(34, 211, 238, 0.7);
@@ -856,19 +887,9 @@ component FullHud inherits Rectangle {
                 padding-top: 14px;
                 HorizontalLayout {
                     alignment: center;
-                    spacing: 24px;
-                    // Minify button on the left, screen-share button on
-                    // the right — both vertically centered with the
-                    // reactor core for visual balance.
-                    Rectangle {
-                        width: 56px;
-                        height: 168px;
-                        MinifyButton {
-                            source: root.minify_icon;
-                            y: (parent.height - self.height) / 2;
-                            clicked => { root.toggle_expand(); }
-                        }
-                    }
+                    // Reactor stands alone now: minify moved to the
+                    // header top-left and screen-share was removed
+                    // (vision happens via the tool path).
                     ArcReactor {
                         reactor_image: root.reactor_image;
                         pulse: root.pulse;
@@ -876,12 +897,6 @@ component FullHud inherits Rectangle {
                         mic_active: root.mic_active;
                         clicked => { root.toggle_mic(); }
                     }
-                    // ScreenShareButton removed — screen capture now fires
-                    // automatically whenever JARVIS needs vision context
-                    // (see the "Screen vision — never announce, just look"
-                    // section in workspace_seed/AGENTS.md). Manual toggle
-                    // is no longer useful and was visually unbalancing the
-                    // reactor.
                 }
                 Text {
                     text: mic_active ? "● LIVE — " + status : "● MUTED — click reactor to enable mic";
@@ -1832,6 +1847,7 @@ export component MainWindow inherits Window {
     callback toggle_autonomous();
     callback export_conversation();
     callback dismiss_sub_agent(string);
+    callback copy_sub_agent(string);
 
     callback toggle_expand();
     callback toggle_mic();
@@ -1961,6 +1977,7 @@ export component MainWindow inherits Window {
                 width: root.sub_agents_width;
                 sub_agents: root.sub_agents;
                 dismiss_sub_agent(id) => { root.dismiss_sub_agent(id); }
+                copy_sub_agent(text) => { root.copy_sub_agent(text); }
             }
         }
 

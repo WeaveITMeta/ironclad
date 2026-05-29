@@ -130,6 +130,13 @@ dirs = "5"
 # one memcpy via .to_vec(). Saves ~12k allocs/sec under voice.
 bytemuck = "1"
 
+# Cross-platform clipboard access. Used for the "double-click a
+# sub-agent error → copy to clipboard" gesture so McKale can paste a
+# truncated error message into a fresh debug query without losing the
+# tail of it. Tiny crate, no native deps on Windows beyond the OS
+# clipboard APIs.
+arboard = "3"
+
 # Pure-Rust ONNX runtime for Silero VAD inference. Same model the
 # Leptos dashboard runs in `silero.js`; gives us a real
 # speech-vs-everything-else classifier so we can ignore music,

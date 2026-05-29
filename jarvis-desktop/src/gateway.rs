@@ -129,6 +129,25 @@ pub struct ThreadListResponse {
     pub active_thread: Option<String>,
 }
 
+/// One conversation turn as the gateway records it: the user's input
+/// and (if the loop has finished) JARVIS's response. Returned in order
+/// by `/api/chat/history`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TurnInfo {
+    pub turn_number: usize,
+    pub user_input: String,
+    pub response: Option<String>,
+    #[allow(dead_code)]
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HistoryResponse {
+    #[allow(dead_code)]
+    pub thread_id: String,
+    pub turns: Vec<TurnInfo>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 struct SendMessageResponse {
@@ -291,6 +310,27 @@ impl Gateway {
             anyhow::bail!("threads returned {}", resp.status());
         }
         resp.json().await.context("decode thread list")
+    }
+
+    /// Fetch every turn of the named thread (or the active thread when
+    /// `thread_id` is None). Used by `on_select_conversation` to rebuild
+    /// the on-screen transcript when McKale clicks a different thread
+    /// in the sidebar.
+    pub async fn fetch_history(&self, thread_id: Option<&str>) -> Result<HistoryResponse> {
+        let url = match thread_id {
+            Some(id) => format!("{}/api/chat/history?thread_id={}", self.base_url, id),
+            None => format!("{}/api/chat/history", self.base_url),
+        };
+        let resp = self
+            .authed_request(&self.breakers.threads, |http, tok| {
+                http.get(&url).bearer_auth(tok)
+            })
+            .await
+            .context("GET /api/chat/history")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("history returned {}", resp.status());
+        }
+        resp.json().await.context("decode history response")
     }
 
     /// Create a new thread and return its info.

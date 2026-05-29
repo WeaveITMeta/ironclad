@@ -104,6 +104,14 @@ struct State {
     /// and optionally treats the trailing text as the next chat turn).
     /// Distinct from `mic_muted`, which fully disables the mic.
     wake_word_only: Arc<AtomicBool>,
+    /// Set true by the voice-Stop intent. The tts_worker checks this
+    /// before pulling the next sentence and drains the channel (dropping
+    /// any in-flight reply) instead of resuming playback. Cleared the
+    /// moment the user issues a new chat turn so the next response
+    /// flows normally. Without this, halting the speaker queue only
+    /// kills the current sentence; the next one from the SSE stream
+    /// immediately resumes via `speaker_queue.resume()` in the worker.
+    stop_requested: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Debug)]
@@ -201,6 +209,7 @@ fn main() -> Result<()> {
         streaming: Arc::new(parking_lot::Mutex::new(None)),
         voice_ready: Arc::new(AtomicBool::new(false)),
         wake_word_only: Arc::new(AtomicBool::new(false)),
+        stop_requested: Arc::new(AtomicBool::new(false)),
         tts_tx: tts_tx_holder.0.clone(),
     };
     let tts_rx_for_worker = tts_tx_holder.1;
@@ -360,8 +369,15 @@ fn main() -> Result<()> {
     {
         let gateway_for_tts = state.gateway.clone();
         let speaker_queue_for_tts = speaker_queue.clone();
+        let stop_requested_for_tts = state.stop_requested.clone();
         runtime.spawn(async move {
-            tts_worker(tts_rx_for_worker, speaker_queue_for_tts, gateway_for_tts).await;
+            tts_worker(
+                tts_rx_for_worker,
+                speaker_queue_for_tts,
+                gateway_for_tts,
+                stop_requested_for_tts,
+            )
+            .await;
         });
     }
 
@@ -441,7 +457,11 @@ fn main() -> Result<()> {
         let runtime = runtime.clone();
         let ui_weak = ui.as_weak();
         let current_thread = current_thread_id.clone();
+        let stop_requested_for_text = state.stop_requested.clone();
         ui.on_send_text(move |s| {
+            // Any user-initiated chat send clears the stop flag so the
+            // tts_worker resumes playing the new response normally.
+            stop_requested_for_text.store(false, Ordering::Release);
             let gateway = gateway.clone();
             let text = s.to_string();
             push_user_block(&text);
@@ -535,6 +555,8 @@ fn main() -> Result<()> {
     // Conversation select / new.
     {
         let current_thread = current_thread_id.clone();
+        let gateway_for_select = state.gateway.clone();
+        let runtime_for_select = runtime.clone();
         ui.on_select_conversation(move |id| {
             let id = id.to_string();
             *current_thread.lock() = Some(id.clone());
@@ -549,10 +571,39 @@ fn main() -> Result<()> {
                     }
                 }
             });
-            // Clearing the on-screen transcript is the cheapest way
-            // to avoid mixing turns; gateway-side per-thread history
-            // is preserved.
+            // Clear the on-screen transcript and rebuild it from the
+            // selected thread's history. Without this, switching to a
+            // prior thread shows an empty chat panel even though the
+            // gateway side has all the turns recorded.
             clear_transcript_rows();
+            let gateway = gateway_for_select.clone();
+            let id_for_fetch = id.clone();
+            runtime_for_select.spawn(async move {
+                match gateway.fetch_history(Some(&id_for_fetch)).await {
+                    Ok(resp) => {
+                        let turns = resp.turns;
+                        let _ = slint::invoke_from_event_loop(move || {
+                            for t in turns {
+                                if !t.user_input.is_empty() {
+                                    push_user_block(&t.user_input);
+                                }
+                                if let Some(reply) = t.response {
+                                    if !reply.is_empty() {
+                                        append_jarvis_blocks(&reply);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "fetch_history failed for thread {}: {}",
+                            id_for_fetch,
+                            e
+                        );
+                    }
+                }
+            });
         });
     }
     {
@@ -590,6 +641,37 @@ fn main() -> Result<()> {
             let id = id.to_string();
             tracing::info!("dismiss_sub_agent: removing card id={id}");
             prune_sub_agent_row(&id);
+        });
+    }
+    // Double-click on a sub-agent card → copy its full label+status to
+    // the OS clipboard. The status string in the UI is elided so a
+    // truncated "Tool error: Tool memory_r..." line still hides the
+    // actual cause. Copying the unfried full text lets McKale paste it
+    // back into chat or a debug query without having to expand the row.
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_copy_sub_agent(move |text| {
+            let text = text.to_string();
+            tracing::info!(
+                "copy_sub_agent: copying {} chars to clipboard",
+                text.chars().count()
+            );
+            match arboard::Clipboard::new() {
+                Ok(mut cb) => {
+                    if let Err(e) = cb.set_text(text.clone()) {
+                        tracing::warn!("arboard set_text failed: {e}");
+                        return;
+                    }
+                    let ui_weak = ui_weak.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(u) = ui_weak.upgrade() {
+                            let preview: String = text.chars().take(40).collect();
+                            u.set_status(format!("copied: {preview}").into());
+                        }
+                    });
+                }
+                Err(e) => tracing::warn!("arboard open failed: {e}"),
+            }
         });
     }
     // surfaced via set_status so the user sees the path.
@@ -1393,7 +1475,11 @@ async fn mic_pipeline(
             // 40ms frame, ~200ms time constant → alpha ≈ 0.2.
             playback_rms_ema = playback_rms_ema * 0.8 + instant_playback * 0.2;
 
-            let condition = frame_rms > 0.15 && frame_rms > playback_rms_ema * 4.0;
+            // Relaxed: normal-volume "stop" lands around 0.08-0.12 RMS;
+            // the old 0.15 absolute floor required shouting. Silero
+            // remains the rigor — JARVIS echo confused with speech
+            // gets rejected at the second stage.
+            let condition = frame_rms > 0.08 && frame_rms > playback_rms_ema * 2.5;
             if condition {
                 barge_streak += 1;
             } else {
@@ -1927,6 +2013,7 @@ async fn tts_worker(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<splitter::Sentence>,
     speaker_queue: Arc<audio::PlaybackQueue>,
     gateway: Gateway,
+    stop_requested: Arc<AtomicBool>,
 ) {
     // ~0.5s leftover. The cpal output thread drains queue→speaker at
     // device rate; once we're this close to empty, the speaker is
@@ -1937,6 +2024,22 @@ async fn tts_worker(
     const MAX_DRAIN_WAIT_MS: u64 = 8_000;
 
     while let Some(sentence) = rx.recv().await {
+        // Voice-Stop drain: if McKale said "stop" since the prior
+        // sentence finished, dump every queued sentence instead of
+        // resuming through them. Without this, halt() only cuts the
+        // current sentence and the next one resumes via resume() in
+        // the worker — the user perceives "stop" as not working.
+        if stop_requested.load(Ordering::Acquire) {
+            let mut dropped = 1; // this sentence
+            while rx.try_recv().is_ok() {
+                dropped += 1;
+            }
+            tracing::info!(
+                "tts_worker: stop_requested honored, dropped {} sentence(s)",
+                dropped
+            );
+            continue;
+        }
         let speakable = strip_markdown(&sentence.text);
         if speakable.trim().is_empty() {
             continue;
@@ -2055,14 +2158,14 @@ async fn handle_stt_final(
     );
     match intent {
         voice_intent::VoiceIntent::Stop => {
-            tracing::info!("voice-stop: '{}' — halting TTS", trimmed);
-            // Halt the speaker queue. Resume happens at the start of
-            // the next spawn_tts so a barge-in keeps JARVIS silent
-            // until the next assistant turn.
+            tracing::info!("voice-stop: '{}' — halting TTS and draining pipeline", trimmed);
             speaker_queue.halt();
-            // Also clear the in-flight splitter so the SSE stream's
-            // remaining chunks don't immediately get re-spoken.
             state.splitter.lock().reset();
+            // Tell the tts_worker to drop any sentences already in
+            // its mpsc channel instead of resuming through them.
+            // Cleared on the next user-initiated chat send so the
+            // following response flows normally.
+            state.stop_requested.store(true, Ordering::Release);
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(u) = ui_weak.upgrade() {
                     u.set_status("stopped".into());
@@ -2074,8 +2177,14 @@ async fn handle_stt_final(
             speaker_queue.halt();
             state.splitter.lock().reset();
             state.wake_word_only.store(true, Ordering::Release);
+            // Flip the reactor visual to MUTED so the front end matches
+            // the audible state. We DON'T touch `state.mic_muted` —
+            // doing so would disable the VAD entirely and we'd never
+            // hear the "Jarvis" wake word. Visual state is purely UX;
+            // the mic stays hot under the hood.
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(u) = ui_weak.upgrade() {
+                    u.set_mic_active(false);
                     u.set_status("muted · say \"Jarvis\" to wake".into());
                 }
             });
@@ -2084,10 +2193,14 @@ async fn handle_stt_final(
             tracing::info!("voice-wake: '{}' — clearing wake-word-only mode (trailing={:?})", trimmed, rest);
             state.wake_word_only.store(false, Ordering::Release);
             speaker_queue.resume();
+            // Restore the reactor visual to LIVE so the front end
+            // matches. Symmetric with the Mute branch above — we
+            // didn't touch `state.mic_muted` there, so we don't here.
             let _ = slint::invoke_from_event_loop({
                 let ui_weak = ui_weak.clone();
                 move || {
                     if let Some(u) = ui_weak.upgrade() {
+                        u.set_mic_active(true);
                         u.set_status("listening".into());
                     }
                 }
@@ -2096,6 +2209,7 @@ async fn handle_stt_final(
             // what's open?"), send the rest as a normal chat turn so
             // the user doesn't have to wake-then-speak in two breaths.
             if !rest.is_empty() {
+                state.stop_requested.store(false, Ordering::Release);
                 let text_for_push = rest.clone();
                 let _ = slint::invoke_from_event_loop({
                     let ui_weak = ui_weak.clone();
@@ -2175,6 +2289,9 @@ async fn handle_stt_final(
                 );
                 return;
             }
+            // New voice turn → clear any pending Stop so the response
+            // plays normally.
+            state.stop_requested.store(false, Ordering::Release);
             let text_for_push = trimmed.to_string();
             let _ = slint::invoke_from_event_loop({
                 let ui_weak = ui_weak.clone();
