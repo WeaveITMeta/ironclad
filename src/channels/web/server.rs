@@ -124,12 +124,24 @@ use crate::workspace::Workspace;
 )]
 pub struct GatewayOpenApi;
 
+/// Connection details published by the gateway when the WT events
+/// server is alive. Clients (jarvis-desktop) fetch this once at boot to
+/// pin the cert hash, then connect via QUIC instead of SSE.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WtEventsAdvert {
+    pub port: u16,
+    pub cert_sha256: String,
+}
+
 /// Shared state for all gateway handlers.
 pub struct GatewayState {
     /// Channel to send messages to the agent loop.
     pub msg_tx: tokio::sync::RwLock<Option<mpsc::Sender<IncomingMessage>>>,
-    /// SSE broadcast manager.
-    pub sse: SseManager,
+    /// SSE broadcast manager. Wrapped in Arc so it survives
+    /// `GatewayChannel::rebuild_state` rebuilds (each `with_*` builder
+    /// rebuilds the whole struct). Without the Arc, every builder call
+    /// minted a fresh SseManager and orphaned any prior subscriber.
+    pub sse: Arc<SseManager>,
     /// Workspace for memory API.
     pub workspace: Option<Arc<Workspace>>,
     /// Context manager for jobs API.
@@ -158,9 +170,20 @@ pub struct GatewayState {
     /// previous shape built a fresh client per TTS sentence which paid
     /// the full TCP+TLS setup (~150 ms RTT) on every utterance.
     pub tts_client: reqwest::Client,
+    /// The WebTransport events server's port + cert SHA-256 hash, set
+    /// when `spawn_wt_events_server` is called at gateway startup. None
+    /// means WT events are disabled and clients should fall back to the
+    /// SSE endpoint. Exposed to clients via `/api/gateway/wt-events`.
+    pub wt_events: Option<WtEventsAdvert>,
     /// Bearer token for the protected routes. Exposed read-only to localhost
     /// callers via `/api/gateway/token` so the dashboard can self-bootstrap.
     pub auth_token: String,
+    /// MCP server state. Holds the broadcast→mailbox forwarder + the
+    /// mailbox itself so the `wait_for_jarvis_response` tool can drain
+    /// events that arrived while Claude Code was busy between calls.
+    /// Wrapped in Arc so it survives `rebuild_state` (every `with_*`
+    /// builder reconstructs the GatewayState wholesale).
+    pub mcp: Arc<crate::channels::web::mcp::McpState>,
 }
 
 /// Start the gateway HTTP server.
@@ -191,6 +214,7 @@ pub async fn start_server(
     let public = Router::new()
         .route("/api/health", get(health_handler))
         .route("/api/gateway/token", get(gateway_token_handler))
+        .route("/api/gateway/wt-events", get(wt_events_advert_handler))
         .route("/api/voice/status", get(voice_status_handler))
         // Public so the dashboard can bootstrap its WebTransport session
         // without an auth round-trip. Returns the cert hash for
@@ -201,7 +225,14 @@ pub async fn start_server(
         // The real onboard server (used only during first-run setup) lives in
         // `src/setup/onboard_api.rs`; if we're answering here, onboarding is
         // already done.
-        .route("/api/onboard/status", get(onboard_status_stub_handler));
+        .route("/api/onboard/status", get(onboard_status_stub_handler))
+        // MCP server. JSON-RPC over POST. Unauthenticated by the same logic
+        // as /api/gateway/token — same loopback trust model. Claude Code's
+        // MCP HTTP transport posts the JSON-RPC envelope here; the handler
+        // serves initialize / tools/list / tools/call. See
+        // `crate::channels::web::mcp` for the protocol implementation +
+        // the tell_jarvis / wait_for_jarvis_response tool definitions.
+        .route("/api/mcp", post(crate::channels::web::mcp::mcp_handler));
 
     // Protected routes (require auth)
     let auth_state = AuthState {
@@ -216,6 +247,15 @@ pub async fn start_server(
         .route("/api/chat/history", get(chat_history_handler))
         .route("/api/chat/threads", get(chat_threads_handler))
         .route("/api/chat/thread/new", post(chat_new_thread_handler))
+        .route("/api/chat/thread/rename", post(chat_rename_thread_handler))
+        .route("/api/chat/thread/delete", post(chat_delete_thread_handler))
+        .route("/api/chat/thread/pin", post(chat_pin_thread_handler))
+        .route("/api/chat/thread/venture", post(chat_set_venture_handler))
+        // Ventures (collapsible sidebar groups)
+        .route("/api/ventures/create", post(ventures_create_handler))
+        .route("/api/ventures/rename", post(ventures_rename_handler))
+        .route("/api/ventures/collapse", post(ventures_collapse_handler))
+        .route("/api/ventures/delete", post(ventures_delete_handler))
         // Memory
         .route("/api/memory/tree", get(memory_tree_handler))
         .route("/api/memory/list", get(memory_list_handler))
@@ -335,6 +375,19 @@ async fn gateway_token_handler(
     Json(GatewayTokenResponse {
         token: state.auth_token.clone(),
     })
+}
+
+/// Advertise the WebTransport events server connection details (port +
+/// cert SHA-256). Returns 204 No Content when WT events are disabled,
+/// signaling the client to use SSE instead.
+async fn wt_events_advert_handler(
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<WtEventsAdvert>, StatusCode> {
+    state
+        .wt_events
+        .clone()
+        .map(Json)
+        .ok_or(StatusCode::NO_CONTENT)
 }
 
 // --- Health ---
@@ -653,14 +706,42 @@ async fn chat_threads_handler(
             id: t.id,
             state: format!("{:?}", t.state),
             turn_count: t.turns.len(),
+            title: t.title.clone(),
             created_at: t.created_at.to_rfc3339(),
             updated_at: t.updated_at.to_rfc3339(),
+            pinned: t.pinned,
+            venture_id: t.venture_id,
         })
         .collect();
+
+    // Load ventures from the persistent store. Empty vec if the store
+    // isn't wired (e.g. unit tests without a Fjall instance) — the
+    // sidebar treats absent ventures as "no ventures" and renders all
+    // threads as loose.
+    let ventures: Vec<VentureInfo> = if let Some(store) = session_manager.store_ref() {
+        match store.list_ventures_for_user(&state.user_id).await {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|v| VentureInfo {
+                    id: v.id,
+                    name: v.name,
+                    collapsed: v.collapsed,
+                    created_at: v.created_at.to_rfc3339(),
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!("list_ventures_for_user failed: {e}");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
 
     Ok(Json(ThreadListResponse {
         threads,
         active_thread: sess.active_thread,
+        ventures,
     }))
 }
 
@@ -689,9 +770,296 @@ async fn chat_new_thread_handler(
         id: thread.id,
         state: format!("{:?}", thread.state),
         turn_count: thread.turns.len(),
+        title: thread.title.clone(),
         created_at: thread.created_at.to_rfc3339(),
         updated_at: thread.updated_at.to_rfc3339(),
+        pinned: thread.pinned,
+        venture_id: thread.venture_id,
     }))
+}
+
+#[derive(serde::Deserialize)]
+struct RenameThreadRequest {
+    thread_id: String,
+    title: Option<String>,
+}
+
+async fn chat_rename_thread_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(req): Json<RenameThreadRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let thread_id = Uuid::parse_str(&req.thread_id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid thread_id".to_string()))?;
+    let session_manager = state.session_manager.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Session manager not available".to_string(),
+    ))?;
+
+    let session = session_manager.get_or_create_session(&state.user_id).await;
+    {
+        let mut sess = session.lock().await;
+        if let Some(thread) = sess.threads.get_mut(&thread_id) {
+            thread.title = req.title.clone();
+            thread.updated_at = chrono::Utc::now();
+        } else {
+            return Err((StatusCode::NOT_FOUND, "thread not found".to_string()));
+        }
+    }
+    // Persist to Fjall too (best-effort).
+    if let Some(store) = session_manager.store_ref() {
+        if let Err(e) = store
+            .set_conversation_title(thread_id, req.title.clone())
+            .await
+        {
+            tracing::warn!("rename: fjall set_title failed: {e}");
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Deserialize)]
+struct DeleteThreadRequest {
+    thread_id: String,
+}
+
+async fn chat_delete_thread_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(req): Json<DeleteThreadRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let thread_id = Uuid::parse_str(&req.thread_id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid thread_id".to_string()))?;
+    let session_manager = state.session_manager.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Session manager not available".to_string(),
+    ))?;
+
+    let session = session_manager.get_or_create_session(&state.user_id).await;
+    {
+        let mut sess = session.lock().await;
+        sess.threads.remove(&thread_id);
+        if sess.active_thread == Some(thread_id) {
+            sess.active_thread = sess.threads.keys().next().copied();
+        }
+    }
+    if let Some(store) = session_manager.store_ref() {
+        if let Err(e) = store.delete_conversation(thread_id).await {
+            tracing::warn!("delete: fjall delete_conversation failed: {e}");
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// --- Pin + Venture handlers ---
+
+#[derive(serde::Deserialize)]
+struct PinThreadRequest {
+    thread_id: String,
+    pinned: bool,
+}
+
+async fn chat_pin_thread_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(req): Json<PinThreadRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let thread_id = Uuid::parse_str(&req.thread_id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid thread_id".to_string()))?;
+    let session_manager = state.session_manager.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Session manager not available".to_string(),
+    ))?;
+
+    let session = session_manager.get_or_create_session(&state.user_id).await;
+    {
+        let mut sess = session.lock().await;
+        if let Some(thread) = sess.threads.get_mut(&thread_id) {
+            thread.pinned = req.pinned;
+            thread.pinned_at = req.pinned.then(chrono::Utc::now);
+        } else {
+            return Err((StatusCode::NOT_FOUND, "thread not found".to_string()));
+        }
+    }
+    if let Some(store) = session_manager.store_ref() {
+        if let Err(e) = store.set_conversation_pinned(thread_id, req.pinned).await {
+            tracing::warn!("pin: fjall set_conversation_pinned failed: {e}");
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Deserialize)]
+struct SetVentureRequest {
+    thread_id: String,
+    /// `Some(uuid)` to assign, `None` to drop the thread to the loose
+    /// section. JSON-null deserializes to None here so a single shape
+    /// handles both move-to and remove-from.
+    venture_id: Option<String>,
+}
+
+async fn chat_set_venture_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(req): Json<SetVentureRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let thread_id = Uuid::parse_str(&req.thread_id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid thread_id".to_string()))?;
+    let venture_id = match req.venture_id.as_deref() {
+        Some(s) => Some(
+            Uuid::parse_str(s)
+                .map_err(|_| (StatusCode::BAD_REQUEST, "invalid venture_id".to_string()))?,
+        ),
+        None => None,
+    };
+    let session_manager = state.session_manager.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Session manager not available".to_string(),
+    ))?;
+
+    let session = session_manager.get_or_create_session(&state.user_id).await;
+    {
+        let mut sess = session.lock().await;
+        if let Some(thread) = sess.threads.get_mut(&thread_id) {
+            thread.venture_id = venture_id;
+        } else {
+            return Err((StatusCode::NOT_FOUND, "thread not found".to_string()));
+        }
+    }
+    if let Some(store) = session_manager.store_ref() {
+        if let Err(e) = store
+            .set_conversation_venture(thread_id, venture_id)
+            .await
+        {
+            tracing::warn!("venture: fjall set_conversation_venture failed: {e}");
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Deserialize)]
+struct CreateVentureRequest {
+    name: String,
+}
+
+async fn ventures_create_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(req): Json<CreateVentureRequest>,
+) -> Result<Json<VentureInfo>, (StatusCode, String)> {
+    let name = req.name.trim().to_string();
+    if name.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "name required".to_string()));
+    }
+    let session_manager = state.session_manager.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Session manager not available".to_string(),
+    ))?;
+    let store = session_manager.store_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "history store unavailable".to_string(),
+    ))?;
+    let id = store
+        .create_venture(&state.user_id, &name)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(VentureInfo {
+        id,
+        name,
+        collapsed: false,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    }))
+}
+
+#[derive(serde::Deserialize)]
+struct RenameVentureRequest {
+    venture_id: String,
+    name: String,
+}
+
+async fn ventures_rename_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(req): Json<RenameVentureRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let venture_id = Uuid::parse_str(&req.venture_id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid venture_id".to_string()))?;
+    let name = req.name.trim().to_string();
+    if name.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "name required".to_string()));
+    }
+    let session_manager = state.session_manager.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Session manager not available".to_string(),
+    ))?;
+    let store = session_manager.store_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "history store unavailable".to_string(),
+    ))?;
+    store
+        .rename_venture(venture_id, &name)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Deserialize)]
+struct CollapseVentureRequest {
+    venture_id: String,
+    collapsed: bool,
+}
+
+async fn ventures_collapse_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(req): Json<CollapseVentureRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let venture_id = Uuid::parse_str(&req.venture_id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid venture_id".to_string()))?;
+    let session_manager = state.session_manager.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Session manager not available".to_string(),
+    ))?;
+    let store = session_manager.store_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "history store unavailable".to_string(),
+    ))?;
+    store
+        .set_venture_collapsed(venture_id, req.collapsed)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Deserialize)]
+struct DeleteVentureRequest {
+    venture_id: String,
+}
+
+async fn ventures_delete_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(req): Json<DeleteVentureRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let venture_id = Uuid::parse_str(&req.venture_id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid venture_id".to_string()))?;
+    let session_manager = state.session_manager.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Session manager not available".to_string(),
+    ))?;
+
+    // Reflect the unassignment into the in-memory threads so the
+    // sidebar's next poll doesn't show stale venture pointers.
+    {
+        let session = session_manager.get_or_create_session(&state.user_id).await;
+        let mut sess = session.lock().await;
+        for thread in sess.threads.values_mut() {
+            if thread.venture_id == Some(venture_id) {
+                thread.venture_id = None;
+            }
+        }
+    }
+    let store = session_manager.store_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "history store unavailable".to_string(),
+    ))?;
+    store
+        .delete_venture(venture_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // --- Memory handlers ---

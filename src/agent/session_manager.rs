@@ -9,8 +9,9 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
-use crate::agent::session::Session;
+use crate::agent::session::{Session, Thread, Turn};
 use crate::agent::undo::UndoManager;
+use crate::history::FjallHistoryStore as Store;
 
 /// Key for mapping external thread IDs to internal ones.
 #[derive(Clone, Hash, Eq, PartialEq)]
@@ -25,19 +26,43 @@ pub struct SessionManager {
     sessions: RwLock<HashMap<String, Arc<Mutex<Session>>>>,
     thread_map: RwLock<HashMap<ThreadKey, Uuid>>,
     undo_managers: RwLock<HashMap<Uuid, Arc<Mutex<UndoManager>>>>,
+    /// Optional Fjall store. When set, fresh sessions rehydrate their
+    /// `threads` map from disk so prior conversations survive a gateway
+    /// restart. None disables persistence (used in unit tests).
+    store: Option<Arc<Store>>,
 }
 
 impl SessionManager {
-    /// Create a new session manager.
+    /// Create a new session manager with no persistence (in-memory only).
     pub fn new() -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
             thread_map: RwLock::new(HashMap::new()),
             undo_managers: RwLock::new(HashMap::new()),
+            store: None,
         }
     }
 
-    /// Get or create a session for a user.
+    /// Create a new session manager backed by a Fjall store. Sessions
+    /// will rehydrate their thread history from disk on first access.
+    pub fn with_store(store: Arc<Store>) -> Self {
+        Self {
+            sessions: RwLock::new(HashMap::new()),
+            thread_map: RwLock::new(HashMap::new()),
+            undo_managers: RwLock::new(HashMap::new()),
+            store: Some(store),
+        }
+    }
+
+    /// Borrow the underlying Fjall store, if any. Used by the rename +
+    /// delete thread handlers to push changes through to disk after
+    /// updating the in-memory state.
+    pub fn store_ref(&self) -> Option<&Arc<Store>> {
+        self.store.as_ref()
+    }
+
+    /// Get or create a session for a user. On first access (cache miss),
+    /// rehydrate prior threads from the Fjall store if one is wired.
     pub async fn get_or_create_session(&self, user_id: &str) -> Arc<Mutex<Session>> {
         // Fast path: check if session exists
         {
@@ -54,7 +79,96 @@ impl SessionManager {
             return Arc::clone(session);
         }
 
-        let session = Arc::new(Mutex::new(Session::new(user_id)));
+        let mut session = Session::new(user_id);
+
+        // Rehydrate prior threads from disk. Each conversation in the
+        // store with thread_id == its own id is one Thread; messages
+        // (role=user / role=assistant) pair up into Turns by arrival
+        // order. We don't bother resurrecting tool_calls or detailed
+        // state — the sidebar just needs turn count + content for
+        // history display, and any in-flight state was discarded by
+        // the prior gateway exit anyway.
+        if let Some(store) = &self.store {
+            if let Ok(convs) = store.list_conversations_for_user(user_id).await {
+                let mut latest_activity: Option<chrono::DateTime<chrono::Utc>> = None;
+                let mut latest_thread: Option<Uuid> = None;
+                for conv in convs {
+                    let Some(thread_id) = conv.thread_id else {
+                        continue;
+                    };
+                    let messages = match store
+                        .messages_for_conversation(conv.id)
+                        .await
+                    {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::warn!(
+                                "rehydrate messages for {} failed: {}",
+                                thread_id,
+                                e
+                            );
+                            continue;
+                        }
+                    };
+                    let mut thread = Thread::new(session.id);
+                    thread.id = thread_id;
+                    thread.title = conv.title.clone();
+                    thread.created_at = conv.created_at;
+                    thread.updated_at = conv.last_activity;
+                    let mut turn_number: usize = 0;
+                    let mut pending_user: Option<(String, chrono::DateTime<chrono::Utc>)> =
+                        None;
+                    for m in messages {
+                        if m.role == "user" {
+                            if let Some((ui, _)) = pending_user.take() {
+                                // No matching assistant — push the user turn
+                                // anyway so the sidebar count is honest.
+                                let mut t = Turn::new(turn_number, ui);
+                                t.started_at = chrono::Utc::now();
+                                thread.turns.push(t);
+                                turn_number += 1;
+                            }
+                            pending_user = Some((m.content, m.created_at));
+                        } else if m.role == "assistant" {
+                            let (user_input, started_at) = pending_user
+                                .take()
+                                .unwrap_or_else(|| (String::new(), m.created_at));
+                            let mut t = Turn::new(turn_number, user_input);
+                            t.started_at = started_at;
+                            t.complete(m.content);
+                            t.completed_at = Some(m.created_at);
+                            thread.turns.push(t);
+                            turn_number += 1;
+                        }
+                    }
+                    if let Some((ui, started_at)) = pending_user {
+                        let mut t = Turn::new(turn_number, ui);
+                        t.started_at = started_at;
+                        thread.turns.push(t);
+                    }
+                    if latest_activity
+                        .map(|prev| conv.last_activity > prev)
+                        .unwrap_or(true)
+                    {
+                        latest_activity = Some(conv.last_activity);
+                        latest_thread = Some(thread_id);
+                    }
+                    session.threads.insert(thread_id, thread);
+                }
+                if let Some(t) = latest_thread {
+                    session.active_thread = Some(t);
+                }
+                if !session.threads.is_empty() {
+                    tracing::info!(
+                        "rehydrated {} thread(s) for {} from Fjall",
+                        session.threads.len(),
+                        user_id
+                    );
+                }
+            }
+        }
+
+        let session = Arc::new(Mutex::new(session));
         sessions.insert(user_id.to_string(), Arc::clone(&session));
         session
     }

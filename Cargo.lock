@@ -4506,6 +4506,7 @@ dependencies = [
  "aes-gcm",
  "aho-corasick",
  "anyhow",
+ "arboard",
  "async-trait",
  "axum",
  "base64 0.22.1",

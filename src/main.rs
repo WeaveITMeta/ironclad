@@ -934,8 +934,14 @@ async fn main() -> anyhow::Result<()> {
     // Create context manager (shared between job tools and agent)
     let context_manager = Arc::new(ContextManager::new(config.agent.max_parallel_jobs));
 
-    // Create session manager (shared between agent and web gateway)
-    let session_manager = Arc::new(SessionManager::new());
+    // Create session manager (shared between agent and web gateway).
+    // When the history store is wired, sessions rehydrate their thread
+    // map from disk on first access so prior conversations show up in
+    // the left sidebar after a restart instead of starting fresh.
+    let session_manager = Arc::new(match &store {
+        Some(s) => SessionManager::with_store(Arc::clone(s)),
+        None => SessionManager::new(),
+    });
 
     // Register job tools
     tools.register_job_tools(Arc::clone(&context_manager));
@@ -953,6 +959,48 @@ async fn main() -> anyhow::Result<()> {
         gw = gw.with_voice(config.voice.clone());
         if let Some(ref ext_mgr) = extension_manager {
             gw = gw.with_extension_manager(Arc::clone(ext_mgr));
+        }
+
+        // WebTransport events bridge. Spawns a QUIC server on
+        // IRONCLAD_WT_EVENTS_PORT (default 3032) that subscribes
+        // DIRECTLY to the same Arc<SseManager> the SSE endpoint uses,
+        // so every broadcast reaches both pipes without a tap. The
+        // legacy Leptos dashboard keeps using SSE; the native client
+        // (jarvis-desktop) prefers WT.
+        let wt_events_port: Option<u16> = std::env::var("IRONCLAD_WT_EVENTS_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .or(Some(3032));
+        if let Some(port) = wt_events_port {
+            let auth_token = gw.auth_token().to_string();
+            // Subscribe to the SAME Arc<SseManager> the gateway uses.
+            // After the Arc<SseManager> conversion, rebuild_state
+            // preserves the Arc, so this manager IS what the agent loop
+            // broadcasts to via channels.send_status / .respond.
+            let sse_arc = Arc::clone(&gw.state().sse);
+            match ironclad::channels::web::wt_events::spawn_wt_events_server(
+                port,
+                auth_token,
+                sse_arc,
+            )
+            .await
+            {
+                Ok(cert_hash) => {
+                    tracing::info!(
+                        "WT events server up on :{port} (cert sha256={})",
+                        &cert_hash[..16]
+                    );
+                    gw = gw.with_wt_events(
+                        ironclad::channels::web::server::WtEventsAdvert {
+                            port,
+                            cert_sha256: cert_hash,
+                        },
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("WT events server failed to start ({e}); clients will use SSE");
+                }
+            }
         }
 
         tracing::info!(

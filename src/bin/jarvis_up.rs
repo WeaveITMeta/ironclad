@@ -96,23 +96,39 @@ async fn main() -> anyhow::Result<()> {
 
     let shutdown = Arc::new(Notify::new());
 
-    // Playwright: one MCP server per configured Chrome profile. JARVIS sees
-    // them as distinct tool namespaces (`playwright_marketing`,
-    // `playwright_personal`, …) and picks based on the account it needs.
-    // Falls back to a single anonymous browser on PLAYWRIGHT_PORT if no
-    // profiles are configured.
-    let (mut h_playwrights, mut playwright_ports) =
-        spawn_playwright_profiles(shutdown.clone());
-
-    // CDP-attach Playwright: if Chrome is running with
-    // `--remote-debugging-port=9222` (set CHROME_CDP_URL to override),
-    // spawn an MCP server that connects to that running instance instead
-    // of launching its own. This is what gives JARVIS access to McKale's
-    // real interactive tabs (background tabs included), not just
-    // Playwright-spawned ones.
+    // Playwright routing: prefer CDP attach to McKale's running Chrome.
+    // The per-profile spawners (playwright_marketing / personal / state
+    // / federal / tech) used to launch separate headless Chrome instances
+    // per Gmail, but those sessions started NOT-logged-in and McKale
+    // never signed into them (defeats the point of his daily Chrome).
+    // So we now ONLY spawn the per-profile sidecars as an emergency
+    // fallback when CDP isn't available. When Chrome is running with
+    // --remote-debugging-port=9222, JARVIS gets a single
+    // `playwright_cdp` namespace pointed at the real, logged-in browser
+    // and routes between accounts via `browser_tabs` (list / select)
+    // instead of cross-MCP routing.
     let cdp_endpoint = std::env::var("CHROME_CDP_URL")
         .unwrap_or_else(|_| "http://localhost:9222".to_string());
-    if probe_cdp_endpoint(&cdp_endpoint).await {
+    let cdp_alive = probe_cdp_endpoint(&cdp_endpoint).await;
+
+    let (mut h_playwrights, mut playwright_ports) = if cdp_alive {
+        println!(
+            "[jarvis-up] CDP attach available on {cdp_endpoint}; \
+             skipping per-profile Playwright spawners (account routing \
+             happens via playwright_cdp browser_tabs instead)"
+        );
+        prune_per_profile_mcp_entries();
+        (Vec::new(), Vec::new())
+    } else {
+        println!(
+            "[jarvis-up] no Chrome on {cdp_endpoint}; falling back to \
+             per-profile Playwright spawners (launch Chrome with \
+             --remote-debugging-port=9222 to switch to CDP attach)"
+        );
+        spawn_playwright_profiles(shutdown.clone())
+    };
+
+    if cdp_alive {
         let cdp_mcp_port: u16 = std::env::var("PLAYWRIGHT_CDP_PORT")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -131,11 +147,6 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("[jarvis-up] failed to start playwright_cdp: {e}");
             }
         }
-    } else {
-        println!(
-            "[jarvis-up] no Chrome on {cdp_endpoint}; skipping playwright_cdp \
-             (launch Chrome with --remote-debugging-port=9222 to enable)"
-        );
     }
 
     println!();
@@ -650,6 +661,52 @@ fn write_playwright_mcp_config(servers: &[(String, u16, Option<String>)]) {
 /// the CDP-attached server alongside the profile-based ones. Preserves
 /// every other server already in the file (Playwright per-profile,
 /// Eustress, etc.).
+/// Remove every per-profile Playwright entry (playwright_marketing /
+/// _personal / _state / _federal / _tech) from `mcp-servers.json` so
+/// JARVIS's tool registry only sees `playwright_cdp` once CDP attach is
+/// active. Without this prune, prior runs leave stale entries pointing
+/// at sidecars that aren't running this session, causing 30-second
+/// connect timeouts on every boot.
+fn prune_per_profile_mcp_entries() {
+    let user_dir = match std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+    {
+        Ok(d) => PathBuf::from(d),
+        Err(_) => return,
+    };
+    let path = user_dir.join(".ironclad").join("mcp-servers.json");
+    let Some(text) = std::fs::read_to_string(&path).ok() else { return };
+    let Some(mut doc) = serde_json::from_str::<serde_json::Value>(&text).ok() else { return };
+    let Some(servers) = doc.get_mut("servers").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    let before = servers.len();
+    servers.retain(|s| {
+        let name = s.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        !matches!(
+            name,
+            "playwright_marketing"
+                | "playwright_personal"
+                | "playwright_state"
+                | "playwright_federal"
+                | "playwright_tech"
+        )
+    });
+    let removed = before - servers.len();
+    if removed == 0 {
+        return;
+    }
+    let pretty = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_string());
+    match std::fs::write(&path, pretty) {
+        Ok(()) => println!(
+            "[jarvis-up] pruned {removed} stale per-profile Playwright \
+             entr{} from mcp-servers.json",
+            if removed == 1 { "y" } else { "ies" }
+        ),
+        Err(e) => eprintln!("[jarvis-up] failed to prune {}: {e}", path.display()),
+    }
+}
+
 fn write_cdp_mcp_entry(mcp_port: u16, cdp_endpoint: &str) {
     let user_dir = match std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))

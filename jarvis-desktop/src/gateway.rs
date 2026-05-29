@@ -119,14 +119,38 @@ pub struct ThreadInfo {
     pub id: String,
     pub state: String,
     pub turn_count: usize,
+    #[serde(default)]
+    pub title: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// User-pinned: float this thread to the top of the sidebar.
+    #[serde(default)]
+    pub pinned: bool,
+    /// Venture this thread belongs to (None = loose, shown below
+    /// every venture in its own unsectioned block).
+    #[serde(default)]
+    pub venture_id: Option<String>,
+}
+
+/// One Venture: a named, collapsible sidebar group of threads. The
+/// sidebar renders these as header rows with a chevron; threads point
+/// at their venture via `ThreadInfo.venture_id`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct VentureInfo {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub collapsed: bool,
+    #[serde(default)]
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ThreadListResponse {
     pub threads: Vec<ThreadInfo>,
     pub active_thread: Option<String>,
+    #[serde(default)]
+    pub ventures: Vec<VentureInfo>,
 }
 
 /// One conversation turn as the gateway records it: the user's input
@@ -333,6 +357,169 @@ impl Gateway {
         resp.json().await.context("decode history response")
     }
 
+    /// Set or clear a user-assigned title for an existing thread.
+    /// `title=None` reverts to the default short-id display.
+    pub async fn rename_thread(
+        &self,
+        thread_id: &str,
+        title: Option<&str>,
+    ) -> Result<()> {
+        let url = format!("{}/api/chat/thread/rename", self.base_url);
+        let body = serde_json::json!({
+            "thread_id": thread_id,
+            "title": title,
+        });
+        let resp = self
+            .authed_request(&self.breakers.threads, |http, tok| {
+                http.post(&url).bearer_auth(tok).json(&body)
+            })
+            .await
+            .context("POST /api/chat/thread/rename")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("rename returned {}", resp.status());
+        }
+        Ok(())
+    }
+
+    /// Delete a thread and all of its messages on the gateway side
+    /// (in-memory + Fjall). Used by the sidebar right-click → Delete.
+    pub async fn delete_thread(&self, thread_id: &str) -> Result<()> {
+        let url = format!("{}/api/chat/thread/delete", self.base_url);
+        let body = serde_json::json!({ "thread_id": thread_id });
+        let resp = self
+            .authed_request(&self.breakers.threads, |http, tok| {
+                http.post(&url).bearer_auth(tok).json(&body)
+            })
+            .await
+            .context("POST /api/chat/thread/delete")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("delete returned {}", resp.status());
+        }
+        Ok(())
+    }
+
+    /// Pin or unpin a thread. Pinned threads float to the top of the
+    /// sidebar across all ventures + loose threads.
+    pub async fn set_thread_pinned(&self, thread_id: &str, pinned: bool) -> Result<()> {
+        let url = format!("{}/api/chat/thread/pin", self.base_url);
+        let body = serde_json::json!({
+            "thread_id": thread_id,
+            "pinned": pinned,
+        });
+        let resp = self
+            .authed_request(&self.breakers.threads, |http, tok| {
+                http.post(&url).bearer_auth(tok).json(&body)
+            })
+            .await
+            .context("POST /api/chat/thread/pin")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("pin returned {}", resp.status());
+        }
+        Ok(())
+    }
+
+    /// Move a thread into a venture (or drop it back to loose with
+    /// `venture_id = None`). The server validates the venture exists
+    /// when assigning.
+    pub async fn set_thread_venture(
+        &self,
+        thread_id: &str,
+        venture_id: Option<&str>,
+    ) -> Result<()> {
+        let url = format!("{}/api/chat/thread/venture", self.base_url);
+        let body = serde_json::json!({
+            "thread_id": thread_id,
+            "venture_id": venture_id,
+        });
+        let resp = self
+            .authed_request(&self.breakers.threads, |http, tok| {
+                http.post(&url).bearer_auth(tok).json(&body)
+            })
+            .await
+            .context("POST /api/chat/thread/venture")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("set_venture returned {}", resp.status());
+        }
+        Ok(())
+    }
+
+    /// Create a new Venture. Returns the assigned id + initial
+    /// collapsed=false state.
+    pub async fn create_venture(&self, name: &str) -> Result<VentureInfo> {
+        let url = format!("{}/api/ventures/create", self.base_url);
+        let body = serde_json::json!({ "name": name });
+        let resp = self
+            .authed_request(&self.breakers.threads, |http, tok| {
+                http.post(&url).bearer_auth(tok).json(&body)
+            })
+            .await
+            .context("POST /api/ventures/create")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("ventures/create returned {}", resp.status());
+        }
+        resp.json().await.context("decode venture info")
+    }
+
+    /// Rename an existing venture.
+    pub async fn rename_venture(&self, venture_id: &str, name: &str) -> Result<()> {
+        let url = format!("{}/api/ventures/rename", self.base_url);
+        let body = serde_json::json!({
+            "venture_id": venture_id,
+            "name": name,
+        });
+        let resp = self
+            .authed_request(&self.breakers.threads, |http, tok| {
+                http.post(&url).bearer_auth(tok).json(&body)
+            })
+            .await
+            .context("POST /api/ventures/rename")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("ventures/rename returned {}", resp.status());
+        }
+        Ok(())
+    }
+
+    /// Persist the venture's collapsed/expanded state so the sidebar
+    /// shape survives restarts.
+    pub async fn set_venture_collapsed(
+        &self,
+        venture_id: &str,
+        collapsed: bool,
+    ) -> Result<()> {
+        let url = format!("{}/api/ventures/collapse", self.base_url);
+        let body = serde_json::json!({
+            "venture_id": venture_id,
+            "collapsed": collapsed,
+        });
+        let resp = self
+            .authed_request(&self.breakers.threads, |http, tok| {
+                http.post(&url).bearer_auth(tok).json(&body)
+            })
+            .await
+            .context("POST /api/ventures/collapse")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("ventures/collapse returned {}", resp.status());
+        }
+        Ok(())
+    }
+
+    /// Delete a venture. Threads previously inside it drop back to the
+    /// loose section (their threads are not destroyed).
+    pub async fn delete_venture(&self, venture_id: &str) -> Result<()> {
+        let url = format!("{}/api/ventures/delete", self.base_url);
+        let body = serde_json::json!({ "venture_id": venture_id });
+        let resp = self
+            .authed_request(&self.breakers.threads, |http, tok| {
+                http.post(&url).bearer_auth(tok).json(&body)
+            })
+            .await
+            .context("POST /api/ventures/delete")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("ventures/delete returned {}", resp.status());
+        }
+        Ok(())
+    }
+
     /// Create a new thread and return its info.
     pub async fn new_thread(&self) -> Result<ThreadInfo> {
         let url = format!("{}/api/chat/thread/new", self.base_url);
@@ -531,6 +718,132 @@ impl Gateway {
             carry = frame[used..].to_vec();
             if !samples.is_empty() {
                 on_chunk(sample_rate, samples);
+            }
+        }
+        Ok(())
+    }
+
+    /// Discover whether the gateway is advertising a WebTransport
+    /// events server. Returns Some((port, cert_sha256_hex)) when WT is
+    /// available; None when the gateway responded with 204 No Content
+    /// (clients should use SSE in that case).
+    pub async fn wt_events_advert(&self) -> Result<Option<(u16, String)>> {
+        #[derive(Deserialize)]
+        struct Advert {
+            port: u16,
+            cert_sha256: String,
+        }
+        let token = self.ensure_token().await?;
+        let url = format!("{}/api/gateway/wt-events", self.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .context("GET /api/gateway/wt-events")?;
+        if resp.status() == reqwest::StatusCode::NO_CONTENT {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            anyhow::bail!("wt-events advert returned {}", resp.status());
+        }
+        let advert: Advert = resp.json().await.context("decode wt-events advert")?;
+        Ok(Some((advert.port, advert.cert_sha256)))
+    }
+
+    /// Subscribe to chat events over WebTransport. Each broadcast event
+    /// arrives on its own unidirectional QUIC stream; we read it to
+    /// completion, deserialize it as a `ChatEvent`, and call `on_event`.
+    /// Returns when the connection closes (gateway exit, network drop).
+    /// Caller wraps in reconnect.
+    pub async fn wt_subscribe_events<F>(
+        &self,
+        port: u16,
+        cert_sha256_hex: &str,
+        on_event: F,
+    ) -> Result<()>
+    where
+        F: Fn(ChatEvent) + Send + Sync + 'static,
+    {
+        use tokio::io::AsyncReadExt;
+        use wtransport::endpoint::ConnectOptions;
+        use wtransport::tls::Sha256Digest;
+        use wtransport::{ClientConfig, Endpoint};
+
+        let token = self.ensure_token().await?;
+        tracing::debug!(
+            "WT events client: stage=ensure_token ok (token_len={})",
+            token.len()
+        );
+
+        // Decode the hex hash to a 32-byte digest and pin it. Matches
+        // the streaming_stt cert-pinning pattern.
+        let mut digest_bytes = [0u8; 32];
+        if cert_sha256_hex.len() != 64 {
+            anyhow::bail!("wt cert hash must be 64 hex chars, got {}", cert_sha256_hex.len());
+        }
+        for i in 0..32 {
+            digest_bytes[i] = u8::from_str_radix(&cert_sha256_hex[i * 2..i * 2 + 2], 16)
+                .context("decode wt cert hash hex")?;
+        }
+        let digest = Sha256Digest::new(digest_bytes);
+        tracing::debug!("WT events client: stage=cert hash decoded ok");
+
+        let client_config = ClientConfig::builder()
+            .with_bind_default()
+            .with_server_certificate_hashes(vec![digest])
+            .build();
+        let endpoint = Endpoint::client(client_config)
+            .context("build WT client endpoint")?;
+        tracing::debug!("WT events client: stage=endpoint built ok");
+
+        // Belt + suspenders auth: token in URL query AND Authorization
+        // header. The server accepts either; if `add_header` is dropped
+        // by wtransport's HTTP/3 CONNECT (suspected from the prior
+        // failure mode), the query path wins. The gateway's auth_token
+        // is generated server-side and is URL-safe (hex/uuid), so we
+        // skip percent-encoding.
+        let url = format!("https://127.0.0.1:{port}/?token={token}");
+        let opts = ConnectOptions::builder(&url)
+            .add_header("Authorization", format!("Bearer {token}"))
+            .build();
+        tracing::info!(
+            "WT events client: starting connect to :{port} (token in query+header)"
+        );
+        let conn = endpoint
+            .connect(opts)
+            .await
+            .with_context(|| format!("WT connect to :{port} failed"))?;
+        tracing::info!("WT events: connected to :{port}");
+
+        loop {
+            // Each event is one unidirectional stream. Accept, read to
+            // EOF, deserialize.
+            let mut recv = match conn.accept_uni().await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::info!("WT events: accept_uni ended ({e})");
+                    break;
+                }
+            };
+            let mut buf = Vec::with_capacity(1024);
+            if let Err(e) = recv.read_to_end(&mut buf).await {
+                tracing::warn!("WT events: read stream failed: {e}");
+                continue;
+            }
+            // Empty payload (server closed-stream-early) means skip.
+            if buf.is_empty() {
+                continue;
+            }
+            match serde_json::from_slice::<ChatEvent>(&buf) {
+                Ok(ev) => on_event(ev),
+                Err(e) => {
+                    tracing::debug!(
+                        "WT events: skip event (parse error: {e}, body={} bytes)",
+                        buf.len()
+                    );
+                }
             }
         }
         Ok(())

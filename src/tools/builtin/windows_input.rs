@@ -535,11 +535,53 @@ fn focus_window(hwnd_raw: isize) -> Result<(), String> {
         }
 
         if ok {
+            return Ok(());
+        }
+
+        // Fourth attempt — Windows foreground-lock timeout. Temporarily
+        // set SPI_SETFOREGROUNDLOCKTIMEOUT to 0 so the lock guard stops
+        // gating SetForegroundWindow, then restore the original after.
+        // This is the most aggressive bypass that doesn't require admin;
+        // it works against the user-mode lock guard but still respects
+        // UAC integrity boundaries (elevated targets still fail and the
+        // user must relaunch JARVIS as admin for those).
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SystemParametersInfoW, SPI_GETFOREGROUNDLOCKTIMEOUT,
+            SPI_SETFOREGROUNDLOCKTIMEOUT, SPIF_SENDCHANGE,
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+        };
+        let mut prev_timeout: u32 = 0;
+        let got_prev = SystemParametersInfoW(
+            SPI_GETFOREGROUNDLOCKTIMEOUT,
+            0,
+            Some(&mut prev_timeout as *mut _ as *mut _),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        ).is_ok();
+        let _ = SystemParametersInfoW(
+            SPI_SETFOREGROUNDLOCKTIMEOUT,
+            0,
+            None,
+            SPIF_SENDCHANGE,
+        );
+        let final_ok = SetForegroundWindow(hwnd).as_bool();
+        if got_prev {
+            // Restore timeout (best-effort).
+            let _ = SystemParametersInfoW(
+                SPI_SETFOREGROUNDLOCKTIMEOUT,
+                prev_timeout,
+                None,
+                SPIF_SENDCHANGE,
+            );
+        }
+
+        if final_ok {
             Ok(())
         } else {
-            Err("SetForegroundWindow refused after Alt-tap + AttachThreadInput; \
-                 the target process may be elevated (run JARVIS as admin) \
-                 or another window has a focus lock"
+            Err("SetForegroundWindow refused after 4 escalating retries \
+                 (Alt-tap, AttachThreadInput, foreground-lock-timeout=0). \
+                 The target process is almost certainly elevated — relaunch \
+                 JARVIS as admin (right-click jarvis-desktop.exe → Run as \
+                 administrator) so it can grab focus from elevated apps."
                 .to_string())
         }
     }))
@@ -685,4 +727,444 @@ fn send_key(key: &str, modifiers: &[String]) -> Result<(), String> {
         Ok(())
     }))
     .map_err(|_| "send_key panicked in Win32 FFI".to_string())?
+}
+
+// =============================================================================
+// windows_mouse_click (write)  + windows_mouse_move (write)
+// =============================================================================
+//
+// Closes the CUA (Computer Use Agent) gap: with these tools JARVIS can
+// take a screenshot, identify a target in pixels, click it, and only
+// THEN type. Without this, `windows_type_text` blasts keystrokes into
+// whatever Windows considers focused — usually not what the screenshot
+// just showed.
+
+/// Coerce a pixel coordinate from a tool-params JSON value into i32.
+/// Tolerates integer, float (rounded to nearest), and stringified
+/// numeric inputs because the LLM sometimes emits `100.0` or `"100"`
+/// for parameters typed as integers in the schema. A strict
+/// `as_i64()` rejects both — that was the cause of recent
+/// `windows_mouse_click execution failed: Invalid parameters` errors.
+/// On failure, the returned error string includes the actual params
+/// the model sent so the next-iteration prompt can correct itself.
+fn coerce_pixel_coord(
+    params: &serde_json::Value,
+    field: &str,
+) -> Result<i32, ToolError> {
+    let v = params.get(field).ok_or_else(|| {
+        ToolError::InvalidParameters(format!(
+            "missing `{field}`; got params = {}",
+            params
+        ))
+    })?;
+    if let Some(n) = v.as_i64() {
+        return Ok(n as i32);
+    }
+    if let Some(f) = v.as_f64() {
+        return Ok(f.round() as i32);
+    }
+    if let Some(s) = v.as_str() {
+        if let Ok(n) = s.trim().parse::<i64>() {
+            return Ok(n as i32);
+        }
+        if let Ok(f) = s.trim().parse::<f64>() {
+            return Ok(f.round() as i32);
+        }
+    }
+    Err(ToolError::InvalidParameters(format!(
+        "`{field}` must be a number (integer or float); got {v}"
+    )))
+}
+
+pub struct WindowsMouseClickTool;
+
+#[async_trait]
+impl Tool for WindowsMouseClickTool {
+    fn name(&self) -> &str {
+        "windows_mouse_click"
+    }
+
+    fn description(&self) -> &str {
+        "Click the mouse at a specific screen-pixel coordinate. Use this \
+         AFTER a `windows_screenshot_foreground` so the LLM can pick the \
+         target visually, THEN before `windows_type_text` so the right \
+         control gets focus. Params: x (i32), y (i32), button (\"left\" \
+         default | \"right\" | \"middle\"), double (bool, default false). \
+         Cursor returns to its prior position after the click."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "x": {"type": "integer"},
+                "y": {"type": "integer"},
+                "button": {
+                    "type": "string",
+                    "enum": ["left", "right", "middle"],
+                    "default": "left"
+                },
+                "double": {"type": "boolean", "default": false}
+            },
+            "required": ["x", "y"]
+        })
+    }
+
+    async fn execute(
+        &self,
+        params: serde_json::Value,
+        _ctx: &JobContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let start = Instant::now();
+        let x = coerce_pixel_coord(&params, "x")?;
+        let y = coerce_pixel_coord(&params, "y")?;
+        let button = params
+            .get("button")
+            .and_then(|v| v.as_str())
+            .unwrap_or("left")
+            .to_string();
+        let double = params
+            .get("double")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        #[cfg(target_os = "windows")]
+        {
+            let button_for_click = button.clone();
+            tokio::task::spawn_blocking(move || mouse_click(x, y, &button_for_click, double))
+                .await
+                .map_err(|e| ToolError::ExecutionFailed(format!("join: {e}")))?
+                .map_err(ToolError::ExecutionFailed)?;
+            Ok(ToolOutput::success(
+                serde_json::json!({"x": x, "y": y, "button": button, "double": double}),
+                start.elapsed(),
+            ))
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (start, x, y, button, double);
+            Err(ToolError::NotAuthorized(
+                "windows_mouse_click only works on Windows".to_string(),
+            ))
+        }
+    }
+
+    fn requires_sanitization(&self) -> bool {
+        false
+    }
+
+    fn requires_approval(&self) -> bool {
+        // Clicks can do irreversible things (close dialogs, hit Send,
+        // etc). Approval per the same policy as type_text.
+        true
+    }
+}
+
+pub struct WindowsMouseMoveTool;
+
+#[async_trait]
+impl Tool for WindowsMouseMoveTool {
+    fn name(&self) -> &str {
+        "windows_mouse_move"
+    }
+
+    fn description(&self) -> &str {
+        "Move the mouse cursor to a screen-pixel coordinate without \
+         clicking. Useful for hover-reveals (tooltips, hover menus). \
+         Params: x (i32), y (i32)."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "x": {"type": "integer"},
+                "y": {"type": "integer"}
+            },
+            "required": ["x", "y"]
+        })
+    }
+
+    async fn execute(
+        &self,
+        params: serde_json::Value,
+        _ctx: &JobContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let start = Instant::now();
+        let x = coerce_pixel_coord(&params, "x")?;
+        let y = coerce_pixel_coord(&params, "y")?;
+        #[cfg(target_os = "windows")]
+        {
+            tokio::task::spawn_blocking(move || mouse_move(x, y))
+                .await
+                .map_err(|e| ToolError::ExecutionFailed(format!("join: {e}")))?
+                .map_err(ToolError::ExecutionFailed)?;
+            Ok(ToolOutput::success(
+                serde_json::json!({"x": x, "y": y}),
+                start.elapsed(),
+            ))
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (start, x, y);
+            Err(ToolError::NotAuthorized(
+                "windows_mouse_move only works on Windows".to_string(),
+            ))
+        }
+    }
+
+    fn requires_sanitization(&self) -> bool {
+        false
+    }
+}
+
+// =============================================================================
+// windows_clipboard_get  +  windows_clipboard_set
+// =============================================================================
+//
+// Faster + more reliable than `windows_type_text` for pasting large
+// payloads (the manifesto McKale tried to drop into VS Code at 19:00 was
+// rejected as keystrokes; a clipboard set + Ctrl+V would have landed
+// instantly). Also lets JARVIS read whatever the user just copied.
+
+pub struct WindowsClipboardGetTool;
+
+#[async_trait]
+impl Tool for WindowsClipboardGetTool {
+    fn name(&self) -> &str {
+        "windows_clipboard_get"
+    }
+
+    fn description(&self) -> &str {
+        "Read the current text contents of the OS clipboard. Returns the \
+         string the user most recently copied. Use this when McKale says \
+         'here, look at what I copied' or to chain a copy-from-one-app, \
+         transform, paste-to-another-app workflow."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(
+        &self,
+        _params: serde_json::Value,
+        _ctx: &JobContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let start = Instant::now();
+        let text = tokio::task::spawn_blocking(|| -> Result<String, String> {
+            let mut cb = arboard::Clipboard::new()
+                .map_err(|e| format!("arboard open: {e}"))?;
+            cb.get_text().map_err(|e| format!("arboard read: {e}"))
+        })
+        .await
+        .map_err(|e| ToolError::ExecutionFailed(format!("join: {e}")))?
+        .map_err(ToolError::ExecutionFailed)?;
+        Ok(ToolOutput::success(
+            serde_json::json!({"text": text}),
+            start.elapsed(),
+        ))
+    }
+
+    fn requires_sanitization(&self) -> bool {
+        true // clipboard content is external input
+    }
+}
+
+pub struct WindowsClipboardSetTool;
+
+#[async_trait]
+impl Tool for WindowsClipboardSetTool {
+    fn name(&self) -> &str {
+        "windows_clipboard_set"
+    }
+
+    fn description(&self) -> &str {
+        "Replace the OS clipboard with the given text. Pair with a \
+         `windows_press_key` for Ctrl+V to paste the payload into the \
+         focused app — orders of magnitude faster and more reliable than \
+         `windows_type_text` for long content (200+ chars). Params: text \
+         (string)."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "text": {"type": "string"}
+            },
+            "required": ["text"]
+        })
+    }
+
+    async fn execute(
+        &self,
+        params: serde_json::Value,
+        _ctx: &JobContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let start = Instant::now();
+        let text = params
+            .get("text")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidParameters("missing text".into()))?
+            .to_string();
+        let len = text.chars().count();
+        tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let mut cb = arboard::Clipboard::new()
+                .map_err(|e| format!("arboard open: {e}"))?;
+            cb.set_text(text).map_err(|e| format!("arboard write: {e}"))
+        })
+        .await
+        .map_err(|e| ToolError::ExecutionFailed(format!("join: {e}")))?
+        .map_err(ToolError::ExecutionFailed)?;
+        Ok(ToolOutput::success(
+            serde_json::json!({"chars_set": len}),
+            start.elapsed(),
+        ))
+    }
+
+    fn requires_sanitization(&self) -> bool {
+        false
+    }
+
+    fn requires_approval(&self) -> bool {
+        // Writing the clipboard is usually benign but could clobber
+        // something the user just copied. Gate per session policy.
+        true
+    }
+}
+
+// =============================================================================
+// Win32 mouse primitives
+// =============================================================================
+
+#[cfg(target_os = "windows")]
+fn mouse_move(x: i32, y: i32) -> Result<(), String> {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use windows::Win32::UI::WindowsAndMessaging::SetCursorPos;
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        SetCursorPos(x, y)
+            .map_err(|e| format!("SetCursorPos({x},{y}) failed: {e}"))?;
+        Ok(())
+    }))
+    .map_err(|_| "mouse_move panicked in Win32 FFI".to_string())?
+}
+
+#[cfg(target_os = "windows")]
+fn mouse_click(x: i32, y: i32, button: &str, double: bool) -> Result<(), String> {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+        MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN,
+        MOUSEEVENTF_RIGHTUP, MOUSEINPUT,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
+
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        // Save current position so we can restore it after — most CUA
+        // flows want the cursor visually where the user left it.
+        let mut prev = windows::Win32::Foundation::POINT { x: 0, y: 0 };
+        let _ = GetCursorPos(&mut prev);
+
+        SetCursorPos(x, y)
+            .map_err(|e| format!("SetCursorPos({x},{y}) failed: {e}"))?;
+
+        let (down, up) = match button {
+            "right" => (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+            "middle" => (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
+            _ => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+        };
+
+        let mk = |flags| INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx: 0,
+                    dy: 0,
+                    mouseData: 0,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+
+        let mut inputs: Vec<INPUT> = Vec::with_capacity(if double { 4 } else { 2 });
+        inputs.push(mk(down));
+        inputs.push(mk(up));
+        if double {
+            inputs.push(mk(down));
+            inputs.push(mk(up));
+        }
+        let sent = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+        if sent as usize != inputs.len() {
+            // Restore prior position on failure too.
+            let _ = SetCursorPos(prev.x, prev.y);
+            return Err(format!(
+                "SendInput sent {}/{} mouse events (button={button})",
+                sent,
+                inputs.len()
+            ));
+        }
+        // Brief settle so the click registers before the cursor jumps
+        // back. 30 ms is below human-perceptible flicker.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let _ = SetCursorPos(prev.x, prev.y);
+        Ok(())
+    }))
+    .map_err(|_| "mouse_click panicked in Win32 FFI".to_string())?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coerce_accepts_integer() {
+        let p = serde_json::json!({"x": 100, "y": 200});
+        assert_eq!(coerce_pixel_coord(&p, "x").unwrap(), 100);
+        assert_eq!(coerce_pixel_coord(&p, "y").unwrap(), 200);
+    }
+
+    #[test]
+    fn coerce_accepts_float() {
+        // LLMs sometimes emit float literals for integer params
+        // (e.g. `100.0`). Strict as_i64() rejects this; we round.
+        let p = serde_json::json!({"x": 100.0, "y": 200.7});
+        assert_eq!(coerce_pixel_coord(&p, "x").unwrap(), 100);
+        assert_eq!(coerce_pixel_coord(&p, "y").unwrap(), 201);
+    }
+
+    #[test]
+    fn coerce_accepts_string_numeric() {
+        // Stringified numbers are also tolerated — sometimes a
+        // structured-output retry serializes ints as strings.
+        let p = serde_json::json!({"x": "100", "y": "200.5"});
+        assert_eq!(coerce_pixel_coord(&p, "x").unwrap(), 100);
+        assert_eq!(coerce_pixel_coord(&p, "y").unwrap(), 201);
+    }
+
+    #[test]
+    fn coerce_rejects_missing_with_params_dump() {
+        // The error message MUST include the actual params received
+        // so a next-iteration prompt can see what went wrong. The
+        // `{p}` formatter on serde_json::Value emits the compact
+        // representation (no spaces after colons) — match that.
+        let p = serde_json::json!({"y": 200});
+        let err = coerce_pixel_coord(&p, "x").unwrap_err();
+        let s = err.to_string();
+        assert!(s.contains("missing `x`"), "got: {s}");
+        assert!(s.contains("\"y\":200"), "got: {s}");
+    }
+
+    #[test]
+    fn coerce_rejects_nonsense_type() {
+        let p = serde_json::json!({"x": {"nested": 1}, "y": 200});
+        let err = coerce_pixel_coord(&p, "x").unwrap_err();
+        assert!(err.to_string().contains("must be a number"));
+    }
 }

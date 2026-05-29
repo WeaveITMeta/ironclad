@@ -37,13 +37,17 @@ impl Default for VadConfig {
             // genuinely sustained speech (most words are 200-300ms
             // so this also requires at least 2 syllables roughly).
             min_speech_ms: 400,
-            // 700ms endpoint silence (was 350ms). McKale's parakeet
-            // logs showed lots of `Final("")` because the VAD was
-            // cutting utterances at 200-400ms — under parakeet-TDT's
-            // minimum recognizable chunk length. 700ms is more than
-            // a natural between-word pause, giving parakeet 500ms+ of
-            // actual speech audio per utterance.
-            endpoint_silence_ms: 700,
+            // 1200ms endpoint silence (was 700ms; 350ms before that).
+            // The 700ms threshold was still cutting McKale off mid-
+            // thought on filler-pause patterns like "Yeah, I'm
+            // curious. Um." The actual 2026-05-29 20:47:45 transcript
+            // shows JARVIS responding 1s after the "Um" — clearly
+            // treating it as end-of-utterance. 1200ms gives natural
+            // thinking time without leaving sub-second pauses for
+            // utterance latency to suffer. If McKale wants even more
+            // patience, tune up; if cutoffs disappear and JARVIS feels
+            // slow, tune down.
+            endpoint_silence_ms: 1200,
             frame_ms: 40,
             pre_roll_ms: 600,
         }

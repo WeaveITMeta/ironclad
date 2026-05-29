@@ -198,6 +198,10 @@ pub struct Thread {
     pub state: ThreadState,
     /// Turns in this thread.
     pub turns: Vec<Turn>,
+    /// Optional user-assigned title. When None, the sidebar falls back
+    /// to the short-id display. Set via the right-click → Rename flow.
+    #[serde(default)]
+    pub title: Option<String>,
     /// When the thread was created.
     pub created_at: DateTime<Utc>,
     /// When the thread was last updated.
@@ -210,6 +214,17 @@ pub struct Thread {
     /// Pending auth token request (thread is in auth mode).
     #[serde(default)]
     pub pending_auth: Option<PendingAuth>,
+    /// User-pinned: floats this thread to the top of the sidebar.
+    #[serde(default)]
+    pub pinned: bool,
+    /// Timestamp of the most recent pin action. None when unpinned.
+    /// Drives sort order within the pinned section.
+    #[serde(default)]
+    pub pinned_at: Option<DateTime<Utc>>,
+    /// Venture (collapsible sidebar group) this thread belongs to.
+    /// None means the thread is loose (shown below all ventures).
+    #[serde(default)]
+    pub venture_id: Option<Uuid>,
 }
 
 impl Thread {
@@ -221,9 +236,13 @@ impl Thread {
             session_id,
             state: ThreadState::Idle,
             turns: Vec::new(),
+            title: None,
             created_at: now,
             updated_at: now,
             metadata: serde_json::Value::Null,
+            pinned: false,
+            pinned_at: None,
+            venture_id: None,
             pending_approval: None,
             pending_auth: None,
         }

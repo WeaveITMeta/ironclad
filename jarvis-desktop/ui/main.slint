@@ -19,6 +19,26 @@ export struct ConversationRow {
     title: string,
     subtitle: string,
     is_active: bool,
+    /// Whether McKale has pinned this thread to the top. Pinned rows
+    /// sort into the dedicated section above all venture groups.
+    pinned: bool,
+    /// Which Venture group this thread belongs to. Empty string means
+    /// "loose" (no venture).
+    venture_id: string,
+}
+
+/// One Venture: a collapsible sidebar group that bundles related
+/// threads. Mirrors the gateway-side VentureInfo. The `threads` array
+/// is the venture's bucket of conversations, already filtered on the
+/// Rust side (Slint can't reliably filter inside a for loop without
+/// emitting empty layout cells, so pre-bucketing here keeps the UI
+/// simple). Threads that are pinned NEVER appear inside a venture's
+/// bucket — they live in the pinned section above instead.
+export struct VentureGroup {
+    id: string,
+    name: string,
+    collapsed: bool,
+    threads: [ConversationRow],
 }
 
 export struct TranscriptEntry {
@@ -265,6 +285,10 @@ component FloatingMode inherits Rectangle {
 
 component ChatRow inherits Rectangle {
     in property <TranscriptEntry> entry;
+    // The transcript VerticalLayout otherwise gives each row
+    // vertical-stretch: 1, which means a single-message chat blows the
+    // one bubble up to fill the whole panel. Force content-sized rows.
+    vertical-stretch: 0;
 
     HorizontalLayout {
         alignment: entry.kind == "user" ? end : start;
@@ -276,11 +300,18 @@ component ChatRow inherits Rectangle {
         padding-bottom: entry.continues_prev ? 0px : 2px;
         Rectangle {
             horizontal-stretch: 0;
-            min-width: 60px;
+            // Same fix at the bubble layer: HorizontalLayout's default
+            // cross-axis stretch was making the inner Rectangle fill
+            // the row's height too.
+            vertical-stretch: 0;
+            min-width: 50px;
             // Tool rows get a tighter max-width — they're informational
             // chrome, not conversation, so they shouldn't compete for
-            // visual weight with the user / jarvis bubbles.
-            max-width: entry.kind == "tool" ? 380px : 440px;
+            // visual weight with the user / jarvis bubbles. Chat
+            // bubbles capped at 360px so line length lands around 50
+            // chars at the 11px font (the readability sweet spot);
+            // 440px was past it and made bubbles fill the panel width.
+            max-width: entry.kind == "tool" ? 320px : 360px;
             background: entry.continues_prev
                 ? transparent
                 : (entry.kind == "user"   ? rgba(34, 211, 238, 0.14)
@@ -1053,9 +1084,10 @@ component ConversationRowView inherits Rectangle {
     in property <ConversationRow> data;
     callback clicked();
     /// Right-click reports the absolute screen coords (relative to the
-    /// window) where the context menu should anchor. The host renders
-    /// a top-level menu overlay with Open / Rename / Export / Delete.
-    callback context_menu_requested(length, length);
+    /// window) where the context menu should anchor + the row's current
+    /// pin state so the menu can render "Pin to top" vs "Unpin" without
+    /// re-looking-up the thread.
+    callback context_menu_requested(length, length, bool);
     height: 50px;
     border-radius: 8px;
     background: data.is_active
@@ -1065,38 +1097,101 @@ component ConversationRowView inherits Rectangle {
         ? rgba(34, 211, 238, 0.55)
         : rgba(34, 211, 238, 0.10);
     border-width: 1px;
-    VerticalLayout {
+    HorizontalLayout {
         padding-left: 10px;
         padding-right: 10px;
         padding-top: 7px;
         padding-bottom: 7px;
-        Text {
-            text: data.title;
-            color: rgba(207, 250, 254, 0.95);
-            font-size: 11px;
+        spacing: 6px;
+        // Small pin glyph on the left when pinned. Uses a unicode bullet
+        // so we don't need to ship an icon font for one symbol.
+        if data.pinned: Text {
+            text: "\u{2605}";
+            color: rgba(250, 204, 21, 0.9);
+            font-size: 10px;
             font-family: "JetBrains Mono";
-            overflow: elide;
+            vertical-alignment: center;
+            horizontal-stretch: 0;
         }
-        Text {
-            text: data.subtitle;
-            color: rgba(165, 243, 252, 0.55);
-            font-size: 9px;
-            font-family: "JetBrains Mono";
-            overflow: elide;
+        VerticalLayout {
+            horizontal-stretch: 1;
+            Text {
+                text: data.title;
+                color: rgba(207, 250, 254, 0.95);
+                font-size: 11px;
+                font-family: "JetBrains Mono";
+                overflow: elide;
+            }
+            Text {
+                text: data.subtitle;
+                color: rgba(165, 243, 252, 0.55);
+                font-size: 9px;
+                font-family: "JetBrains Mono";
+                overflow: elide;
+            }
         }
     }
     ta := TouchArea {
         pointer-event(ev) => {
             if (ev.kind == PointerEventKind.up && ev.button == PointerEventButton.right) {
-                // Hand absolute window coordinates to the host so the
-                // popup can pin itself wherever the user clicked.
+                // Hand absolute window coordinates + current pinned
+                // state to the host so the popup can pin itself
+                // wherever the user clicked and render the right label.
+                root.context_menu_requested(
+                    self.absolute-position.x + self.mouse-x,
+                    self.absolute-position.y + self.mouse-y,
+                    root.data.pinned,
+                );
+            }
+        }
+        clicked => { root.clicked(); }
+    }
+}
+
+/// Header row above a section of the sidebar (Pinned, Venture, Loose).
+/// `is_venture` controls whether the chevron toggle is interactive.
+component SidebarSectionHeader inherits Rectangle {
+    in property <string> label;
+    in property <bool> is_venture: false;
+    in property <bool> collapsed: false;
+    callback toggle();
+    callback context_menu_requested(length, length);
+    height: 24px;
+    HorizontalLayout {
+        padding-left: 4px;
+        padding-right: 8px;
+        spacing: 4px;
+        // Chevron — only an interactive toggle when this is a Venture
+        // header. Pinned / Loose sections don't collapse.
+        if is_venture: Text {
+            text: collapsed ? "\u{25b8}" : "\u{25be}";
+            color: rgba(34, 211, 238, 0.75);
+            font-size: 10px;
+            font-family: "JetBrains Mono";
+            vertical-alignment: center;
+            horizontal-stretch: 0;
+        }
+        Text {
+            text: label;
+            color: rgba(165, 243, 252, 0.65);
+            font-size: 9px;
+            font-family: "JetBrains Mono";
+            letter-spacing: 1.4px;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+    }
+    if is_venture: TouchArea {
+        pointer-event(ev) => {
+            if (ev.kind == PointerEventKind.up && ev.button == PointerEventButton.right) {
                 root.context_menu_requested(
                     self.absolute-position.x + self.mouse-x,
                     self.absolute-position.y + self.mouse-y,
                 );
             }
         }
-        clicked => { root.clicked(); }
+        clicked => { root.toggle(); }
     }
 }
 
@@ -1128,16 +1223,24 @@ component ContextMenuItem inherits Rectangle {
 }
 
 component Sidebar inherits Rectangle {
-    in property <[ConversationRow]> conversations;
+    /// Pinned threads (sort: most-recently-pinned first).
+    in property <[ConversationRow]> pinned_conversations;
+    /// Each Venture and its threads, pre-filtered Rust-side.
+    in property <[VentureGroup]> ventures;
+    /// Threads with no venture and not pinned.
+    in property <[ConversationRow]> loose_conversations;
     in property <bool> settings_open: false;
     in property <image> gear_icon;
     callback select_conversation(string);
     callback new_conversation();
     callback toggle_settings();
     callback export_conversation();
-    /// Right-click on a row. Bubbles up to MainWindow with the thread
-    /// id + absolute window coords so the popup can position itself.
-    callback context_menu(string, length, length);
+    /// Right-click on a thread row: (id, x, y, pinned).
+    callback context_menu(string, length, length, bool);
+    /// Right-click on a venture header. Brings up rename/delete.
+    callback venture_context_menu(string, length, length);
+    /// Toggle a venture's collapsed state (left-click on header).
+    callback toggle_venture(string);
     // Width is bound by the caller (MainWindow.sidebar_width) so the
     // splitter can resize it live. No default-width here.
     background: rgba(2, 6, 23, 0.92);
@@ -1173,17 +1276,75 @@ component Sidebar inherits Rectangle {
         }
 
         // Conversation list. Left-click selects; right-click triggers
-        // export for that specific thread.
+        // context menu. Wrapping Rectangle claims all remaining vertical
+        // space so the ScrollView's intrinsic scrollbar can engage.
+        //
+        // Layout, top to bottom:
+        //   1. PINNED section header + every pinned thread (Rust-side
+        //      sorted by pinned_at desc).
+        //   2. One section per Venture, each with a chevron-toggleable
+        //      header; collapsed ventures hide their contents but the
+        //      header stays visible. A thread that's pinned NEVER
+        //      appears inside a venture (pinning lifts it out for
+        //      visibility); its venture_id is preserved so unpinning
+        //      drops it back into the right bucket.
+        //   3. Loose section: threads with no venture, not pinned.
         Rectangle {
             background: transparent;
+            vertical-stretch: 1;
             ScrollView {
                 VerticalLayout {
                     spacing: 4px;
-                    for c in conversations: ConversationRowView {
+
+                    // ----- Pinned section -----
+                    if pinned_conversations.length > 0: SidebarSectionHeader {
+                        label: "PINNED";
+                        is_venture: false;
+                    }
+                    for c in pinned_conversations: ConversationRowView {
                         data: c;
                         clicked => { root.select_conversation(c.id); }
-                        context_menu_requested(x, y) => {
-                            root.context_menu(c.id, x, y);
+                        context_menu_requested(x, y, pinned) => {
+                            root.context_menu(c.id, x, y, pinned);
+                        }
+                    }
+
+                    // ----- Venture groups -----
+                    for v in ventures: VerticalLayout {
+                        spacing: 4px;
+                        SidebarSectionHeader {
+                            label: v.name;
+                            is_venture: true;
+                            collapsed: v.collapsed;
+                            toggle => { root.toggle_venture(v.id); }
+                            context_menu_requested(x, y) => {
+                                root.venture_context_menu(v.id, x, y);
+                            }
+                        }
+                        if !v.collapsed: VerticalLayout {
+                            spacing: 4px;
+                            for c in v.threads: ConversationRowView {
+                                data: c;
+                                clicked => { root.select_conversation(c.id); }
+                                context_menu_requested(x, y, pinned) => {
+                                    root.context_menu(c.id, x, y, pinned);
+                                }
+                            }
+                        }
+                    }
+
+                    // ----- Loose threads (no venture, not pinned) -----
+                    if loose_conversations.length > 0
+                            && (pinned_conversations.length > 0 || ventures.length > 0):
+                        SidebarSectionHeader {
+                            label: "THREADS";
+                            is_venture: false;
+                        }
+                    for c in loose_conversations: ConversationRowView {
+                        data: c;
+                        clicked => { root.select_conversation(c.id); }
+                        context_menu_requested(x, y, pinned) => {
+                            root.context_menu(c.id, x, y, pinned);
                         }
                     }
                 }
@@ -1824,8 +1985,13 @@ export component MainWindow inherits Window {
     in property <string> approval_description: "";
     in-out property <string> composer_text: "";
 
-    // Sidebar / settings state
-    in property <[ConversationRow]> conversations;
+    // Sidebar / settings state. Conversations are pre-bucketed
+    // Rust-side into three explicit lists so the Slint layout doesn't
+    // have to filter inside loops (which Slint doesn't reliably do
+    // without emitting empty layout cells).
+    in property <[ConversationRow]> pinned_conversations;
+    in property <[VentureGroup]> ventures;
+    in property <[ConversationRow]> loose_conversations;
     in-out property <bool> settings_open: false;
     in-out property <bool> wizard_open: false;
     in-out property <string> anthropic_key;
@@ -1848,6 +2014,47 @@ export component MainWindow inherits Window {
     callback export_conversation();
     callback dismiss_sub_agent(string);
     callback copy_sub_agent(string);
+    // Sidebar right-click menu actions.
+    callback rename_thread(string, string);  // (thread_id, new_title)
+    callback delete_thread(string);          // (thread_id)
+    callback export_thread(string);          // (thread_id) — write that thread's transcript
+    // Pin / venture actions.
+    callback pin_thread(string, bool);       // (thread_id, pinned)
+    callback set_thread_venture(string, string); // (thread_id, venture_id; empty = remove)
+    callback toggle_venture(string);         // (venture_id) — collapsed/expanded toggle
+    callback rename_venture(string, string); // (venture_id, new_name)
+    callback delete_venture(string);         // (venture_id) — threads become loose
+    callback create_venture_for(string);     // (thread_id) — open new-venture overlay,
+                                             // then assign that new venture to this thread
+
+    // Context-menu popup state — set when the sidebar fires
+    // context_menu(id, x, y). Cleared by clicking off OR picking a row.
+    in-out property <bool> ctx_menu_open: false;
+    in-out property <string> ctx_menu_thread_id: "";
+    in-out property <bool> ctx_menu_thread_pinned: false;
+    in-out property <length> ctx_menu_x: 0;
+    in-out property <length> ctx_menu_y: 0;
+    // Venture context menu state (right-click on a Venture header).
+    in-out property <bool> venture_ctx_open: false;
+    in-out property <string> venture_ctx_id: "";
+    in-out property <length> venture_ctx_x: 0;
+    in-out property <length> venture_ctx_y: 0;
+    // Move-to-venture picker state.
+    in-out property <bool> venture_picker_open: false;
+    in-out property <string> venture_picker_thread_id: "";
+    // Inline rename overlay state. Used for both threads (when
+    // rename_overlay_kind == "thread") and ventures (when it's
+    // "venture" — same overlay, different submit handler).
+    in-out property <bool> rename_overlay_open: false;
+    in-out property <string> rename_overlay_thread_id: "";
+    in-out property <string> rename_overlay_value: "";
+    in-out property <string> rename_overlay_kind: "thread";
+    // New-venture overlay state.
+    in-out property <bool> new_venture_overlay_open: false;
+    in-out property <string> new_venture_overlay_value: "";
+    // When non-empty, creating a new venture also assigns this thread
+    // to it ("right-click thread → New venture..." flow).
+    in-out property <string> new_venture_overlay_for_thread: "";
 
     callback toggle_expand();
     callback toggle_mic();
@@ -1892,13 +2099,29 @@ export component MainWindow inherits Window {
             // Left sidebar: conversation list + settings toggle.
             Sidebar {
                 width: root.sidebar_width;
-                conversations: root.conversations;
+                pinned_conversations: root.pinned_conversations;
+                ventures: root.ventures;
+                loose_conversations: root.loose_conversations;
                 settings_open: root.settings_open;
                 gear_icon: root.gear_icon;
                 select_conversation(id) => { root.select_conversation(id); }
                 new_conversation => { root.new_conversation(); }
                 toggle_settings => { root.toggle_settings(); }
                 export_conversation => { root.export_conversation(); }
+                context_menu(id, x, y, pinned) => {
+                    root.ctx_menu_thread_id = id;
+                    root.ctx_menu_thread_pinned = pinned;
+                    root.ctx_menu_x = x;
+                    root.ctx_menu_y = y;
+                    root.ctx_menu_open = true;
+                }
+                toggle_venture(id) => { root.toggle_venture(id); }
+                venture_context_menu(id, x, y) => {
+                    root.venture_ctx_id = id;
+                    root.venture_ctx_x = x;
+                    root.venture_ctx_y = y;
+                    root.venture_ctx_open = true;
+                }
             }
             // Drag this to resize the sidebar.
             HSplitter {
@@ -1978,6 +2201,413 @@ export component MainWindow inherits Window {
                 sub_agents: root.sub_agents;
                 dismiss_sub_agent(id) => { root.dismiss_sub_agent(id); }
                 copy_sub_agent(text) => { root.copy_sub_agent(text); }
+            }
+        }
+
+        // ---- Right-click thread context menu ----
+        // Full-screen dim/dismiss layer; the popup itself sits on top.
+        if ctx_menu_open: TouchArea {
+            // Catches click-off to close the menu. Slint TouchAreas
+            // don't propagate clicks through, so any click outside the
+            // popup rectangle dismisses.
+            clicked => { root.ctx_menu_open = false; }
+        }
+        if ctx_menu_open: Rectangle {
+            x: root.ctx_menu_x;
+            y: root.ctx_menu_y;
+            width: 180px;
+            // Grew vertical from 132 to 198 to fit Pin/Unpin and Move-to-venture.
+            height: 198px;
+            background: rgba(2, 6, 23, 0.97);
+            border-color: rgba(34, 211, 238, 0.55);
+            border-width: 1px;
+            border-radius: 8px;
+            drop-shadow-color: rgba(0, 0, 0, 0.6);
+            drop-shadow-blur: 14px;
+            drop-shadow-offset-y: 4px;
+            VerticalLayout {
+                padding: 4px;
+                spacing: 0px;
+                ContextMenuItem {
+                    label: "Open";
+                    clicked => {
+                        root.select_conversation(root.ctx_menu_thread_id);
+                        root.ctx_menu_open = false;
+                    }
+                }
+                ContextMenuItem {
+                    label: "Rename";
+                    clicked => {
+                        root.rename_overlay_kind = "thread";
+                        root.rename_overlay_thread_id = root.ctx_menu_thread_id;
+                        root.rename_overlay_value = "";
+                        root.rename_overlay_open = true;
+                        root.ctx_menu_open = false;
+                    }
+                }
+                ContextMenuItem {
+                    // Label flips based on the right-clicked thread's
+                    // current pin state, so a single menu slot serves
+                    // both actions.
+                    label: root.ctx_menu_thread_pinned ? "Unpin" : "Pin to top";
+                    clicked => {
+                        root.pin_thread(root.ctx_menu_thread_id, !root.ctx_menu_thread_pinned);
+                        root.ctx_menu_open = false;
+                    }
+                }
+                ContextMenuItem {
+                    label: "Add to venture...";
+                    clicked => {
+                        root.venture_picker_thread_id = root.ctx_menu_thread_id;
+                        root.venture_picker_open = true;
+                        root.ctx_menu_open = false;
+                    }
+                }
+                ContextMenuItem {
+                    label: "Export as .md";
+                    clicked => {
+                        root.export_thread(root.ctx_menu_thread_id);
+                        root.ctx_menu_open = false;
+                    }
+                }
+                ContextMenuItem {
+                    label: "Delete";
+                    destructive: true;
+                    clicked => {
+                        root.delete_thread(root.ctx_menu_thread_id);
+                        root.ctx_menu_open = false;
+                    }
+                }
+            }
+        }
+
+        // ---- Venture header right-click menu (rename/delete) ----
+        if venture_ctx_open: TouchArea {
+            clicked => { root.venture_ctx_open = false; }
+        }
+        if venture_ctx_open: Rectangle {
+            x: root.venture_ctx_x;
+            y: root.venture_ctx_y;
+            width: 160px;
+            height: 70px;
+            background: rgba(2, 6, 23, 0.97);
+            border-color: rgba(34, 211, 238, 0.55);
+            border-width: 1px;
+            border-radius: 8px;
+            drop-shadow-color: rgba(0, 0, 0, 0.6);
+            drop-shadow-blur: 14px;
+            drop-shadow-offset-y: 4px;
+            VerticalLayout {
+                padding: 4px;
+                spacing: 0px;
+                ContextMenuItem {
+                    label: "Rename venture";
+                    clicked => {
+                        root.rename_overlay_kind = "venture";
+                        root.rename_overlay_thread_id = root.venture_ctx_id;
+                        root.rename_overlay_value = "";
+                        root.rename_overlay_open = true;
+                        root.venture_ctx_open = false;
+                    }
+                }
+                ContextMenuItem {
+                    label: "Delete venture";
+                    destructive: true;
+                    clicked => {
+                        root.delete_venture(root.venture_ctx_id);
+                        root.venture_ctx_open = false;
+                    }
+                }
+            }
+        }
+
+        // ---- Venture picker (move-to-venture overlay) ----
+        if venture_picker_open: TouchArea {
+            clicked => { root.venture_picker_open = false; }
+        }
+        if venture_picker_open: Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: 80px;
+            width: 320px;
+            // Static height — long venture lists become scrollable.
+            height: 260px;
+            background: rgba(2, 6, 23, 0.98);
+            border-color: rgba(34, 211, 238, 0.65);
+            border-width: 1px;
+            border-radius: 10px;
+            drop-shadow-color: rgba(0, 0, 0, 0.7);
+            drop-shadow-blur: 18px;
+            drop-shadow-offset-y: 4px;
+            TouchArea { clicked => { } }  // Swallow clicks on the body
+            VerticalLayout {
+                padding: 12px;
+                spacing: 8px;
+                Text {
+                    text: "Move to venture";
+                    color: rgba(207, 250, 254, 0.95);
+                    font-size: 12px;
+                    font-family: "JetBrains Mono";
+                    letter-spacing: 1.2px;
+                    horizontal-alignment: center;
+                }
+                Rectangle {
+                    vertical-stretch: 1;
+                    ScrollView {
+                        VerticalLayout {
+                            spacing: 2px;
+                            for v in ventures: ContextMenuItem {
+                                label: v.name;
+                                clicked => {
+                                    root.set_thread_venture(root.venture_picker_thread_id, v.id);
+                                    root.venture_picker_open = false;
+                                }
+                            }
+                            ContextMenuItem {
+                                label: "+ New venture...";
+                                clicked => {
+                                    root.new_venture_overlay_for_thread = root.venture_picker_thread_id;
+                                    root.new_venture_overlay_value = "";
+                                    root.new_venture_overlay_open = true;
+                                    root.venture_picker_open = false;
+                                }
+                            }
+                            ContextMenuItem {
+                                label: "\u{2715} Remove from venture";
+                                destructive: true;
+                                clicked => {
+                                    root.set_thread_venture(root.venture_picker_thread_id, "");
+                                    root.venture_picker_open = false;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- New venture overlay (modal) ----
+        if new_venture_overlay_open: TouchArea {
+            clicked => { root.new_venture_overlay_open = false; }
+        }
+        if new_venture_overlay_open: Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: 80px;
+            width: 360px;
+            height: 130px;
+            background: rgba(2, 6, 23, 0.98);
+            border-color: rgba(34, 211, 238, 0.65);
+            border-width: 1px;
+            border-radius: 10px;
+            drop-shadow-color: rgba(0, 0, 0, 0.7);
+            drop-shadow-blur: 18px;
+            drop-shadow-offset-y: 4px;
+            TouchArea { clicked => { } }
+            VerticalLayout {
+                padding: 14px;
+                spacing: 10px;
+                Text {
+                    text: "New venture";
+                    color: rgba(207, 250, 254, 0.95);
+                    font-size: 12px;
+                    font-family: "JetBrains Mono";
+                    letter-spacing: 1.2px;
+                    horizontal-alignment: center;
+                }
+                Rectangle {
+                    height: 32px;
+                    background: rgba(2, 6, 23, 0.85);
+                    border-color: rgba(34, 211, 238, 0.45);
+                    border-width: 1px;
+                    border-radius: 6px;
+                    new_venture_input := TextInput {
+                        x: 10px;
+                        y: 0;
+                        width: parent.width - 20px;
+                        height: parent.height;
+                        text <=> root.new_venture_overlay_value;
+                        color: rgba(236, 254, 255, 0.95);
+                        font-size: 11px;
+                        font-family: "JetBrains Mono";
+                        single-line: true;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        accepted => {
+                            root.create_venture_for(root.new_venture_overlay_for_thread);
+                            root.new_venture_overlay_open = false;
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: end;
+                    Rectangle {
+                        width: 80px;
+                        height: 28px;
+                        border-radius: 6px;
+                        background: new_venture_cancel_ta.has-hover
+                            ? rgba(165, 243, 252, 0.10) : transparent;
+                        border-color: rgba(165, 243, 252, 0.35);
+                        border-width: 1px;
+                        Text {
+                            text: "Cancel";
+                            color: rgba(207, 250, 254, 0.9);
+                            font-size: 11px;
+                            font-family: "JetBrains Mono";
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        new_venture_cancel_ta := TouchArea {
+                            clicked => { root.new_venture_overlay_open = false; }
+                        }
+                    }
+                    Rectangle {
+                        width: 80px;
+                        height: 28px;
+                        border-radius: 6px;
+                        background: new_venture_save_ta.has-hover
+                            ? rgba(34, 211, 238, 0.28)
+                            : rgba(34, 211, 238, 0.15);
+                        border-color: rgba(34, 211, 238, 0.65);
+                        border-width: 1px;
+                        Text {
+                            text: "Create";
+                            color: rgba(207, 250, 254, 0.95);
+                            font-size: 11px;
+                            font-family: "JetBrains Mono";
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        new_venture_save_ta := TouchArea {
+                            clicked => {
+                                root.create_venture_for(root.new_venture_overlay_for_thread);
+                                root.new_venture_overlay_open = false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- Rename overlay (modal) ----
+        if rename_overlay_open: TouchArea {
+            clicked => { root.rename_overlay_open = false; }
+        }
+        if rename_overlay_open: Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: 80px;
+            width: 360px;
+            height: 130px;
+            background: rgba(2, 6, 23, 0.98);
+            border-color: rgba(34, 211, 238, 0.65);
+            border-width: 1px;
+            border-radius: 10px;
+            drop-shadow-color: rgba(0, 0, 0, 0.7);
+            drop-shadow-blur: 18px;
+            drop-shadow-offset-y: 4px;
+            // Modal-body click-swallow: without this, clicks on the
+            // dark dialog background (anywhere except the TextInput or
+            // a button) fall through to the backdrop TouchArea above
+            // (which closes the modal). The empty handler claims the
+            // click and stops propagation.
+            TouchArea {
+                clicked => { }
+            }
+            VerticalLayout {
+                padding: 14px;
+                spacing: 10px;
+                Text {
+                    text: "Rename thread";
+                    color: rgba(207, 250, 254, 0.95);
+                    font-size: 12px;
+                    font-family: "JetBrains Mono";
+                    letter-spacing: 1.2px;
+                    horizontal-alignment: center;
+                }
+                Rectangle {
+                    height: 32px;
+                    background: rgba(2, 6, 23, 0.85);
+                    border-color: rgba(34, 211, 238, 0.45);
+                    border-width: 1px;
+                    border-radius: 6px;
+                    rename_input := TextInput {
+                        x: 10px;
+                        y: 0;
+                        width: parent.width - 20px;
+                        height: parent.height;
+                        text <=> root.rename_overlay_value;
+                        color: rgba(236, 254, 255, 0.95);
+                        font-size: 11px;
+                        font-family: "JetBrains Mono";
+                        single-line: true;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        accepted => {
+                            if root.rename_overlay_kind == "venture" {
+                                root.rename_venture(root.rename_overlay_thread_id, self.text);
+                            } else {
+                                root.rename_thread(root.rename_overlay_thread_id, self.text);
+                            }
+                            root.rename_overlay_open = false;
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: end;
+                    Rectangle {
+                        width: 80px;
+                        height: 28px;
+                        border-radius: 6px;
+                        background: cancel_ta.has-hover ? rgba(165, 243, 252, 0.10) : transparent;
+                        border-color: rgba(165, 243, 252, 0.35);
+                        border-width: 1px;
+                        Text {
+                            text: "Cancel";
+                            color: rgba(207, 250, 254, 0.9);
+                            font-size: 11px;
+                            font-family: "JetBrains Mono";
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        cancel_ta := TouchArea {
+                            clicked => { root.rename_overlay_open = false; }
+                        }
+                    }
+                    Rectangle {
+                        width: 80px;
+                        height: 28px;
+                        border-radius: 6px;
+                        background: save_ta.has-hover
+                            ? rgba(34, 211, 238, 0.28)
+                            : rgba(34, 211, 238, 0.15);
+                        border-color: rgba(34, 211, 238, 0.65);
+                        border-width: 1px;
+                        Text {
+                            text: "Save";
+                            color: rgba(207, 250, 254, 0.95);
+                            font-size: 11px;
+                            font-family: "JetBrains Mono";
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        save_ta := TouchArea {
+                            clicked => {
+                                if root.rename_overlay_kind == "venture" {
+                                    root.rename_venture(
+                                        root.rename_overlay_thread_id,
+                                        rename_input.text,
+                                    );
+                                } else {
+                                    root.rename_thread(
+                                        root.rename_overlay_thread_id,
+                                        rename_input.text,
+                                    );
+                                }
+                                root.rename_overlay_open = false;
+                            }
+                        }
+                    }
+                }
             }
         }
 

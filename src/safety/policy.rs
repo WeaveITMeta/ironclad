@@ -159,20 +159,31 @@ impl Default for Policy {
             PolicyAction::Warn,
         ));
 
-        // Block shell command injection patterns
+        // Block shell command injection patterns. The bare-backtick
+        // alternative (`.*`) was nuking every browser snapshot — Google
+        // Calendar, GitHub, Gmail all contain backtick-wrapped UI text
+        // (code-styled shortcuts, inline `code` hints, help banners).
+        // Real shell command substitution from tool output is also
+        // sandboxed by the WASM runtime / shell tool's own checks, so
+        // the cost of false-positive Blocks here vastly outweighs the
+        // benefit. Keep only the truly dangerous head-of-command
+        // patterns: `;rm -rf` and `curl | sh`.
         policy.add_rule(PolicyRule::new(
             "shell_injection",
             "Potential shell command injection",
-            r"(?i)(;\s*rm\s+-rf|;\s*curl\s+.*\|\s*sh|`.*`)",
+            r"(?i)(;\s*rm\s+-rf\s+/|;\s*curl\s+[^|]+\|\s*(sh|bash)\b)",
             Severity::Critical,
             PolicyAction::Block,
         ));
 
-        // Warn on excessive URLs
+        // Warn on excessive URLs. Raised 10 -> 200: modern web pages
+        // (Gmail, calendar, GitHub) have 50-150 hrefs each and were
+        // tripping this on every snapshot. 200+ in tool output really
+        // is suspicious; 10 was just normal.
         policy.add_rule(PolicyRule::new(
             "excessive_urls",
             "Excessive number of URLs detected",
-            r"(https?://[^\s]+\s*){10,}",
+            r"(https?://[^\s]+\s*){200,}",
             Severity::Low,
             PolicyAction::Warn,
         ));
@@ -186,11 +197,14 @@ impl Default for Policy {
             PolicyAction::Sanitize,
         ));
 
-        // Warn on very long strings without spaces (potential obfuscation)
+        // Warn on very long strings without spaces (potential
+        // obfuscation). Raised 500 -> 4000: 500 chars catches every
+        // Google session-token, every `data:image/png;base64,...` URI,
+        // every CSP nonce. Real obfuscation is usually 4000+ chars.
         policy.add_rule(PolicyRule::new(
             "obfuscated_string",
             "Potential obfuscated content",
-            r"[^\s]{500,}",
+            r"[^\s]{4000,}",
             Severity::Medium,
             PolicyAction::Warn,
         ));

@@ -73,7 +73,9 @@ pub use windows_desktop::{
 };
 #[cfg(target_os = "windows")]
 pub use windows_input::{
-    WindowsFocusWindowTool, WindowsGetInputFocusTool, WindowsPressKeyTool, WindowsTypeTextTool,
+    WindowsClipboardGetTool, WindowsClipboardSetTool, WindowsFocusWindowTool,
+    WindowsGetInputFocusTool, WindowsMouseClickTool, WindowsMouseMoveTool, WindowsPressKeyTool,
+    WindowsTypeTextTool,
 };
 #[cfg(target_os = "windows")]
 pub use windows_screenshot::WindowsScreenshotForegroundTool;

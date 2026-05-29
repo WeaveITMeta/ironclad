@@ -215,10 +215,11 @@ impl ToolRegistry {
     #[cfg(target_os = "windows")]
     pub fn register_windows_desktop_tools(&self) {
         use crate::tools::builtin::{
-            WindowsFocusWindowTool, WindowsGetInputFocusTool, WindowsListDesktopsTool,
-            WindowsListMonitorsTool, WindowsMoveWindowToDesktopTool, WindowsNewDesktopTool,
-            WindowsPressKeyTool, WindowsScreenshotForegroundTool, WindowsSnapWindowTool,
-            WindowsSwitchDesktopTool, WindowsTypeTextTool,
+            WindowsClipboardGetTool, WindowsClipboardSetTool, WindowsFocusWindowTool,
+            WindowsGetInputFocusTool, WindowsListDesktopsTool, WindowsListMonitorsTool,
+            WindowsMouseClickTool, WindowsMouseMoveTool, WindowsMoveWindowToDesktopTool,
+            WindowsNewDesktopTool, WindowsPressKeyTool, WindowsScreenshotForegroundTool,
+            WindowsSnapWindowTool, WindowsSwitchDesktopTool, WindowsTypeTextTool,
         };
         self.register_sync(Arc::new(WindowsListDesktopsTool));
         self.register_sync(Arc::new(WindowsSwitchDesktopTool));
@@ -231,7 +232,11 @@ impl ToolRegistry {
         self.register_sync(Arc::new(WindowsTypeTextTool));
         self.register_sync(Arc::new(WindowsPressKeyTool));
         self.register_sync(Arc::new(WindowsScreenshotForegroundTool));
-        tracing::info!("Registered 11 Windows desktop + window + input + screenshot tools");
+        self.register_sync(Arc::new(WindowsMouseClickTool));
+        self.register_sync(Arc::new(WindowsMouseMoveTool));
+        self.register_sync(Arc::new(WindowsClipboardGetTool));
+        self.register_sync(Arc::new(WindowsClipboardSetTool));
+        tracing::info!("Registered 15 Windows desktop + window + input + screenshot tools");
     }
 
     /// Register `recent_logs` so JARVIS can introspect Iron Clad's own

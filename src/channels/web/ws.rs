@@ -396,7 +396,7 @@ mod tests {
 
         GatewayState {
             msg_tx: tokio::sync::RwLock::new(msg_tx),
-            sse: SseManager::new(),
+            sse: Arc::new(SseManager::new()),
             workspace: None,
             context_manager: None,
             session_manager: None,
@@ -408,7 +408,9 @@ mod tests {
             ws_tracker: Some(Arc::new(WsConnectionTracker::new())),
             voice: crate::config::VoiceConfig::default(),
             tts_client: reqwest::Client::new(),
+            wt_events: None,
             auth_token: "test-token".to_string(),
+            mcp: Arc::new(crate::channels::web::mcp::McpState::new()),
         }
     }
 }

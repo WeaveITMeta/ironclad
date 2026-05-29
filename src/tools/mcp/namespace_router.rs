@@ -138,10 +138,32 @@ impl Tool for McpNamespaceRouter {
                     self.namespace
                 ))
             })?;
-        let args = params
-            .get("args")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({}));
+        // Claude sometimes emits `"args": "{}"` (string) instead of
+        // `"args": {}` (object) when calling namespace routers — a
+        // known Anthropic tool-use serialization quirk that surfaces as
+        // every Playwright call returning 400 Bad Request. Defensive
+        // unwrap: if args is a JSON string, try to parse it back as an
+        // object; if that fails the original string survives so a
+        // sub-tool that legitimately wants a string parameter still
+        // works.
+        let args = match params.get("args") {
+            None => serde_json::json!({}),
+            Some(serde_json::Value::String(s)) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    serde_json::json!({})
+                } else if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                    tracing::debug!(
+                        "namespace_router[{}]: unwrapped string-wrapped args",
+                        self.namespace
+                    );
+                    parsed
+                } else {
+                    serde_json::Value::String(s.clone())
+                }
+            }
+            Some(other) => other.clone(),
+        };
 
         let target = self.sub_tools.get(tool).ok_or_else(|| {
             // Hint with the closest matches if the model misspelled.

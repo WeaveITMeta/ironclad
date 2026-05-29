@@ -28,14 +28,39 @@ pub struct ThreadInfo {
     pub id: Uuid,
     pub state: String,
     pub turn_count: usize,
+    /// Optional user-assigned title (set via the sidebar's
+    /// right-click → Rename). Absent when the user hasn't renamed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// User-pinned: float this thread to the top of the sidebar.
+    #[serde(default)]
+    pub pinned: bool,
+    /// Venture (collapsible sidebar group) this thread belongs to.
+    /// Absent / null means "loose" (shown below all ventures).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub venture_id: Option<Uuid>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct VentureInfo {
+    pub id: Uuid,
+    pub name: String,
+    pub collapsed: bool,
+    pub created_at: String,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ThreadListResponse {
     pub threads: Vec<ThreadInfo>,
     pub active_thread: Option<Uuid>,
+    /// All ventures defined for this user. The sidebar bucket assigns
+    /// threads to ventures by matching `thread.venture_id`; threads
+    /// pointing at a venture id not in this list (e.g. one that was
+    /// deleted by another client mid-poll) are treated as loose.
+    #[serde(default)]
+    pub ventures: Vec<VentureInfo>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

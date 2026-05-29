@@ -128,9 +128,43 @@ struct PendingApproval {
 thread_local! {
     static TRANSCRIPT_MODEL: std::cell::RefCell<Option<std::rc::Rc<VecModel<TranscriptEntry>>>> =
         std::cell::RefCell::new(None);
+    // Unfiltered cache: every thread the gateway knows about, kept
+    // in sync by refresh_conversation_model. The Slint sidebar no
+    // longer reads from this directly — it reads from the three
+    // bucket models below. CONVERSATIONS_MODEL exists so callbacks
+    // that need the full list (e.g. picking the pin-state of the
+    // right-clicked thread by id) can scan it.
     static CONVERSATIONS_MODEL: std::cell::RefCell<Option<std::rc::Rc<VecModel<ConversationRow>>>> =
         std::cell::RefCell::new(None);
+    // Three UI-facing bucket models. refresh_conversation_model
+    // re-buckets the canonical list into these three on every poll
+    // (and on every selection change). Slint reads from them via
+    // the sidebar's pinned_conversations / ventures /
+    // loose_conversations properties.
+    static PINNED_CONVERSATIONS_MODEL:
+        std::cell::RefCell<Option<std::rc::Rc<VecModel<ConversationRow>>>> =
+        std::cell::RefCell::new(None);
+    static LOOSE_CONVERSATIONS_MODEL:
+        std::cell::RefCell<Option<std::rc::Rc<VecModel<ConversationRow>>>> =
+        std::cell::RefCell::new(None);
+    static VENTURES_MODEL: std::cell::RefCell<Option<std::rc::Rc<VecModel<VentureGroup>>>> =
+        std::cell::RefCell::new(None);
+    // Persistent cache of the last gateway response we saw — drives
+    // the re-bucketing path on selection changes (so a click instantly
+    // moves the highlight without waiting for the 10s poll). Refreshed
+    // on every list_threads response.
+    static LAST_THREAD_LIST:
+        std::cell::RefCell<Option<gateway::ThreadListResponse>> =
+        std::cell::RefCell::new(None);
     static SUB_AGENTS_MODEL: std::cell::RefCell<Option<std::rc::Rc<VecModel<SubAgentRow>>>> =
+        std::cell::RefCell::new(None);
+    // The thread McKale has visually selected in the sidebar. Set when
+    // he clicks a row (or creates a new conversation); read by
+    // refresh_conversation_model so the periodic gateway poll doesn't
+    // yank the highlight to whichever thread the gateway last appended
+    // to. Lives on the UI thread; cross-thread setters route through
+    // slint::invoke_from_event_loop.
+    static CURRENT_THREAD_ID: std::cell::RefCell<Option<String>> =
         std::cell::RefCell::new(None);
 }
 
@@ -221,6 +255,17 @@ fn main() -> Result<()> {
     let conversations_model: std::rc::Rc<VecModel<ConversationRow>> =
         std::rc::Rc::new(VecModel::<ConversationRow>::default());
     CONVERSATIONS_MODEL.with(|cell| *cell.borrow_mut() = Some(conversations_model.clone()));
+    let pinned_conversations_model: std::rc::Rc<VecModel<ConversationRow>> =
+        std::rc::Rc::new(VecModel::<ConversationRow>::default());
+    PINNED_CONVERSATIONS_MODEL
+        .with(|cell| *cell.borrow_mut() = Some(pinned_conversations_model.clone()));
+    let loose_conversations_model: std::rc::Rc<VecModel<ConversationRow>> =
+        std::rc::Rc::new(VecModel::<ConversationRow>::default());
+    LOOSE_CONVERSATIONS_MODEL
+        .with(|cell| *cell.borrow_mut() = Some(loose_conversations_model.clone()));
+    let ventures_model: std::rc::Rc<VecModel<VentureGroup>> =
+        std::rc::Rc::new(VecModel::<VentureGroup>::default());
+    VENTURES_MODEL.with(|cell| *cell.borrow_mut() = Some(ventures_model.clone()));
     let sub_agents_model: std::rc::Rc<VecModel<SubAgentRow>> =
         std::rc::Rc::new(VecModel::<SubAgentRow>::default());
     SUB_AGENTS_MODEL.with(|cell| *cell.borrow_mut() = Some(sub_agents_model.clone()));
@@ -259,7 +304,9 @@ fn main() -> Result<()> {
     // Bind the transcript Model so the UI's `for entry in transcript`
     // sees Rust-side pushes immediately.
     ui.set_transcript(ModelRc::from(transcript_model));
-    ui.set_conversations(ModelRc::from(conversations_model));
+    ui.set_pinned_conversations(ModelRc::from(pinned_conversations_model));
+    ui.set_loose_conversations(ModelRc::from(loose_conversations_model));
+    ui.set_ventures(ModelRc::from(ventures_model));
     ui.set_sub_agents(ModelRc::from(sub_agents_model));
 
     // Seed initial settings from env (matching what jarvis_up reads).
@@ -560,17 +607,11 @@ fn main() -> Result<()> {
         ui.on_select_conversation(move |id| {
             let id = id.to_string();
             *current_thread.lock() = Some(id.clone());
-            // Reflect selection in the model.
-            let _ = with_conversations(|m| {
-                for i in 0..m.row_count() {
-                    let mut row = m.row_data(i).unwrap_or_default();
-                    let was_active = row.is_active;
-                    row.is_active = row.id == id;
-                    if was_active != row.is_active {
-                        m.set_row_data(i, row);
-                    }
-                }
-            });
+            // Mirror into the UI-thread thread_local + re-bucket so the
+            // highlight moves to the clicked row immediately (no 10-second
+            // wait for the next gateway poll).
+            CURRENT_THREAD_ID.with(|cell| *cell.borrow_mut() = Some(id.clone()));
+            rebucket_conversations();
             // Clear the on-screen transcript and rebuild it from the
             // selected thread's history. Without this, switching to a
             // prior thread shows an empty chat panel even though the
@@ -617,12 +658,21 @@ fn main() -> Result<()> {
                 match gw.new_thread().await {
                     Ok(info) => {
                         *current_thread.lock() = Some(info.id.clone());
-                        // Refresh the sidebar.
-                        if let Ok(list) = gw.list_threads().await {
-                            refresh_conversation_model(&list);
-                        }
-                        let _ = slint::invoke_from_event_loop(|| {
+                        let list = gw.list_threads().await.ok();
+                        let new_id = info.id.clone();
+                        // refresh_conversation_model touches a UI-thread
+                        // thread_local (CONVERSATIONS_MODEL), so it MUST
+                        // run inside slint::invoke_from_event_loop —
+                        // otherwise the call was silently dropping the
+                        // refresh (wrong thread → empty thread_local).
+                        let _ = slint::invoke_from_event_loop(move || {
+                            CURRENT_THREAD_ID.with(|cell| {
+                                *cell.borrow_mut() = Some(new_id.clone())
+                            });
                             clear_transcript_rows();
+                            if let Some(list) = list {
+                                refresh_conversation_model(&list);
+                            }
                         });
                     }
                     Err(e) => tracing::warn!("new thread failed: {e}"),
@@ -711,6 +761,326 @@ fn main() -> Result<()> {
                         u.set_status(status.into());
                     }
                 });
+            });
+        });
+    }
+    // Right-click thread menu actions: rename / delete / export.
+    {
+        let ui_weak = ui.as_weak();
+        let gateway = state.gateway.clone();
+        let runtime_for_rename = runtime.clone();
+        ui.on_rename_thread(move |thread_id, title| {
+            let thread_id = thread_id.to_string();
+            let title = title.to_string();
+            let gateway = gateway.clone();
+            let ui_weak = ui_weak.clone();
+            runtime_for_rename.spawn(async move {
+                let trimmed = title.trim();
+                let send: Option<&str> = if trimmed.is_empty() { None } else { Some(trimmed) };
+                if let Err(e) = gateway.rename_thread(&thread_id, send).await {
+                    tracing::warn!("rename_thread failed: {e}");
+                }
+                // Refresh the sidebar so the new title shows up immediately.
+                if let Ok(list) = gateway.list_threads().await {
+                    let _ = slint::invoke_from_event_loop(move || {
+                        refresh_conversation_model(&list);
+                        if let Some(u) = ui_weak.upgrade() {
+                            u.set_status("renamed".into());
+                        }
+                    });
+                }
+            });
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let gateway = state.gateway.clone();
+        let runtime_for_delete = runtime.clone();
+        let current_thread_for_delete = current_thread_id.clone();
+        ui.on_delete_thread(move |thread_id| {
+            let thread_id = thread_id.to_string();
+            let gateway = gateway.clone();
+            let ui_weak = ui_weak.clone();
+            let current = current_thread_for_delete.clone();
+            runtime_for_delete.spawn(async move {
+                if let Err(e) = gateway.delete_thread(&thread_id).await {
+                    tracing::warn!("delete_thread failed: {e}");
+                }
+                // If we deleted the active thread, clear the panel.
+                let was_active = current
+                    .lock()
+                    .as_ref()
+                    .map(|s| s.as_str() == thread_id.as_str())
+                    .unwrap_or(false);
+                if was_active {
+                    *current.lock() = None;
+                    let _ = slint::invoke_from_event_loop(|| {
+                        // Drop the selection-override too — without
+                        // this, refresh_conversation_model keeps trying
+                        // to highlight a deleted thread id forever.
+                        CURRENT_THREAD_ID.with(|cell| *cell.borrow_mut() = None);
+                        clear_transcript_rows();
+                    });
+                }
+                if let Ok(list) = gateway.list_threads().await {
+                    let _ = slint::invoke_from_event_loop(move || {
+                        refresh_conversation_model(&list);
+                        if let Some(u) = ui_weak.upgrade() {
+                            u.set_status("deleted".into());
+                        }
+                    });
+                }
+            });
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let gateway = state.gateway.clone();
+        let runtime_for_export_thread = runtime.clone();
+        ui.on_export_thread(move |thread_id| {
+            let Some(u) = ui_weak.upgrade() else { return; };
+            u.set_status("exporting...".into());
+            let thread_id = thread_id.to_string();
+            let gateway = gateway.clone();
+            let ui_weak = ui_weak.clone();
+            runtime_for_export_thread.spawn(async move {
+                let history = match gateway.fetch_history(Some(&thread_id)).await {
+                    Ok(h) => h,
+                    Err(e) => {
+                        tracing::warn!("export_thread fetch_history failed: {e}");
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(u) = ui_weak.upgrade() {
+                                u.set_status(format!("export failed: {e}").into());
+                            }
+                        });
+                        return;
+                    }
+                };
+                // Render the fetched turns directly to markdown so we
+                // don't depend on the transcript model being populated.
+                let mut md = String::with_capacity(8 * 1024);
+                use std::fmt::Write;
+                let _ = writeln!(md, "# JARVIS conversation\n\n_Thread: `{thread_id}`_\n");
+                for t in &history.turns {
+                    if !t.user_input.is_empty() {
+                        let _ = writeln!(md, "## You\n\n{}\n", t.user_input);
+                    }
+                    if let Some(ref r) = t.response {
+                        if !r.is_empty() {
+                            let _ = writeln!(md, "## JARVIS\n\n{}\n", r);
+                        }
+                    }
+                }
+                let res = tokio::task::spawn_blocking(move || -> anyhow::Result<std::path::PathBuf> {
+                    let dir = dirs::download_dir()
+                        .or_else(dirs::home_dir)
+                        .unwrap_or_else(std::env::temp_dir);
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let short = thread_id.get(..8).unwrap_or(&thread_id);
+                    let path = dir.join(format!("jarvis-thread-{short}-{ts}.md"));
+                    std::fs::write(&path, md)?;
+                    Ok(path)
+                })
+                .await;
+                let status = match res {
+                    Ok(Ok(path)) => format!("exported: {}", path.display()),
+                    Ok(Err(e)) => format!("export failed: {e}"),
+                    Err(e) => format!("export join failed: {e}"),
+                };
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(u) = ui_weak.upgrade() {
+                        u.set_status(status.into());
+                    }
+                });
+            });
+        });
+    }
+    // Pin / unpin a thread. Calls the gateway, then refreshes the list
+    // so the row jumps to the pinned section (or back out) immediately.
+    {
+        let ui_weak = ui.as_weak();
+        let gateway = state.gateway.clone();
+        let runtime_for_pin = runtime.clone();
+        ui.on_pin_thread(move |thread_id, pinned| {
+            let thread_id = thread_id.to_string();
+            let gateway = gateway.clone();
+            let ui_weak = ui_weak.clone();
+            runtime_for_pin.spawn(async move {
+                if let Err(e) = gateway.set_thread_pinned(&thread_id, pinned).await {
+                    tracing::warn!("set_thread_pinned failed: {e}");
+                }
+                if let Ok(list) = gateway.list_threads().await {
+                    let _ = slint::invoke_from_event_loop(move || {
+                        refresh_conversation_model(&list);
+                        if let Some(u) = ui_weak.upgrade() {
+                            u.set_status(if pinned { "pinned".into() } else { "unpinned".into() });
+                        }
+                    });
+                }
+            });
+        });
+    }
+    // Move a thread into a venture (or drop it back to loose).
+    {
+        let ui_weak = ui.as_weak();
+        let gateway = state.gateway.clone();
+        let runtime_for_set_venture = runtime.clone();
+        ui.on_set_thread_venture(move |thread_id, venture_id| {
+            let thread_id = thread_id.to_string();
+            let venture_id = venture_id.to_string();
+            let gateway = gateway.clone();
+            let ui_weak = ui_weak.clone();
+            runtime_for_set_venture.spawn(async move {
+                let assigning = !venture_id.is_empty();
+                let target = if assigning {
+                    Some(venture_id.as_str())
+                } else {
+                    None
+                };
+                if let Err(e) = gateway.set_thread_venture(&thread_id, target).await {
+                    tracing::warn!("set_thread_venture failed: {e}");
+                }
+                if let Ok(list) = gateway.list_threads().await {
+                    let _ = slint::invoke_from_event_loop(move || {
+                        refresh_conversation_model(&list);
+                        if let Some(u) = ui_weak.upgrade() {
+                            u.set_status(if assigning {
+                                "moved to venture".into()
+                            } else {
+                                "removed from venture".into()
+                            });
+                        }
+                    });
+                }
+            });
+        });
+    }
+    // Toggle a venture's collapsed/expanded state. We optimistically
+    // flip the local model immediately (so the chevron animates without
+    // a network round-trip), then persist server-side. The next poll
+    // confirms the state.
+    {
+        let gateway = state.gateway.clone();
+        let runtime_for_toggle_venture = runtime.clone();
+        ui.on_toggle_venture(move |venture_id| {
+            let venture_id_str = venture_id.to_string();
+            // Optimistic local flip: walk VENTURES_MODEL and toggle the
+            // matching venture's collapsed flag in place.
+            let new_state = VENTURES_MODEL
+                .with(|cell| {
+                    cell.borrow().as_ref().map(|m| {
+                        for i in 0..m.row_count() {
+                            let mut row = m.row_data(i).unwrap_or_default();
+                            if row.id == venture_id_str {
+                                row.collapsed = !row.collapsed;
+                                let next = row.collapsed;
+                                m.set_row_data(i, row);
+                                return next;
+                            }
+                        }
+                        false
+                    })
+                })
+                .unwrap_or(false);
+            // Persist.
+            let gateway = gateway.clone();
+            runtime_for_toggle_venture.spawn(async move {
+                if let Err(e) = gateway
+                    .set_venture_collapsed(&venture_id_str, new_state)
+                    .await
+                {
+                    tracing::warn!("set_venture_collapsed failed: {e}");
+                }
+            });
+        });
+    }
+    // Rename a venture. Server-side update + refresh.
+    {
+        let gateway = state.gateway.clone();
+        let runtime_for_rename_venture = runtime.clone();
+        ui.on_rename_venture(move |venture_id, name| {
+            let venture_id = venture_id.to_string();
+            let name = name.to_string();
+            let trimmed = name.trim().to_string();
+            if trimmed.is_empty() {
+                return;
+            }
+            let gateway = gateway.clone();
+            runtime_for_rename_venture.spawn(async move {
+                if let Err(e) = gateway.rename_venture(&venture_id, &trimmed).await {
+                    tracing::warn!("rename_venture failed: {e}");
+                }
+                if let Ok(list) = gateway.list_threads().await {
+                    let _ = slint::invoke_from_event_loop(move || {
+                        refresh_conversation_model(&list);
+                    });
+                }
+            });
+        });
+    }
+    // Delete a venture. Threads inside it drop back to loose.
+    {
+        let gateway = state.gateway.clone();
+        let runtime_for_delete_venture = runtime.clone();
+        ui.on_delete_venture(move |venture_id| {
+            let venture_id = venture_id.to_string();
+            let gateway = gateway.clone();
+            runtime_for_delete_venture.spawn(async move {
+                if let Err(e) = gateway.delete_venture(&venture_id).await {
+                    tracing::warn!("delete_venture failed: {e}");
+                }
+                if let Ok(list) = gateway.list_threads().await {
+                    let _ = slint::invoke_from_event_loop(move || {
+                        refresh_conversation_model(&list);
+                    });
+                }
+            });
+        });
+    }
+    // Create a new venture from the new-venture overlay. If
+    // for_thread_id is non-empty, also assigns that thread to the
+    // freshly-created venture so the "+ New venture..." flow lands in
+    // one round trip.
+    {
+        let ui_weak = ui.as_weak();
+        let gateway = state.gateway.clone();
+        let runtime_for_create_venture = runtime.clone();
+        ui.on_create_venture_for(move |for_thread_id| {
+            let for_thread_id = for_thread_id.to_string();
+            let ui_weak = ui_weak.clone();
+            let name = ui_weak
+                .upgrade()
+                .map(|u| u.get_new_venture_overlay_value().to_string())
+                .unwrap_or_default();
+            let trimmed = name.trim().to_string();
+            if trimmed.is_empty() {
+                return;
+            }
+            let gateway = gateway.clone();
+            runtime_for_create_venture.spawn(async move {
+                let venture = match gateway.create_venture(&trimmed).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!("create_venture failed: {e}");
+                        return;
+                    }
+                };
+                if !for_thread_id.is_empty() {
+                    if let Err(e) = gateway
+                        .set_thread_venture(&for_thread_id, Some(&venture.id))
+                        .await
+                    {
+                        tracing::warn!("create_venture: assign thread failed: {e}");
+                    }
+                }
+                if let Ok(list) = gateway.list_threads().await {
+                    let _ = slint::invoke_from_event_loop(move || {
+                        refresh_conversation_model(&list);
+                    });
+                }
             });
         });
     }
@@ -1299,8 +1669,12 @@ async fn voice_startup(
         match state.gateway.new_thread().await {
             Ok(info) => {
                 *state.current_thread_id.lock() = Some(info.id.clone());
+                let new_id = info.id.clone();
                 if let Ok(list) = state.gateway.list_threads().await {
                     let _ = slint::invoke_from_event_loop(move || {
+                        CURRENT_THREAD_ID.with(|cell| {
+                            *cell.borrow_mut() = Some(new_id.clone())
+                        });
                         refresh_conversation_model(&list);
                     });
                 }
@@ -1475,10 +1849,19 @@ async fn mic_pipeline(
             // 40ms frame, ~200ms time constant → alpha ≈ 0.2.
             playback_rms_ema = playback_rms_ema * 0.8 + instant_playback * 0.2;
 
-            // Relaxed: normal-volume "stop" lands around 0.08-0.12 RMS;
-            // the old 0.15 absolute floor required shouting. Silero
-            // remains the rigor — JARVIS echo confused with speech
-            // gets rejected at the second stage.
+            // RESTORED to the tighter values after the loosened pass
+            // broke JARVIS mid-sentence. Root cause: Silero VAD fails
+            // to initialize on this machine ("gate disabled (fail-
+            // open)" in the log) and fails-open at 1.0 = always-
+            // speech. That removes the second-stage rigor that the
+            // looser RMS gates were relying on; the result is
+            // JARVIS's own voice through the speakers passes the
+            // barge threshold and halts his own TTS. Until Silero
+            // init is actually fixed (see speech_gate.rs init logging
+            // for the failing stage), stay conservative here.
+            // Normal-volume "stop" lands around 0.08-0.12 RMS; the
+            // 2.5x ratio over the smoothed playback floor keeps a
+            // comfortable margin above echo.
             let condition = frame_rms > 0.08 && frame_rms > playback_rms_ema * 2.5;
             if condition {
                 barge_streak += 1;
@@ -1778,19 +2161,52 @@ async fn sse_consumer(
         let state = state.clone();
         let speaker_queue = speaker_queue.clone();
         let gw_for_tts = gateway.clone();
-        let result = gateway
-            .subscribe_events(move |event| {
-                handle_chat_event(
-                    event,
-                    ui_weak.clone(),
-                    state.clone(),
-                    speaker_queue.clone(),
-                    gw_for_tts.clone(),
-                );
-            })
-            .await;
+        let on_event = move |event| {
+            handle_chat_event(
+                event,
+                ui_weak.clone(),
+                state.clone(),
+                speaker_queue.clone(),
+                gw_for_tts.clone(),
+            );
+        };
+
+        // WT-first. SSE escape hatch is JARVIS_USE_SSE_EVENTS=true,
+        // for debugging only. We're committing to WT here; both ends
+        // now log full underlying errors so the actual connect failure
+        // surfaces instead of a generic message.
+        let force_sse = std::env::var("JARVIS_USE_SSE_EVENTS")
+            .ok()
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+
+        let result = if force_sse {
+            tracing::info!("event subscriber: SSE [forced via JARVIS_USE_SSE_EVENTS]");
+            gateway.subscribe_events(on_event).await
+        } else {
+            match gateway.wt_events_advert().await {
+                Ok(Some((port, hash))) => {
+                    let prefix = &hash[..16.min(hash.len())];
+                    tracing::info!(
+                        "event subscriber: WT — port={port}, cert_hash_prefix={prefix}"
+                    );
+                    gateway.wt_subscribe_events(port, &hash, on_event).await
+                }
+                Ok(None) => {
+                    tracing::warn!("event subscriber: SSE (gateway didn't advertise WT)");
+                    gateway.subscribe_events(on_event).await
+                }
+                Err(e) => {
+                    tracing::warn!("wt-events advert failed ({e:#}); using SSE");
+                    gateway.subscribe_events(on_event).await
+                }
+            }
+        };
         if let Err(e) = result {
-            tracing::warn!("SSE stream closed: {e}; reconnecting in 3s");
+            // {e:#} prints the full cause chain so the underlying
+            // wtransport error surfaces instead of just the outermost
+            // context wrap.
+            tracing::warn!("event stream closed: {e:#}; reconnecting in 3s");
         }
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
@@ -2052,6 +2468,24 @@ async fn tts_worker(
         speaker_queue.resume();
         let q = speaker_queue.clone();
         let on_chunk = move |sr: u32, samples: Vec<f32>| {
+            // In-sentence backpressure. ElevenLabs Flash delivers the
+            // PCM body in TCP-buffered bursts; tokio's AsyncRead can
+            // drain several 5-6KB chunks back-to-back without yielding,
+            // and each chunk becomes one enqueue. Without backpressure,
+            // 100+ enqueues fire in microseconds, blow past the 10s
+            // cap, and the queue drops ~1390 samples per call (the
+            // overflow log spam McKale saw at 21:06:18). Solution: if
+            // the queue is already holding more than ~7s of audio,
+            // briefly spin-wait for the cpal output thread to drain
+            // before pushing more. Bounded to 250ms so a stuck output
+            // device can't wedge the worker permanently.
+            const HIGH_WATERMARK_SAMPLES: usize = 48_000 * 7; // ~7s @ 48kHz
+            let start = std::time::Instant::now();
+            while q.pending_samples() > HIGH_WATERMARK_SAMPLES
+                && start.elapsed() < std::time::Duration::from_millis(250)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
             q.enqueue_pcm(sr, &samples);
         };
         if let Err(e) = gateway.tts_stream(&speakable, on_chunk).await {
@@ -2491,15 +2925,37 @@ fn update_streaming_jarvis(full_body: &str, already_streaming: bool) {
 
 /// On finalize, swap the streaming placeholder row for markdown-rendered
 /// blocks; or just append fresh blocks if no streaming happened. UI-thread only.
+///
+/// Bug fix (2026-05-29): the agent loop fires `SseEvent::Response` once
+/// PER agentic iteration, each carrying the cumulative text JARVIS has
+/// produced so far. Without this collapse, every iteration appends a
+/// growing-prefix bubble — McKale's screenshot showed 6 bubbles each a
+/// strict prefix of the next. We now strip every trailing jarvis-kind
+/// row back to the most recent USER or TOOL boundary before appending,
+/// so cumulative-Response duplication collapses to the final state.
+/// Sub-agent broadcasts are unaffected because they're separated from
+/// any prior jarvis row by at least one USER turn.
 fn replace_streaming_with_final(final_text: &str, was_streamed: bool) {
-    if was_streamed {
-        let _ = with_transcript(|m| {
+    let _ = with_transcript(|m| {
+        if was_streamed {
             let n = m.row_count();
             if n > 0 {
                 m.remove(n - 1);
             }
-        });
-    }
+        }
+        // Collapse cumulative jarvis rows from the current turn.
+        loop {
+            let n = m.row_count();
+            if n == 0 {
+                break;
+            }
+            let row = m.row_data(n - 1).unwrap_or_default();
+            if row.kind != "jarvis" {
+                break;
+            }
+            m.remove(n - 1);
+        }
+    });
     append_jarvis_blocks(final_text);
 }
 
@@ -2658,29 +3114,108 @@ fn prune_sub_agent_row(id: &str) {
 use crate::settings::{write_settings_to_env, WriteSettings};
 
 fn refresh_conversation_model(list: &gateway::ThreadListResponse) {
-    let active = list.active_thread.clone().unwrap_or_default();
-    let rows: Vec<ConversationRow> = list
-        .threads
+    // Cache the latest gateway response so on_select_conversation and
+    // any other UI-state change can re-bucket without waiting for the
+    // next 10-second poll.
+    LAST_THREAD_LIST.with(|cell| *cell.borrow_mut() = Some(list.clone()));
+    rebucket_conversations();
+}
+
+/// Re-derive the three UI bucket models from the cached
+/// `LAST_THREAD_LIST` + the current `CURRENT_THREAD_ID` highlight.
+/// Called by `refresh_conversation_model` (every gateway poll) and on
+/// every selection change so the highlight moves immediately.
+fn rebucket_conversations() {
+    let list = LAST_THREAD_LIST.with(|cell| cell.borrow().clone());
+    let Some(list) = list else { return };
+
+    let highlight_id = CURRENT_THREAD_ID
+        .with(|cell| cell.borrow().clone())
+        .or_else(|| list.active_thread.clone())
+        .unwrap_or_default();
+
+    // Three buckets + a canonical unfiltered list (the latter still
+    // populates CONVERSATIONS_MODEL, which several callbacks scan to
+    // resolve a thread id back to its row).
+    let mut all_rows: Vec<ConversationRow> = Vec::with_capacity(list.threads.len());
+    let mut pinned: Vec<ConversationRow> = Vec::new();
+    let mut loose: Vec<ConversationRow> = Vec::new();
+    let mut by_venture: std::collections::HashMap<String, Vec<ConversationRow>> =
+        std::collections::HashMap::new();
+
+    for t in &list.threads {
+        let row = build_conversation_row(t, &highlight_id);
+        all_rows.push(row.clone());
+        if t.pinned {
+            pinned.push(row);
+        } else if let Some(vid) = t.venture_id.clone().filter(|s| !s.is_empty()) {
+            by_venture.entry(vid).or_default().push(row);
+        } else {
+            loose.push(row);
+        }
+    }
+
+    // Build the VentureGroup list, pulling each venture's pre-bucketed
+    // threads from `by_venture`. A venture with no threads still gets a
+    // header so the user can drag-and-drop into it (and so an empty
+    // venture doesn't silently vanish).
+    let ventures: Vec<VentureGroup> = list
+        .ventures
         .iter()
-        .map(|t| {
-            // Title: short id + turn count
-            let short = t.id.chars().take(8).collect::<String>();
-            let title = format!("Thread {}", short);
-            let subtitle = format!(
-                "{} turn{} • {}",
-                t.turn_count,
-                if t.turn_count == 1 { "" } else { "s" },
-                short_date(&t.updated_at)
-            );
-            ConversationRow {
-                id: t.id.clone().into(),
-                title: title.into(),
-                subtitle: subtitle.into(),
-                is_active: t.id == active,
-            }
+        .map(|v| VentureGroup {
+            id: v.id.clone().into(),
+            name: v.name.clone().into(),
+            collapsed: v.collapsed,
+            threads: ModelRc::new(VecModel::from(
+                by_venture.remove(&v.id).unwrap_or_default(),
+            )),
         })
         .collect();
-    let _ = with_conversations(|m| m.set_vec(rows));
+
+    let _ = with_conversations(|m| m.set_vec(all_rows));
+    PINNED_CONVERSATIONS_MODEL.with(|cell| {
+        if let Some(m) = cell.borrow().as_ref() {
+            m.set_vec(pinned);
+        }
+    });
+    LOOSE_CONVERSATIONS_MODEL.with(|cell| {
+        if let Some(m) = cell.borrow().as_ref() {
+            m.set_vec(loose);
+        }
+    });
+    VENTURES_MODEL.with(|cell| {
+        if let Some(m) = cell.borrow().as_ref() {
+            m.set_vec(ventures);
+        }
+    });
+}
+
+/// Build a single sidebar row from a gateway ThreadInfo. Shared by
+/// every code path that needs to materialize Slint rows.
+fn build_conversation_row(
+    t: &gateway::ThreadInfo,
+    highlight_id: &str,
+) -> ConversationRow {
+    let short = t.id.chars().take(8).collect::<String>();
+    let title = t
+        .title
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| format!("Thread {}", short));
+    let subtitle = format!(
+        "{} turn{} • {}",
+        t.turn_count,
+        if t.turn_count == 1 { "" } else { "s" },
+        short_date(&t.updated_at)
+    );
+    ConversationRow {
+        id: t.id.clone().into(),
+        title: title.into(),
+        subtitle: subtitle.into(),
+        is_active: t.id == highlight_id,
+        pinned: t.pinned,
+        venture_id: t.venture_id.clone().unwrap_or_default().into(),
+    }
 }
 
 fn short_date(rfc3339: &str) -> String {

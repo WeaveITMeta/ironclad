@@ -171,6 +171,28 @@ impl Agent {
     }
 
     // Convenience accessors
+    /// Persist an assistant-role message to Fjall in the background.
+    /// Best-effort — failures are logged but don't bubble up. Used at
+    /// every site where `thread.complete_turn` / `thread.fail_turn`
+    /// runs so the on-disk record matches the in-memory thread state.
+    ///
+    /// Async (not fire-and-forget spawn) so the write actually
+    /// completes before the agent loop returns SubmissionResult. The
+    /// spawn-based version would orphan its task on gateway shutdown;
+    /// a "DONE" reply that completed milliseconds before Ctrl+C would
+    /// be lost because tokio cancels detached tasks on runtime drop.
+    async fn persist_assistant_message(&self, thread_id: Uuid, body: String) {
+        let Some(store) = self.store() else {
+            return;
+        };
+        if let Err(e) = store
+            .add_conversation_message(thread_id, "assistant", &body)
+            .await
+        {
+            tracing::warn!("fjall: persist assistant message failed: {e}");
+        }
+    }
+
     fn store(&self) -> Option<&Arc<Store>> {
         self.deps.store.as_ref()
     }
@@ -710,6 +732,35 @@ impl Agent {
             thread.messages()
         };
 
+        // Persist the user turn to Fjall so the thread survives a
+        // gateway restart. Conversation row is upserted lazily here so
+        // the keyspace doesn't need its own create-thread hook. Errors
+        // are logged but don't fail the chat — durability is best
+        // effort, not a blocking dependency.
+        //
+        // Inline-await (not tokio::spawn) so the conv record EXISTS
+        // before any concurrent assistant-message persist task tries
+        // to touch_conversation it. The spawn-based version of this
+        // path had a race where the assistant message would land in
+        // the memtable before its parent conv row was upserted; the
+        // touch_conversation found nothing to update and skipped the
+        // persist, leaving the message in volatile memory until the
+        // next shutdown wiped it. Cost is ~1-2ms (Buffer-mode persist
+        // to OS write buffer); worth it for the reliability gain.
+        if let Some(store) = self.store() {
+            if let Err(e) = store
+                .upsert_conversation_for_thread(thread_id, &message.channel, &message.user_id)
+                .await
+            {
+                tracing::warn!("fjall: upsert_conversation_for_thread failed: {e}");
+            } else if let Err(e) = store
+                .add_conversation_message(thread_id, "user", content)
+                .await
+            {
+                tracing::warn!("fjall: persist user message failed: {e}");
+            }
+        }
+
         // Send thinking status
         let _ = self
             .channels
@@ -748,6 +799,19 @@ impl Agent {
         match result {
             Ok(AgenticLoopResult::Response(response)) => {
                 thread.complete_turn(&response);
+                // Persist the assistant reply alongside the user turn
+                // we wrote above. Inline-await (not spawn) so the
+                // write completes before the agent loop returns —
+                // detached spawns get cancelled on gateway shutdown
+                // and lose the message.
+                if let Some(store) = self.store() {
+                    if let Err(e) = store
+                        .add_conversation_message(thread_id, "assistant", &response)
+                        .await
+                    {
+                        tracing::warn!("fjall: persist assistant message failed: {e}");
+                    }
+                }
                 let _ = self
                     .channels
                     .send_status(
@@ -781,8 +845,21 @@ impl Agent {
                 })
             }
             Err(e) => {
-                thread.fail_turn(e.to_string());
-                Ok(SubmissionResult::error(e.to_string()))
+                let err_str = e.to_string();
+                thread.fail_turn(err_str.clone());
+                // Persist the failure as an assistant message too — the
+                // sidebar should show "this thread blew up", not look
+                // like it just stopped mid-turn.
+                if let Some(store) = self.store() {
+                    let body = format!("[turn failed] {err_str}");
+                    if let Err(e) = store
+                        .add_conversation_message(thread_id, "assistant", &body)
+                        .await
+                    {
+                        tracing::warn!("fjall: persist failed-turn message failed: {e}");
+                    }
+                }
+                Ok(SubmissionResult::error(err_str))
             }
         }
     }
@@ -1001,14 +1078,38 @@ impl Agent {
                     for tc in tool_calls {
                         // Check if tool requires approval
                         if let Some(tool) = self.tools().get(&tc.name).await {
-                            if tool.requires_approval() {
-                                // Check if auto-approved for this session
-                                let is_auto_approved = {
-                                    let sess = session.lock().await;
-                                    sess.is_tool_auto_approved(&tc.name)
-                                };
+                            // Pattern-based per-call override comes
+                            // first. Lets a tool inspect the actual
+                            // parameters and decide:
+                            //   Some(true)  → ALWAYS prompt (overrides
+                            //                 session "Always approved")
+                            //   Some(false) → skip approval entirely
+                            //   None        → fall through to the
+                            //                 static requires_approval()
+                            //                 + session-auto-approval
+                            //                 default policy
+                            //
+                            // Shell uses this to gate `rm`/`sudo`/etc.
+                            // even after the user clicked "Always" on
+                            // a benign command, while letting
+                            // `cargo build`/`git status` run with no
+                            // banner at all.
+                            let override_decision =
+                                tool.approval_override(&tc.arguments);
+                            let needs_approval = match override_decision {
+                                Some(true) => true,
+                                Some(false) => false,
+                                None => {
+                                    if tool.requires_approval() {
+                                        let sess = session.lock().await;
+                                        !sess.is_tool_auto_approved(&tc.name)
+                                    } else {
+                                        false
+                                    }
+                                }
+                            };
 
-                                if !is_auto_approved {
+                            if needs_approval {
                                     // Need approval - store pending request and return.
                                     //
                                     // Multi-tool defense: the most recent assistant
@@ -1068,7 +1169,6 @@ impl Agent {
                                     };
 
                                     return Ok(AgenticLoopResult::NeedApproval { pending });
-                                }
                             }
                         }
 
@@ -1771,6 +1871,7 @@ impl Agent {
                         thread.complete_turn(&instructions);
                     }
                 }
+                self.persist_assistant_message(thread_id, instructions.clone()).await;
                 let _ = self
                     .channels
                     .send_status(
@@ -1818,6 +1919,7 @@ impl Agent {
             match result {
                 Ok(AgenticLoopResult::Response(response)) => {
                     thread.complete_turn(&response);
+                    self.persist_assistant_message(thread_id, response.clone()).await;
                     let _ = self
                         .channels
                         .send_status(
@@ -1852,8 +1954,14 @@ impl Agent {
                     })
                 }
                 Err(e) => {
-                    thread.fail_turn(e.to_string());
-                    Ok(SubmissionResult::error(e.to_string()))
+                    let err_str = e.to_string();
+                    thread.fail_turn(err_str.clone());
+                    self.persist_assistant_message(
+                        thread_id,
+                        format!("[turn failed] {err_str}"),
+                    )
+                    .await;
+                    Ok(SubmissionResult::error(err_str))
                 }
             }
         } else {

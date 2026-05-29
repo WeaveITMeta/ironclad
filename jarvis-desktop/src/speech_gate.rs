@@ -40,19 +40,54 @@ static GATE: OnceLock<Option<Mutex<GateState>>> = OnceLock::new();
 
 fn init_gate() -> Option<Mutex<GateState>> {
     // tract: load the ONNX file from a byte slice → typed → optimize → make_runnable.
+    // Each stage logs its actual failure cause instead of being swallowed
+    // by `.ok()?`. Without this we end up with a generic "gate disabled"
+    // warning and no way to tell whether the model file is wrong, the
+    // input shape is wrong, or the optimization pass blew up.
     let mut cursor = std::io::Cursor::new(MODEL_BYTES);
-    let model = onnx().model_for_read(&mut cursor).ok()?;
-    let model = model
-        .with_input_fact(0, f32::fact([1, CHUNK]).into())
-        .ok()?
-        .with_input_fact(1, f32::fact([2, 1, 128]).into())
-        .ok()?
-        .with_input_fact(2, i64::fact([1]).into())
-        .ok()?
-        .into_optimized()
-        .ok()?
-        .into_runnable()
-        .ok()?;
+    let model = match onnx().model_for_read(&mut cursor) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("Silero init: model_for_read failed: {e:#}");
+            return None;
+        }
+    };
+    let model = match model.with_input_fact(0, f32::fact([1, CHUNK]).into()) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("Silero init: with_input_fact 0 failed: {e:#}");
+            return None;
+        }
+    };
+    let model = match model.with_input_fact(1, f32::fact([2, 1, 128]).into()) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("Silero init: with_input_fact 1 failed: {e:#}");
+            return None;
+        }
+    };
+    let model = match model.with_input_fact(2, i64::fact([1]).into()) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("Silero init: with_input_fact 2 failed: {e:#}");
+            return None;
+        }
+    };
+    let model = match model.into_optimized() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("Silero init: into_optimized failed: {e:#}");
+            return None;
+        }
+    };
+    let model = match model.into_runnable() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("Silero init: into_runnable failed: {e:#}");
+            return None;
+        }
+    };
+    tracing::info!("Silero VAD initialized ok");
     Some(Mutex::new(GateState {
         model,
         state: Array3::<f32>::zeros((2, 1, 128)),

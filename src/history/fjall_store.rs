@@ -26,14 +26,80 @@ fn db_err(ctx: &str, e: impl std::fmt::Display) -> DatabaseError {
     DatabaseError::Query(format!("{ctx}: {e}"))
 }
 
+/// Summary of one persisted conversation. Returned by
+/// `list_conversations_for_user` for the rehydration path.
+#[derive(Debug, Clone)]
+pub struct ConversationSummary {
+    pub id: Uuid,
+    pub thread_id: Option<Uuid>,
+    pub channel: String,
+    pub title: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub last_activity: DateTime<Utc>,
+    /// Whether the user has pinned this thread to the top.
+    pub pinned: bool,
+    /// When it was pinned (None when unpinned). Drives sort within
+    /// the pinned section.
+    pub pinned_at: Option<DateTime<Utc>>,
+    /// Venture this thread belongs to, if any.
+    pub venture_id: Option<Uuid>,
+}
+
+/// Light-weight view of one Venture for the gateway's list endpoint.
+#[derive(Debug, Clone)]
+pub struct VentureSummary {
+    pub id: Uuid,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+    pub collapsed: bool,
+}
+
+/// One persisted chat turn fragment ("user said X" or "assistant said
+/// Y"). Returned by `messages_for_conversation` for rehydration and
+/// the chat_history fallback path.
+#[derive(Debug, Clone)]
+pub struct ConversationMessage {
+    pub role: String,
+    pub content: String,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct ConvRecord {
     id: Uuid,
     channel: String,
     user_id: String,
     thread_id: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
     created_at: DateTime<Utc>,
     last_activity: DateTime<Utc>,
+    /// User-pinned threads sort to the top of the sidebar. Pin state
+    /// is a manual toggle from the right-click menu; pinned_at orders
+    /// the pinned section (most-recently-pinned first).
+    #[serde(default)]
+    pinned: bool,
+    #[serde(default)]
+    pinned_at: Option<DateTime<Utc>>,
+    /// Optional grouping: a Venture is a collapsible sidebar section.
+    /// `None` means the thread is "loose" — shown below the venture
+    /// groups in its own unsectioned block.
+    #[serde(default)]
+    venture_id: Option<Uuid>,
+}
+
+/// Persisted Venture: a named, collapsible sidebar group that bundles
+/// related threads. One thread belongs to at most one Venture (or
+/// none); ventures persist their `collapsed` state so the visual
+/// shape survives restarts.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct VentureRecord {
+    pub id: Uuid,
+    pub user_id: String,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub collapsed: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -96,6 +162,11 @@ pub struct FjallHistoryStore {
     llm_calls: PartitionHandle,
     estimations: PartitionHandle,
     tool_failures: PartitionHandle,
+    /// Named, collapsible thread groups (the "Venture" concept in the
+    /// sidebar UX). One row per venture; the per-thread venture_id
+    /// lives on the ConvRecord side so we don't have to maintain a
+    /// reverse index — a thread's venture is wherever its own row says.
+    ventures: PartitionHandle,
 }
 
 fn job_action_key(job_id: Uuid, seq: u32) -> Vec<u8> {
@@ -122,6 +193,7 @@ impl FjallHistoryStore {
             llm_calls: p("llm_calls")?,
             estimations: p("estimations")?,
             tool_failures: p("tool_failures")?,
+            ventures: p("ventures")?,
             keyspace,
         })
     }
@@ -166,8 +238,12 @@ impl FjallHistoryStore {
             channel: channel.to_string(),
             user_id: user_id.to_string(),
             thread_id: thread_id.map(|s| s.to_string()),
+            title: None,
             created_at: now,
             last_activity: now,
+            pinned: false,
+            pinned_at: None,
+            venture_id: None,
         };
         Self::put_json(&self.conversations, id.as_bytes().to_vec(), &rec)?;
         self.persist()?;
@@ -181,6 +257,298 @@ impl FjallHistoryStore {
             self.persist()?;
         }
         Ok(())
+    }
+
+    /// Convenience for the chat path: ensure a Conversation row exists
+    /// for the given thread, keyed by the thread UUID directly (so the
+    /// thread_id IS the conversation_id from this layer's POV — no
+    /// secondary mapping needed). Idempotent: subsequent calls just
+    /// bump `last_activity`.
+    pub async fn upsert_conversation_for_thread(
+        &self,
+        thread_id: Uuid,
+        channel: &str,
+        user_id: &str,
+    ) -> Result<(), DatabaseError> {
+        let now = Utc::now();
+        let rec = match Self::get_json::<ConvRecord>(
+            &self.conversations,
+            thread_id.as_bytes(),
+        )? {
+            Some(mut existing) => {
+                existing.last_activity = now;
+                existing
+            }
+            None => ConvRecord {
+                id: thread_id,
+                channel: channel.to_string(),
+                user_id: user_id.to_string(),
+                thread_id: Some(thread_id.to_string()),
+                title: None,
+                created_at: now,
+                last_activity: now,
+                pinned: false,
+                pinned_at: None,
+                venture_id: None,
+            },
+        };
+        Self::put_json(&self.conversations, thread_id.as_bytes().to_vec(), &rec)?;
+        self.persist()?;
+        Ok(())
+    }
+
+    /// List every conversation for `user_id`, sorted newest-first by
+    /// `last_activity`. Used by session rehydration on Agent boot to
+    /// rebuild the in-memory thread map so the left-sidebar threads
+    /// list survives restarts.
+    pub async fn list_conversations_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<ConversationSummary>, DatabaseError> {
+        let mut out: Vec<ConversationSummary> = Vec::new();
+        for kv in self.conversations.iter() {
+            let (_, v) = kv.map_err(|e| db_err("scan conversations", e))?;
+            if let Ok(rec) = serde_json::from_slice::<ConvRecord>(&v) {
+                if rec.user_id == user_id {
+                    out.push(ConversationSummary {
+                        id: rec.id,
+                        thread_id: rec
+                            .thread_id
+                            .and_then(|s| Uuid::parse_str(&s).ok()),
+                        channel: rec.channel,
+                        title: rec.title,
+                        created_at: rec.created_at,
+                        last_activity: rec.last_activity,
+                        pinned: rec.pinned,
+                        pinned_at: rec.pinned_at,
+                        venture_id: rec.venture_id,
+                    });
+                }
+            }
+        }
+        out.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
+        Ok(out)
+    }
+
+    /// Set/clear the user-assigned title for a thread's persisted
+    /// conversation. No-op if the conversation row doesn't exist yet.
+    pub async fn set_conversation_title(
+        &self,
+        thread_id: Uuid,
+        title: Option<String>,
+    ) -> Result<(), DatabaseError> {
+        if let Some(mut rec) =
+            Self::get_json::<ConvRecord>(&self.conversations, thread_id.as_bytes())?
+        {
+            rec.title = title;
+            rec.last_activity = Utc::now();
+            Self::put_json(&self.conversations, thread_id.as_bytes().to_vec(), &rec)?;
+            self.persist()?;
+        }
+        Ok(())
+    }
+
+    /// Toggle the user-pin flag for a thread. Pinning stamps
+    /// `pinned_at = now()` so the pinned section can sort
+    /// most-recently-pinned first; unpinning clears it.
+    pub async fn set_conversation_pinned(
+        &self,
+        thread_id: Uuid,
+        pinned: bool,
+    ) -> Result<(), DatabaseError> {
+        if let Some(mut rec) =
+            Self::get_json::<ConvRecord>(&self.conversations, thread_id.as_bytes())?
+        {
+            rec.pinned = pinned;
+            rec.pinned_at = pinned.then(Utc::now);
+            Self::put_json(&self.conversations, thread_id.as_bytes().to_vec(), &rec)?;
+            self.persist()?;
+        }
+        Ok(())
+    }
+
+    /// Assign or clear a thread's venture. Passing `None` removes the
+    /// thread from whichever venture it was in (drops it to the loose
+    /// section). The venture row itself is untouched.
+    pub async fn set_conversation_venture(
+        &self,
+        thread_id: Uuid,
+        venture_id: Option<Uuid>,
+    ) -> Result<(), DatabaseError> {
+        if let Some(mut rec) =
+            Self::get_json::<ConvRecord>(&self.conversations, thread_id.as_bytes())?
+        {
+            rec.venture_id = venture_id;
+            Self::put_json(&self.conversations, thread_id.as_bytes().to_vec(), &rec)?;
+            self.persist()?;
+        }
+        Ok(())
+    }
+
+    // ==================== Ventures ====================
+
+    /// Create a new venture for the given user. Returns the assigned
+    /// id; the caller is expected to push it to clients via the next
+    /// `list_threads` poll.
+    pub async fn create_venture(
+        &self,
+        user_id: &str,
+        name: &str,
+    ) -> Result<Uuid, DatabaseError> {
+        let id = Uuid::new_v4();
+        let rec = VentureRecord {
+            id,
+            user_id: user_id.to_string(),
+            name: name.to_string(),
+            created_at: Utc::now(),
+            collapsed: false,
+        };
+        Self::put_json(&self.ventures, id.as_bytes().to_vec(), &rec)?;
+        self.persist()?;
+        Ok(id)
+    }
+
+    /// List all ventures for a user, oldest-first (sidebar shows them
+    /// in creation order so the layout doesn't shuffle as the user
+    /// renames or expands/collapses).
+    pub async fn list_ventures_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<VentureSummary>, DatabaseError> {
+        let mut out: Vec<VentureSummary> = Vec::new();
+        for kv in self.ventures.iter() {
+            let (_, v) = kv.map_err(|e| db_err("scan ventures", e))?;
+            if let Ok(rec) = serde_json::from_slice::<VentureRecord>(&v) {
+                if rec.user_id == user_id {
+                    out.push(VentureSummary {
+                        id: rec.id,
+                        name: rec.name,
+                        created_at: rec.created_at,
+                        collapsed: rec.collapsed,
+                    });
+                }
+            }
+        }
+        out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(out)
+    }
+
+    /// Rename a venture. No-op if the venture doesn't exist.
+    pub async fn rename_venture(
+        &self,
+        venture_id: Uuid,
+        name: &str,
+    ) -> Result<(), DatabaseError> {
+        if let Some(mut rec) =
+            Self::get_json::<VentureRecord>(&self.ventures, venture_id.as_bytes())?
+        {
+            rec.name = name.to_string();
+            Self::put_json(&self.ventures, venture_id.as_bytes().to_vec(), &rec)?;
+            self.persist()?;
+        }
+        Ok(())
+    }
+
+    /// Toggle the venture's collapsed-state flag. Persistent so the
+    /// sidebar shape survives jarvis-desktop restarts.
+    pub async fn set_venture_collapsed(
+        &self,
+        venture_id: Uuid,
+        collapsed: bool,
+    ) -> Result<(), DatabaseError> {
+        if let Some(mut rec) =
+            Self::get_json::<VentureRecord>(&self.ventures, venture_id.as_bytes())?
+        {
+            rec.collapsed = collapsed;
+            Self::put_json(&self.ventures, venture_id.as_bytes().to_vec(), &rec)?;
+            self.persist()?;
+        }
+        Ok(())
+    }
+
+    /// Delete a venture. All threads previously in it have their
+    /// `venture_id` cleared (they fall back to the loose section);
+    /// the threads themselves stay intact.
+    pub async fn delete_venture(
+        &self,
+        venture_id: Uuid,
+    ) -> Result<(), DatabaseError> {
+        // Unassign every conversation that pointed at this venture.
+        let mut to_update: Vec<(Vec<u8>, ConvRecord)> = Vec::new();
+        for kv in self.conversations.iter() {
+            let (k, v) = kv.map_err(|e| db_err("scan conversations for venture delete", e))?;
+            if let Ok(rec) = serde_json::from_slice::<ConvRecord>(&v) {
+                if rec.venture_id == Some(venture_id) {
+                    let mut updated = rec;
+                    updated.venture_id = None;
+                    to_update.push((k.to_vec(), updated));
+                }
+            }
+        }
+        for (k, rec) in to_update {
+            Self::put_json(&self.conversations, k, &rec)?;
+        }
+        // Then the venture row itself.
+        self.ventures
+            .remove(venture_id.as_bytes())
+            .map_err(|e| db_err("remove venture", e))?;
+        self.persist()?;
+        Ok(())
+    }
+
+    /// Remove a conversation and ALL of its messages from the store.
+    /// Used by the sidebar's right-click → Delete flow. Idempotent: a
+    /// missing thread returns Ok(()).
+    pub async fn delete_conversation(
+        &self,
+        thread_id: Uuid,
+    ) -> Result<(), DatabaseError> {
+        // Drop messages first (prefix-scan + collect keys, then remove).
+        let prefix = thread_id.as_bytes().to_vec();
+        let mut to_drop: Vec<Vec<u8>> = Vec::new();
+        for kv in self.messages.prefix(&prefix) {
+            let (k, _) = kv.map_err(|e| db_err("scan messages for delete", e))?;
+            to_drop.push(k.to_vec());
+        }
+        for k in to_drop {
+            self.messages
+                .remove(&k)
+                .map_err(|e| db_err("remove message", e))?;
+        }
+        // Then the conversation row itself.
+        self.conversations
+            .remove(thread_id.as_bytes())
+            .map_err(|e| db_err("remove conversation", e))?;
+        self.persist()?;
+        Ok(())
+    }
+
+    /// Read every message for a conversation, sorted by creation time.
+    /// Used by both rehydration and the chat_history_handler fallback
+    /// path.
+    pub async fn messages_for_conversation(
+        &self,
+        conversation_id: Uuid,
+    ) -> Result<Vec<ConversationMessage>, DatabaseError> {
+        let prefix = conversation_id.as_bytes().to_vec();
+        let mut by_ts: std::collections::BTreeMap<
+            (DateTime<Utc>, Uuid),
+            ConversationMessage,
+        > = std::collections::BTreeMap::new();
+        for kv in self.messages.prefix(&prefix) {
+            let (_, v) = kv.map_err(|e| db_err("scan messages", e))?;
+            if let Ok(rec) = serde_json::from_slice::<MsgRecord>(&v) {
+                by_ts.insert(
+                    (rec.created_at, rec.id),
+                    ConversationMessage {
+                        role: rec.role,
+                        content: rec.content,
+                        created_at: rec.created_at,
+                    },
+                );
+            }
+        }
+        Ok(by_ts.into_values().collect())
     }
 
     pub async fn add_conversation_message(
@@ -200,7 +568,15 @@ impl FjallHistoryStore {
         let mut key = conversation_id.as_bytes().to_vec();
         key.extend_from_slice(id.as_bytes());
         Self::put_json(&self.messages, key, &rec)?;
+        // touch_conversation only persists when the parent conv record
+        // exists — without this fallback persist, a message written
+        // before its conv row is upserted (e.g. the agent-loop spawn
+        // race where the user-msg + upsert task runs concurrently with
+        // an assistant-msg task) would sit in the memtable and be lost
+        // on the next gateway shutdown. Persist unconditionally so the
+        // write durably hits disk regardless of spawn ordering.
         self.touch_conversation(conversation_id).await?;
+        self.persist()?;
         Ok(id)
     }
 

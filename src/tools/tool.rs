@@ -175,6 +175,30 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// Per-call override of the static `requires_approval()` decision,
+    /// inspecting the specific parameters of this invocation.
+    ///
+    /// Returns:
+    /// - `Some(true)` to FORCE approval for this specific call, even
+    ///   when the session has "Always approved" this tool. Use for
+    ///   parameter patterns that are inherently dangerous regardless
+    ///   of prior consent (e.g. `rm -rf`, `sudo` in a shell command).
+    ///   Prevents one blanket "Always" click from unlocking write
+    ///   access to everything that tool can reach.
+    /// - `Some(false)` to SKIP approval entirely for this call. Use
+    ///   for safe-by-pattern invocations of an otherwise-approval-
+    ///   gated tool (e.g. `cargo build`, `git status` in shell — the
+    ///   tool as a whole isn't safe, but these specific commands are).
+    /// - `None` to fall through to the default policy: the static
+    ///   `requires_approval()` decision combined with the session's
+    ///   per-tool auto-approval set.
+    ///
+    /// Default returns `None` so existing tools are unaffected. Tools
+    /// that want pattern-based gating override this.
+    fn approval_override(&self, _params: &serde_json::Value) -> Option<bool> {
+        None
+    }
+
     /// Get the tool schema for LLM function calling.
     fn schema(&self) -> ToolSchema {
         ToolSchema {
