@@ -220,42 +220,105 @@ async fn build_video_for(stream: &MediaStream) -> Result<HtmlVideoElement, Strin
     Ok(video)
 }
 
+/// Anthropic's recommended max long edge for vision images. Going larger
+/// wastes input tokens without improving comprehension; going smaller
+/// (e.g. 1024) saves tokens at a noticeable quality cost for dense UIs.
+/// Combined with JPEG q=0.85 this keeps a full-screen capture well
+/// under Anthropic's 5 MB per-image hard limit on any monitor McKale
+/// owns (4K source → ~200-500 KB JPEG).
+const MAX_IMAGE_LONG_EDGE: i32 = 1568;
+const JPEG_QUALITY: f64 = 0.85;
+
 fn draw_video_to_base64(video: &HtmlVideoElement) -> Result<String, String> {
     let window = web_sys::window().ok_or("no window")?;
     let document = window.document().ok_or("no document")?;
-    let width = video.video_width() as i32;
-    let height = video.video_height() as i32;
-    if width <= 0 || height <= 0 {
+    let src_w = video.video_width() as i32;
+    let src_h = video.video_height() as i32;
+    if src_w <= 0 || src_h <= 0 {
         return Err("video metadata not ready".to_string());
     }
+
+    // Scale so the longest edge fits MAX_IMAGE_LONG_EDGE, preserving
+    // aspect ratio. Source already-small images stay 1:1 (we don't
+    // upscale — that just inflates bytes for no quality gain).
+    let (dst_w, dst_h) = scale_to_max_edge(src_w, src_h, MAX_IMAGE_LONG_EDGE);
+
     let canvas: HtmlCanvasElement = document
         .create_element("canvas")
         .map_err(|e| format!("create canvas: {:?}", e))?
         .dyn_into()
         .map_err(|_| "not a canvas".to_string())?;
-    canvas.set_width(width as u32);
-    canvas.set_height(height as u32);
+    canvas.set_width(dst_w as u32);
+    canvas.set_height(dst_h as u32);
     let ctx = canvas
         .get_context("2d")
         .map_err(|e| format!("getContext: {:?}", e))?
         .ok_or("2d context unavailable")?
         .dyn_into::<web_sys::CanvasRenderingContext2d>()
         .map_err(|_| "not a 2d context".to_string())?;
+    // High-quality downscale: imageSmoothingEnabled + high quality.
+    // Defaults vary by browser; force the good path.
+    let _ = js_sys::Reflect::set(
+        ctx.as_ref(),
+        &JsValue::from_str("imageSmoothingEnabled"),
+        &JsValue::TRUE,
+    );
+    let _ = js_sys::Reflect::set(
+        ctx.as_ref(),
+        &JsValue::from_str("imageSmoothingQuality"),
+        &JsValue::from_str("high"),
+    );
     ctx.draw_image_with_html_video_element_and_dw_and_dh(
         video,
         0.0,
         0.0,
-        width as f64,
-        height as f64,
+        dst_w as f64,
+        dst_h as f64,
     )
     .map_err(|e| format!("drawImage: {:?}", e))?;
+    // JPEG instead of PNG. Screenshots are photographic enough that JPEG
+    // is the right choice — 10x smaller than PNG for the same visual
+    // fidelity at q=0.85. PNG was the source of the silent-failure mode
+    // where screen-share frames pushed the request body past Anthropic's
+    // 5 MB per-image limit and the entire turn rejected.
     let data_url = canvas
-        .to_data_url_with_type("image/png")
+        .to_data_url_with_type_and_encoder_options(
+            "image/jpeg",
+            &JsValue::from_f64(JPEG_QUALITY),
+        )
         .map_err(|e| format!("toDataURL: {:?}", e))?;
     let comma = data_url
         .find(',')
         .ok_or("data URL had no comma separator".to_string())?;
-    Ok(data_url[comma + 1..].to_string())
+    let b64 = &data_url[comma + 1..];
+    // Visible-in-devtools log so we can confirm sizes once McKale shares
+    // his screen again. Format: "[screen] 1568x882 jpeg=482KB" or similar.
+    let approx_bytes = (b64.len() * 3) / 4;
+    web_sys::console::log_1(
+        &format!(
+            "[screen] {}x{} jpeg ~ {}KB (src {}x{})",
+            dst_w,
+            dst_h,
+            approx_bytes / 1024,
+            src_w,
+            src_h
+        )
+        .into(),
+    );
+    Ok(b64.to_string())
+}
+
+/// Preserve aspect ratio while capping the longer edge at `max`. Never
+/// upscales (so a 1024x768 input stays 1024x768 even if max is 1568).
+fn scale_to_max_edge(src_w: i32, src_h: i32, max: i32) -> (i32, i32) {
+    let long = src_w.max(src_h);
+    if long <= max {
+        return (src_w, src_h);
+    }
+    let scale = max as f64 / long as f64;
+    let dst_w = ((src_w as f64) * scale).round().max(1.0) as i32;
+    let dst_h = ((src_h as f64) * scale).round().max(1.0) as i32;
+    (dst_w, dst_h)
 }
 
 fn once_event(target: &web_sys::EventTarget, name: &'static str) -> js_sys::Promise {

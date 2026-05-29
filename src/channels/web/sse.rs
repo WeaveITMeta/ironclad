@@ -99,6 +99,9 @@ impl SseManager {
                     SseEvent::ApprovalNeeded { .. } => "approval_needed",
                     SseEvent::Error { .. } => "error",
                     SseEvent::Heartbeat => "heartbeat",
+                    SseEvent::SubAgentStarted { .. } => "sub_agent_started",
+                    SseEvent::SubAgentProgress { .. } => "sub_agent_progress",
+                    SseEvent::SubAgentCompleted { .. } => "sub_agent_completed",
                 };
                 Ok(Event::default()
                     .event(event_type)

@@ -1,3 +1,12 @@
+# Workspace root. jarvis-desktop sits alongside this crate so both
+# binaries land in the same target/release/ — jarvis_up's sibling-path
+# discovery (`current_exe()/../jarvis-desktop.exe`) picks it up without
+# extra configuration. The Leptos `dashboard/` is intentionally excluded
+# because its build flow runs through Trunk, not cargo.
+[workspace]
+members = [".", "jarvis-desktop"]
+exclude = ["dashboard"]
+
 [package]
 name = "ironclad"
 version = "0.1.0"
@@ -124,8 +133,11 @@ zbus = "4"
 # for the windows_desktop tool family.
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
-winvd = "0.0.46"
-# Pinned to 0.52 to match winvd 0.0.46's HWND/COM types. Without this
+# 0.0.49 ships GUID/vtable updates for Win11 24H2 build 26100.2605+;
+# McKale's machine is on 26200 and the older 0.0.46 GUIDs segfault
+# inside IServiceProvider on this build.
+winvd = "0.0.49"
+# Pinned to 0.52 to match winvd's HWND/COM types. Without this
 # pin, cargo picks 0.59 transitively and HWND becomes a *mut c_void
 # instead of an isize, breaking interop with winvd.
 windows = { version = "0.52", features = [
@@ -140,6 +152,16 @@ windows = { version = "0.52", features = [
     # without relying on the screen DC, which is why
     # windows_screenshot_foreground needs this feature.
     "Win32_Storage_Xps",
+] }
+# Second copy of the windows crate at 0.58 so the winvd_helper bin can
+# call winvd 0.0.49 (which uses windows 0.58's HWND/COM types). The rest
+# of the project stays on 0.52 — migrating the entire Win32 surface to
+# 0.58 would cascade through windows_input, windows_window, and
+# windows_screenshot. The helper is the only consumer that talks to
+# winvd directly, so the version skew is contained.
+windows_58 = { package = "windows", version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
 ] }
 
 [dev-dependencies]

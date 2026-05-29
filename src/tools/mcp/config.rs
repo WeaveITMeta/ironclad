@@ -49,10 +49,39 @@ pub struct McpServerConfig {
     /// Extra environment variables for the stdio MCP process.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub env: Option<std::collections::HashMap<String, String>>,
+
+    /// Static HTTP headers to attach to every request (HTTP transport only).
+    /// Values may reference environment variables as `${VAR}` and are
+    /// expanded at request time so secrets stay out of this file. Useful
+    /// for hosted MCPs that authenticate with a long-lived API key instead
+    /// of full OAuth.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub static_headers: Option<HashMap<String, String>>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+/// Expand `${VAR}` references in `s` against the current process
+/// environment. Unknown variables expand to an empty string.
+fn expand_env(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+            if let Some(end) = s[i + 2..].find('}') {
+                let name = &s[i + 2..i + 2 + end];
+                out.push_str(&std::env::var(name).unwrap_or_default());
+                i += 2 + end + 1;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
 }
 
 impl McpServerConfig {
@@ -67,6 +96,7 @@ impl McpServerConfig {
             command: None,
             args: None,
             env: None,
+            static_headers: None,
         }
     }
 
@@ -88,7 +118,30 @@ impl McpServerConfig {
             command: Some(command.into()),
             args: if args.is_empty() { None } else { Some(args) },
             env: None,
+            static_headers: None,
         }
+    }
+
+    /// Attach a static header (e.g. `Authorization: Bearer ...`). The value
+    /// may reference environment variables as `${VAR}`.
+    pub fn with_static_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.static_headers
+            .get_or_insert_with(HashMap::new)
+            .insert(name.into(), value.into());
+        self
+    }
+
+    /// Resolve all `${VAR}` references in the configured static headers
+    /// against the current process environment. Unset variables expand to
+    /// empty so a misconfigured header is visible (server returns 401)
+    /// rather than silently dropped.
+    pub fn resolved_static_headers(&self) -> Vec<(String, String)> {
+        let Some(ref map) = self.static_headers else {
+            return Vec::new();
+        };
+        map.iter()
+            .map(|(k, v)| (k.clone(), expand_env(v)))
+            .collect()
     }
 
     /// True if this config points at a stdio MCP (no URL, has command).

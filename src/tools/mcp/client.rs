@@ -128,6 +128,29 @@ impl McpClient {
         }
     }
 
+    /// Create a new MCP client that uses static HTTP headers from its
+    /// config (e.g. a long-lived API key) instead of OAuth. No secrets
+    /// store needed.
+    pub fn new_with_static_auth(
+        config: McpServerConfig,
+        session_manager: Arc<McpSessionManager>,
+    ) -> Self {
+        Self {
+            server_url: config.url.clone(),
+            server_name: config.name.clone(),
+            http_client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(120))
+                .build()
+                .expect("Failed to create HTTP client"),
+            next_id: AtomicU64::new(1),
+            tools_cache: RwLock::new(None),
+            session_manager: Some(session_manager),
+            secrets: None,
+            user_id: "default".to_string(),
+            server_config: Some(config),
+        }
+    }
+
     /// Create a new authenticated MCP client.
     ///
     /// Use this for hosted MCP servers that require OAuth authentication.
@@ -228,6 +251,17 @@ impl McpClient {
                 .header("Content-Type", "application/json")
                 .json(&request);
 
+            // Attach any static headers declared in the config (e.g. a
+            // hosted MCP authed by a long-lived API key). Applied first so
+            // a real OAuth token below can override the placeholder.
+            if let Some(ref cfg) = self.server_config {
+                for (name, value) in cfg.resolved_static_headers() {
+                    if !value.is_empty() {
+                        req_builder = req_builder.header(name, value);
+                    }
+                }
+            }
+
             // Add Authorization header if we have a token
             if let Some(token) = self.get_access_token().await? {
                 req_builder = req_builder.header("Authorization", format!("Bearer {}", token));
@@ -268,14 +302,20 @@ impl McpClient {
                         // response will store the new session ID via
                         // update_session_id().
                         let init = McpRequest::initialize(self.next_request_id());
-                        let init_resp = self
+                        let mut init_b = self
                             .http_client
                             .post(&self.server_url)
                             .header("Accept", "application/json, text/event-stream")
                             .header("Content-Type", "application/json")
-                            .json(&init)
-                            .send()
-                            .await;
+                            .json(&init);
+                        if let Some(ref cfg) = self.server_config {
+                            for (n, v) in cfg.resolved_static_headers() {
+                                if !v.is_empty() {
+                                    init_b = init_b.header(n, v);
+                                }
+                            }
+                        }
+                        let init_resp = init_b.send().await;
                         match init_resp {
                             Ok(r) => {
                                 let _ = self.parse_response(r).await;
@@ -285,14 +325,28 @@ impl McpClient {
                                 // requires it strictly we'll get one more
                                 // error and surface it normally.
                                 let notif = McpRequest::initialized_notification();
-                                let _ = self
+                                let mut notif_b = self
                                     .http_client
                                     .post(&self.server_url)
                                     .header("Accept", "application/json, text/event-stream")
                                     .header("Content-Type", "application/json")
-                                    .json(&notif)
-                                    .send()
-                                    .await;
+                                    .json(&notif);
+                                if let Some(ref cfg) = self.server_config {
+                                    for (n, v) in cfg.resolved_static_headers() {
+                                        if !v.is_empty() {
+                                            notif_b = notif_b.header(n, v);
+                                        }
+                                    }
+                                }
+                                let _ = notif_b.send().await;
+                                // CRITICAL: mark the session as initialized
+                                // again. Without this, the next call_tool's
+                                // initialize() short-circuit fails and we
+                                // send a duplicate `initialize` request,
+                                // which Playwright 400s with "Server already
+                                // initialized". That was the cascade the
+                                // user kept hitting after a 404 self-heal.
+                                sm.mark_initialized(&self.server_name).await;
                                 continue;
                             }
                             Err(e) => {
@@ -668,19 +722,32 @@ impl Tool for McpToolWrapper {
         // Use the original tool name (without prefix) for the actual call
         let result = self.client.call_tool(&self.tool.name, params).await?;
 
-        // Convert content blocks to a single result
-        let content: String = result
-            .content
-            .iter()
-            .filter_map(|block| block.as_text())
-            .collect::<Vec<_>>()
-            .join("\n");
+        // Split content blocks two ways:
+        //   - Text → concatenated into the textual tool result the model
+        //     sees as the body of the tool_result message.
+        //   - Image → base64 PNG/JPEG data harvested into a separate
+        //     vec, which the agent loop attaches as Image content
+        //     blocks alongside the tool_result. Without this, calling
+        //     `browser_take_screenshot` returned only the text wrapper
+        //     ("### Result\n- Screenshot saved to ...") and Claude
+        //     never received the pixels — defeating the entire vision
+        //     pathway through Playwright.
+        let mut text_parts: Vec<&str> = Vec::new();
+        let mut images: Vec<String> = Vec::new();
+        for block in &result.content {
+            if let Some(t) = block.as_text() {
+                text_parts.push(t);
+            } else if let Some(b64) = block.as_image_base64() {
+                images.push(b64.to_string());
+            }
+        }
+        let content = text_parts.join("\n");
 
         if result.is_error {
             return Err(ToolError::ExecutionFailed(content));
         }
 
-        Ok(ToolOutput::text(content, start.elapsed()))
+        Ok(ToolOutput::text(content, start.elapsed()).with_images(images))
     }
 
     fn requires_sanitization(&self) -> bool {

@@ -2,7 +2,7 @@
 
 ## Identity
 - **Name:** McKale Olson (Simbuilder)
-- **DOB:** April 19, 1998 (Age 27)
+- **DOB:** April 19, 1998 (Age 28)
 - **Location:** Tucson, Arizona
 - **Status:** Homeowner (mortgage), single, romantically interested
 - **Health:** Good
@@ -19,11 +19,8 @@ Money — no startups generating revenue yet. Taxes owed. Mortgage to maintain.
 Complete financial independence, taxes paid off, mortgage current, living in my house, successful startups.
 
 ## Work
-- Founder/CEO of Summit Studios Games LLC
-- Vehicle Simulator on Roblox — 500M+ visits, 34K+ Discord, Mattel partnership
-- 13 active startups across multiple industries (see vault: Work/Companies/)
-- RDC speaker (San Francisco, Amsterdam)
-- Uses Windsurf IDE with AI-boosted development (54x productivity)
+- Founder/CEO of McKaleOlson.com
+- 15 active startups across multiple industries (see vault: Work/Companies/)
 
 ## Life System
 Obsidian vault at `C:\Users\miksu\Documents\Olson` with 12 pillars:

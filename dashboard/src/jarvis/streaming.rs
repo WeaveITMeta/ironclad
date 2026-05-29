@@ -77,6 +77,12 @@ pub struct StreamingStt {
     /// `StreamingStt` `Some` in the cell, on_utterance kept calling
     /// `finalize()` on a dead control stream, and the user got silence.
     alive: Rc<Cell<bool>>,
+    /// Single error-catch closure shared across every datagram/control
+    /// write `.catch()`. Earlier we built `Closure::once` per call and
+    /// `.forget()`d it — at ~67 datagrams/sec that leaked ~20k closures
+    /// per 5-minute conversation. One closure, lifetime of the session.
+    /// js_sys::Promise::catch takes `&Closure<dyn FnMut(JsValue)>`.
+    shared_err_handler: Closure<dyn FnMut(JsValue)>,
 }
 
 impl StreamingStt {
@@ -194,11 +200,16 @@ impl StreamingStt {
         let on_event = Rc::new(RefCell::new(on_event));
         spawn_local(read_inbound_loop(incoming, on_event));
 
+        let shared_err_handler = Closure::wrap(Box::new(|e: JsValue| {
+            console_log(&format!("[stream-stt] WT write rejected: {:?}", e));
+        }) as Box<dyn FnMut(JsValue)>);
+
         Ok(Self {
             transport,
             datagram_writer,
             control_writer,
             alive,
+            shared_err_handler,
         })
     }
 
@@ -236,14 +247,14 @@ impl StreamingStt {
             ));
         }
 
-        // Attach an error catch on the promise so rejected writes surface
-        // instead of vanishing into the void.
+        // Attach an error catch on the promise so rejected writes
+        // surface instead of vanishing into the void. We share a single
+        // closure for the lifetime of the StreamingStt rather than
+        // allocating a fresh `Closure::once` per send_audio — at ~67
+        // calls/sec, the old per-call .forget() leaked ~20k closures
+        // per 5-minute conversation.
         if let Ok(promise) = promise.dyn_into::<Promise>() {
-            let on_err = Closure::once(Box::new(|e: JsValue| {
-                console_log(&format!("[stream-stt] datagram write rejected: {:?}", e));
-            }) as Box<dyn FnOnce(JsValue)>);
-            let _ = promise.catch(&on_err);
-            on_err.forget();
+            let _ = promise.catch(&self.shared_err_handler);
         }
         Ok(())
     }
@@ -259,15 +270,11 @@ impl StreamingStt {
         let promise = write_fn
             .call1(&self.control_writer, &bytes)
             .map_err(|e| format!("control write() call: {:?}", e))?;
-        // Attach a catch so a WT-close-mid-write doesn't bubble as an
-        // unhandled rejection ("WebTransportError: Connection lost") in
-        // the browser console.
+        // Attach the shared catch so a WT-close-mid-write doesn't
+        // bubble as an unhandled rejection ("WebTransportError:
+        // Connection lost") in the browser console.
         if let Ok(promise) = promise.dyn_into::<Promise>() {
-            let on_err = Closure::once(Box::new(|e: JsValue| {
-                console_log(&format!("[stream-stt] control write rejected: {:?}", e));
-            }) as Box<dyn FnOnce(JsValue)>);
-            let _ = promise.catch(&on_err);
-            on_err.forget();
+            let _ = promise.catch(&self.shared_err_handler);
         }
         Ok(())
     }

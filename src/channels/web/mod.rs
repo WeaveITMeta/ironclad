@@ -43,6 +43,23 @@ use self::server::GatewayState;
 use self::sse::SseManager;
 use self::types::SseEvent;
 
+/// Build the shared `reqwest::Client` used for ElevenLabs TTS calls.
+/// reqwest pools idle keep-alive connections by host, so subsequent
+/// `voice/tts_stream` requests skip TCP+TLS setup (~150 ms RTT) and
+/// land directly on a warm HTTP/2 stream. 120 s timeout matches what
+/// the previous per-request client used.
+fn build_tts_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        // 90 s idle — ElevenLabs' edge keeps HTTP/2 connections alive
+        // ~120 s, so we time out a touch earlier to avoid the race
+        // where reqwest reuses a connection the server's about to drop.
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .pool_max_idle_per_host(4)
+        .build()
+        .expect("build pooled tts client")
+}
+
 /// Web gateway channel implementing the Channel trait.
 pub struct GatewayChannel {
     config: GatewayConfig,
@@ -79,6 +96,7 @@ impl GatewayChannel {
             shutdown_tx: tokio::sync::RwLock::new(None),
             ws_tracker: Some(Arc::new(ws::WsConnectionTracker::new())),
             voice: VoiceConfig::default(),
+            tts_client: build_tts_client(),
             auth_token: auth_token.clone(),
         });
 
@@ -104,6 +122,7 @@ impl GatewayChannel {
             shutdown_tx: tokio::sync::RwLock::new(None),
             ws_tracker: self.state.ws_tracker.clone(),
             voice: self.state.voice.clone(),
+            tts_client: self.state.tts_client.clone(),
             auth_token: self.state.auth_token.clone(),
         };
         mutate(&mut new_state);
@@ -232,6 +251,21 @@ impl Channel for GatewayChannel {
                 description,
                 parameters: serde_json::to_string_pretty(&parameters)
                     .unwrap_or_else(|_| parameters.to_string()),
+            },
+            StatusUpdate::SubAgentStarted { id, label, kind } => {
+                SseEvent::SubAgentStarted { id, label, kind }
+            }
+            StatusUpdate::SubAgentProgress { id, message } => {
+                SseEvent::SubAgentProgress { id, message }
+            }
+            StatusUpdate::SubAgentCompleted {
+                id,
+                success,
+                summary,
+            } => SseEvent::SubAgentCompleted {
+                id,
+                success,
+                summary,
             },
         };
 

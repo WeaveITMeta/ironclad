@@ -117,26 +117,73 @@ fn build_system_prompt(task: &str, allowed_tools: &[Arc<dyn Tool>]) -> String {
     )
 }
 
+/// Per-name conversation history for sub-agents that carry context
+/// across calls. The friendly identity from `agent_names::identify` (or
+/// whatever the caller passes as `name`) keys this map: subsequent
+/// spawns with the same name receive the prior turns in their initial
+/// message list, so "Memory Diver" stops re-introducing herself every
+/// time and can build on what she did before.
+///
+/// Stored entirely in memory: gateway restart drops everything. Cap is
+/// MAX_HISTORY_MESSAGES so a long-lived identity can't blow context.
+#[derive(Default)]
+pub struct SubAgentSessions {
+    inner: tokio::sync::RwLock<std::collections::HashMap<String, Vec<ChatMessage>>>,
+}
+
+const MAX_HISTORY_MESSAGES: usize = 20;
+
+impl SubAgentSessions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    async fn load(&self, name: &str) -> Vec<ChatMessage> {
+        self.inner
+            .read()
+            .await
+            .get(name)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    async fn save(&self, name: &str, messages: Vec<ChatMessage>) {
+        let mut trimmed = messages;
+        // Keep the head (system + first user) intact and trim the
+        // middle. Without this, repeated calls with a name eventually
+        // include every prior turn — costly and noisy. 20 messages is
+        // ~10 turn pairs, enough to reference "what we did last time"
+        // without ballooning context.
+        if trimmed.len() > MAX_HISTORY_MESSAGES {
+            let head = trimmed.drain(..2).collect::<Vec<_>>();
+            let tail_keep = MAX_HISTORY_MESSAGES.saturating_sub(2);
+            let drop_n = trimmed.len().saturating_sub(tail_keep);
+            trimmed.drain(..drop_n);
+            let mut out = head;
+            out.extend(trimmed);
+            trimmed = out;
+        }
+        self.inner
+            .write()
+            .await
+            .insert(name.to_string(), trimmed);
+    }
+}
+
 pub struct SpawnAgentTool {
     registry: Arc<ToolRegistry>,
+    haiku: Arc<dyn LlmProvider>,
     sonnet: Arc<dyn LlmProvider>,
     opus: Arc<dyn LlmProvider>,
-    /// Used by the background task to broadcast the completed sub-agent
-    /// result back to the user as an unsolicited assistant message. Without
-    /// this we'd have to block the main agent loop; with it, McKale can
-    /// keep talking to JARVIS while sub-agents work, and results land
-    /// as "Hey, the WeaveITMeta triage just finished, here's the headline."
     channels: Arc<ChannelManager>,
-    /// Shared with the existing `list_jobs` / `job_status` / `cancel_job`
-    /// tools. Every sub-agent spawn registers as a real Iron Clad job so
-    /// McKale can ask "what's running?" and get a unified list (sub-agents,
-    /// scheduled work, marketplace jobs, all the same table).
     context_manager: Arc<ContextManager>,
+    sessions: Arc<SubAgentSessions>,
 }
 
 impl SpawnAgentTool {
     pub fn new(
         registry: Arc<ToolRegistry>,
+        haiku: Arc<dyn LlmProvider>,
         sonnet: Arc<dyn LlmProvider>,
         opus: Arc<dyn LlmProvider>,
         channels: Arc<ChannelManager>,
@@ -144,10 +191,12 @@ impl SpawnAgentTool {
     ) -> Self {
         Self {
             registry,
+            haiku,
             sonnet,
             opus,
             channels,
             context_manager,
+            sessions: Arc::new(SubAgentSessions::new()),
         }
     }
 }
@@ -189,9 +238,9 @@ impl Tool for SpawnAgentTool {
                 },
                 "model": {
                     "type": "string",
-                    "enum": ["sonnet", "opus"],
+                    "enum": ["haiku", "sonnet", "opus"],
                     "default": "sonnet",
-                    "description": "Sonnet 4.6 for most reasoning. Opus 4.7 for hardest tasks (code review, deep research, strategy)."
+                    "description": "Haiku 4.5 for cheap parallel work at the same tier as main JARVIS (4-8 parallel reads, simple summaries). Sonnet 4.6 for most reasoning (default). Opus 4.7 for hardest tasks (code review, deep research, strategy)."
                 },
                 "tools": {
                     "type": "array",
@@ -211,6 +260,15 @@ impl Tool for SpawnAgentTool {
                     "default": 8000,
                     "maximum": 64000,
                     "description": "Per-LLM-call max_tokens for the sub-agent's responses."
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Persistent identity for this sub-agent. When set, the prior \
+                                    conversation under the same name is loaded so the agent \
+                                    builds on what it did before (e.g. 'Memory Diver' \
+                                    remembers her last search and refines it). Same name \
+                                    reuses the same sub-agent card in the right panel. \
+                                    Omit for a one-shot fresh agent."
                 }
             },
             "required": ["task"]
@@ -253,6 +311,15 @@ impl Tool for SpawnAgentTool {
             .unwrap_or(env_max_tokens)
             .min(64000) as u32;
 
+        // Optional persistent-identity name. When present, we hydrate
+        // the sub-agent's message list with whatever it did in prior
+        // turns under the same name. Empty/missing → one-shot agent.
+        let session_name = params
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         let tool_names: Vec<String> = params
             .get("tools")
             .and_then(|v| v.as_array())
@@ -265,6 +332,7 @@ impl Tool for SpawnAgentTool {
 
         // Provider selection.
         let (provider, model_label) = match model_choice.as_str() {
+            "haiku" => (Arc::clone(&self.haiku), "claude-haiku-4-5"),
             "opus" => (Arc::clone(&self.opus), "claude-opus-4-7"),
             _ => (Arc::clone(&self.sonnet), "claude-sonnet-4-6"),
         };
@@ -381,6 +449,8 @@ impl Tool for SpawnAgentTool {
         let user_id_bg = user_id.clone();
         let allowed_tools_bg = allowed_tools.clone();
         let tool_defs_bg = tool_defs.clone();
+        let sessions_bg = Arc::clone(&self.sessions);
+        let session_name_bg = session_name.clone();
 
         // === FIRE-AND-FORGET ===
         //
@@ -391,9 +461,49 @@ impl Tool for SpawnAgentTool {
         // the gateway channel — the dashboard receives it as a normal
         // SseEvent::Response and TTS reads the headline aloud.
         tokio::spawn(async move {
-            let mut messages =
-                vec![ChatMessage::system(build_system_prompt(&task_for_bg, &allowed_tools_bg)),
-                     ChatMessage::user(&task_for_bg)];
+            // Hydrate the message list. If a `name` was provided and we
+            // have a saved transcript for that identity, prepend it so
+            // the sub-agent picks up where it left off. The new user
+            // turn (the current `task`) is always appended last.
+            let mut messages: Vec<ChatMessage> = if let Some(ref n) = session_name_bg {
+                let prior = sessions_bg.load(n).await;
+                if prior.is_empty() {
+                    vec![
+                        ChatMessage::system(build_system_prompt(&task_for_bg, &allowed_tools_bg)),
+                        ChatMessage::user(&task_for_bg),
+                    ]
+                } else {
+                    // Reuse the prior system + history, just add the
+                    // new task as the next user turn. The system prompt
+                    // is regenerated to reflect the current allowed
+                    // tools (which may differ from last spawn) — drop
+                    // the stored system message and substitute fresh.
+                    let mut hydrated = Vec::with_capacity(prior.len() + 2);
+                    hydrated.push(ChatMessage::system(build_system_prompt(
+                        &task_for_bg,
+                        &allowed_tools_bg,
+                    )));
+                    // Skip the prior system message (index 0); keep the
+                    // rest. If the prior history doesn't start with
+                    // system, take everything.
+                    let skip = if matches!(
+                        prior.first(),
+                        Some(m) if matches!(m.role, crate::llm::Role::System)
+                    ) {
+                        1
+                    } else {
+                        0
+                    };
+                    hydrated.extend(prior.into_iter().skip(skip));
+                    hydrated.push(ChatMessage::user(&task_for_bg));
+                    hydrated
+                }
+            } else {
+                vec![
+                    ChatMessage::system(build_system_prompt(&task_for_bg, &allowed_tools_bg)),
+                    ChatMessage::user(&task_for_bg),
+                ]
+            };
 
             let bg_ctx = JobContext::with_user(
                 &user_id_bg,
@@ -555,6 +665,18 @@ impl Tool for SpawnAgentTool {
                 .await
             {
                 tracing::warn!(job_id = %job_id_bg, error = ?e, "broadcasting sub-agent result failed");
+            }
+
+            // Persist the conversation under the identity name so the
+            // next spawn with the same name resumes here. Append the
+            // final assistant summary as a synthetic message so the
+            // next turn sees what we concluded last time. If no name
+            // was provided, this is a no-op.
+            if let Some(name) = session_name_bg {
+                if llm_error.is_none() && !summary.is_empty() {
+                    messages.push(ChatMessage::assistant(&summary));
+                }
+                sessions_bg.save(&name, messages).await;
             }
         });
 

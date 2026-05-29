@@ -123,6 +123,45 @@ fn validate_path(path_str: &str, base_dir: Option<&Path>) -> Result<PathBuf, Too
     Ok(resolved)
 }
 
+/// Translate a raw `std::io::Error` for a filesystem operation into an
+/// LLM-readable message. The default `Display` impl just says
+/// "Access is denied. (os error 5)" which gives JARVIS nothing to act
+/// on. We surface the path and classify the most common Windows codes
+/// (ERROR_ACCESS_DENIED=5, ERROR_FILE_NOT_FOUND=2, ERROR_PATH_NOT_FOUND=3,
+/// ERROR_SHARING_VIOLATION=32, ERROR_LOCK_VIOLATION=33).
+fn classify_io_error(path: &Path, op: &str, err: &std::io::Error) -> String {
+    let raw = err.raw_os_error();
+    let kind = err.kind();
+    let hint = match (raw, kind) {
+        (Some(5), _) => Some(
+            "access denied — likely a file owned by another user, a system \
+             file (Program Files, Windows\\System32), or a path the agent \
+             process doesn't have permission for. Try a path inside your \
+             workspace or run ironclad elevated if the file truly requires \
+             admin",
+        ),
+        (Some(32), _) | (Some(33), _) => Some(
+            "file is locked by another process (Excel, an editor, a build \
+             that's still running). Close the locking app and retry",
+        ),
+        (Some(2), _) | (Some(3), _) | (_, std::io::ErrorKind::NotFound) => Some(
+            "no such file or directory at that path. Check spelling and \
+             whether you meant a relative or absolute path",
+        ),
+        _ => None,
+    };
+    match hint {
+        Some(h) => format!(
+            "{op} '{}' failed: {} ({}). {}",
+            path.display(),
+            err,
+            raw.map(|c| c.to_string()).unwrap_or_else(|| format!("{kind:?}")),
+            h
+        ),
+        None => format!("{op} '{}' failed: {}", path.display(), err),
+    }
+}
+
 /// Read file contents tool.
 #[derive(Debug, Default)]
 pub struct ReadFileTool {
@@ -191,9 +230,20 @@ impl Tool for ReadFileTool {
         let path = validate_path(path_str, self.base_dir.as_deref())?;
 
         // Check file size
-        let metadata = fs::metadata(&path)
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Cannot access file: {}", e)))?;
+        let metadata = fs::metadata(&path).await.map_err(|e| {
+            ToolError::ExecutionFailed(classify_io_error(&path, "stat", &e))
+        })?;
+
+        // Windows happily lets you call read_to_string on a directory
+        // and then returns "Access is denied (os error 5)" deep in the
+        // wrapped error, which is what just confused the autonomous loop.
+        // Catch it up front and point at the right tool.
+        if metadata.is_dir() {
+            return Err(ToolError::ExecutionFailed(format!(
+                "'{}' is a directory, not a file. Use list_dir to inspect it.",
+                path.display()
+            )));
+        }
 
         if metadata.len() > MAX_READ_SIZE {
             return Err(ToolError::ExecutionFailed(format!(
@@ -204,9 +254,9 @@ impl Tool for ReadFileTool {
         }
 
         // Read file
-        let content = fs::read_to_string(&path)
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to read file: {}", e)))?;
+        let content = fs::read_to_string(&path).await.map_err(|e| {
+            ToolError::ExecutionFailed(classify_io_error(&path, "read", &e))
+        })?;
 
         // Apply offset and limit
         let lines: Vec<&str> = content.lines().collect();

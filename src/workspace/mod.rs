@@ -329,11 +329,20 @@ impl Workspace {
     pub async fn system_prompt(&self) -> Result<String, WorkspaceError> {
         let mut parts = Vec::new();
 
-        // Load identity files in order of importance
+        // Load identity files in order of importance. CLIENT-PROFILE,
+        // CLIENT-DOSSIER, VAULT-SUMMARY, and WISHLIST are synced from the
+        // vault on every boot via bootstrap_jarvis_identity(), so JARVIS
+        // always opens a session already knowing McKale's full profile,
+        // operational state, vault layout, and stated wishes.
         let identity_files = [
             (paths::AGENTS, "## Agent Instructions"),
             (paths::SOUL, "## Core Values"),
             (paths::USER, "## User Context"),
+            (paths::CLIENT_PROFILE, "## Client Profile"),
+            (paths::CLIENT_DOSSIER, "## Client Dossier"),
+            (paths::VAULT_SUMMARY, "## Vault Map"),
+            (paths::WISHLIST, "## User Wishlist"),
+            (paths::MY_TOOLKIT, "## User Toolkit"),
             (paths::IDENTITY, "## Identity"),
             (paths::TOOLS, "## Tools Available"),
         ];

@@ -1,5 +1,17 @@
 [alias]
-# `cargo run-jarvis` — boot Playwright MCP (:8931), Trunk dashboard (:3000),
-# and Iron Clad with the web gateway (:3030) as one orchestrated process.
-# Ctrl+C tears all three down.
+# `cargo run-jarvis` — boot Playwright MCPs, Parakeet STT sidecar(s),
+# Iron Clad gateway on :3030, and the native jarvis-desktop overlay
+# (always-on-top arc-reactor + global hotkeys + tray) as one
+# orchestrated process. Ctrl+C tears everything down.
+#
+# Trunk (Leptos dashboard on :3000) is run separately in another terminal
+# because it can't be supervised cleanly under tokio on Windows.
+#
+# To run without the desktop overlay (e.g. headless server / CI):
+#   $env:JARVIS_DESKTOP_ENABLED = "false"; cargo run-jarvis
 run-jarvis = "run --release --bin jarvis_up --"
+
+# `cargo build-jarvis` — build the orchestrator AND the desktop overlay
+# binaries together. Useful before the first `cargo run-jarvis` after
+# pulling so the sibling-path lookup finds jarvis-desktop.exe ready.
+build-jarvis = "build --release --workspace --bins"

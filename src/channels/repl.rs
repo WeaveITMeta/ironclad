@@ -472,6 +472,28 @@ impl Channel for ReplChannel {
                 eprintln!("  {bot_border}");
                 eprintln!();
             }
+            StatusUpdate::SubAgentStarted { id, label, kind } => {
+                let short = id.get(..8).unwrap_or(&id);
+                eprintln!("  \x1b[35m\u{25C6} sub-agent [{kind}] {label} ({short})\x1b[0m");
+            }
+            StatusUpdate::SubAgentProgress { id, message } => {
+                if debug {
+                    let short = id.get(..8).unwrap_or(&id);
+                    eprintln!("  \x1b[35m\u{25C7} ({short}) {message}\x1b[0m");
+                }
+            }
+            StatusUpdate::SubAgentCompleted {
+                id,
+                success,
+                summary,
+            } => {
+                let short = id.get(..8).unwrap_or(&id);
+                if success {
+                    eprintln!("  \x1b[32m\u{25C6} sub-agent {short} done — {summary}\x1b[0m");
+                } else {
+                    eprintln!("  \x1b[31m\u{25C6} sub-agent {short} failed — {summary}\x1b[0m");
+                }
+            }
         }
         Ok(())
     }

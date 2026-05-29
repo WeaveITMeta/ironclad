@@ -1858,6 +1858,28 @@ fn status_to_wit(status: &StatusUpdate, metadata: &serde_json::Value) -> wit_cha
             message: format!("Approval needed: {} - {}", tool_name, description),
             metadata_json,
         },
+        StatusUpdate::SubAgentStarted { id, label, kind } => wit_channel::StatusUpdate {
+            status: wit_channel::StatusType::ToolStarted,
+            message: format!("sub_agent[{kind}] {label} ({id})"),
+            metadata_json,
+        },
+        StatusUpdate::SubAgentProgress { id, message } => wit_channel::StatusUpdate {
+            status: wit_channel::StatusType::Thinking,
+            message: format!("sub_agent({id}) {message}"),
+            metadata_json,
+        },
+        StatusUpdate::SubAgentCompleted {
+            id,
+            success,
+            summary,
+        } => wit_channel::StatusUpdate {
+            status: wit_channel::StatusType::ToolCompleted,
+            message: format!(
+                "sub_agent({id}) {}: {summary}",
+                if *success { "ok" } else { "failed" }
+            ),
+            metadata_json,
+        },
     }
 }
 

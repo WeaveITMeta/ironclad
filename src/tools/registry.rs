@@ -12,13 +12,13 @@ use crate::safety::SafetyLayer;
 use crate::tools::builder::{BuildSoftwareTool, BuilderConfig, LlmSoftwareBuilder};
 use crate::tools::builtin::{
     ApplyPatchTool, CancelJobTool, CreateJobTool, EchoTool, GithubGetPrTool, GithubListIssuesTool,
-    ClaudeCodeTranscriptTailTool, GithubListPrsTool, GithubListReposTool, GithubRecentCommitsTool,
-    HttpTool, JobStatusTool, JsonTool, ListDirTool, ListJobsTool, MemoryReadTool, MemorySearchTool,
-    MemoryTreeTool, MemoryWriteTool, OpenAppTool, OpenUrlTool, ReadFileTool, ShellTool,
-    SpawnAgentTool, TimeTool, ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool,
-    ToolRemoveTool, ToolSearchTool, ListMyToolsTool, MissionLookupTool, RecentLogsTool,
-    VaultDeleteTool, VaultListTool, VaultMoveTool, VaultReadTool, VaultSearchTool, VaultWriteTool,
-    WriteFileTool,
+    ClaudeCodeTranscriptTailTool, FeedbackLogReadTool, FeedbackLogWriteTool, GithubListPrsTool,
+    GithubListReposTool, GithubRecentCommitsTool, HttpTool, JobStatusTool, JsonTool, ListDirTool,
+    ListJobsTool, MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool, OpenAppTool,
+    OpenUrlTool, ReadFileTool, ShellTool, SpawnAgentTool, TimeTool, ToolActivateTool, ToolAuthTool,
+    ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool, ListMyToolsTool,
+    MissionLookupTool, RecentLogsTool, VaultDeleteTool, VaultListTool, VaultMoveTool, VaultReadTool,
+    VaultSearchTool, VaultWriteTool, WeatherTool, WriteFileTool,
 };
 use crate::tools::tool::Tool;
 use crate::tools::wasm::{
@@ -125,6 +125,8 @@ impl ToolRegistry {
         self.register_sync(Arc::new(OpenAppTool));
         // Autonomous loop window into the active Claude Code session.
         self.register_sync(Arc::new(ClaudeCodeTranscriptTailTool));
+        // Weather data via Open-Meteo (no API key, free).
+        self.register_sync(Arc::new(WeatherTool::new()));
 
         tracing::info!("Registered {} built-in tools", self.count());
     }
@@ -152,9 +154,13 @@ impl ToolRegistry {
         self.register_sync(Arc::new(MemorySearchTool::new(Arc::clone(&workspace))));
         self.register_sync(Arc::new(MemoryWriteTool::new(Arc::clone(&workspace))));
         self.register_sync(Arc::new(MemoryReadTool::new(Arc::clone(&workspace))));
-        self.register_sync(Arc::new(MemoryTreeTool::new(workspace)));
+        self.register_sync(Arc::new(MemoryTreeTool::new(Arc::clone(&workspace))));
+        // Feedback loop — persistent learning across turns. Same
+        // workspace handle so entries land alongside memory/identity.
+        self.register_sync(Arc::new(FeedbackLogWriteTool::new(Arc::clone(&workspace))));
+        self.register_sync(Arc::new(FeedbackLogReadTool::new(workspace)));
 
-        tracing::info!("Registered 4 memory tools");
+        tracing::info!("Registered 4 memory tools + 2 feedback log tools");
     }
 
     /// Register job management tools.
@@ -259,16 +265,23 @@ impl ToolRegistry {
     /// in a void.
     pub fn register_spawn_agent_tool(
         self: &Arc<Self>,
+        haiku: Arc<dyn LlmProvider>,
         sonnet: Arc<dyn LlmProvider>,
         opus: Arc<dyn LlmProvider>,
         channels: Arc<crate::channels::ChannelManager>,
         context_manager: Arc<crate::context::ContextManager>,
     ) {
-        let tool =
-            SpawnAgentTool::new(Arc::clone(self), sonnet, opus, channels, context_manager);
+        let tool = SpawnAgentTool::new(
+            Arc::clone(self),
+            haiku,
+            sonnet,
+            opus,
+            channels,
+            context_manager,
+        );
         self.register_sync(Arc::new(tool));
         tracing::info!(
-            "Registered spawn_agent (Sonnet + Opus sub-agents, fire-and-forget, job-tracked)"
+            "Registered spawn_agent (Haiku + Sonnet + Opus sub-agents, fire-and-forget, job-tracked)"
         );
     }
 

@@ -47,6 +47,18 @@ fn client() -> Result<Client, ToolError> {
 }
 
 async fn get_json(url: &str) -> Result<Value, ToolError> {
+    match get_json_opt(url).await? {
+        Some(v) => Ok(v),
+        None => Err(ToolError::ExecutionFailed(format!(
+            "GitHub returned 404 Not Found for {url}"
+        ))),
+    }
+}
+
+/// Same as `get_json` but treats 404 as `Ok(None)` so the caller can
+/// fall back (e.g. try `/users/{name}/repos` after `/orgs/{name}/repos`
+/// 404s for a personal account masquerading as an org).
+async fn get_json_opt(url: &str) -> Result<Option<Value>, ToolError> {
     let token = pat()?;
     let resp = client()?
         .get(url)
@@ -56,8 +68,11 @@ async fn get_json(url: &str) -> Result<Value, ToolError> {
         .send()
         .await
         .map_err(|e| ToolError::ExecutionFailed(format!("GET {url}: {e}")))?;
-    if !resp.status().is_success() {
-        let code = resp.status();
+    let code = resp.status();
+    if code == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !code.is_success() {
         let body = resp.text().await.unwrap_or_default();
         return Err(ToolError::ExecutionFailed(format!(
             "GitHub returned {code} for {url}: {body}"
@@ -66,6 +81,7 @@ async fn get_json(url: &str) -> Result<Value, ToolError> {
     resp.json::<Value>()
         .await
         .map_err(|e| ToolError::ExecutionFailed(format!("decode {url}: {e}")))
+        .map(Some)
 }
 
 // ============================================================
@@ -81,9 +97,11 @@ impl Tool for GithubListReposTool {
     }
 
     fn description(&self) -> &str {
-        "List repositories in a GitHub organization. Defaults to GITHUB_DEFAULT_ORG. \
-         Returns name, description, default_branch, open_issues_count, updated_at for each. \
-         Use this to discover what's in scope before triaging."
+        "List repositories belonging to a GitHub org OR user (e.g. \
+         'WeaveITMeta' may be either). Defaults to GITHUB_DEFAULT_ORG. \
+         Tries `/orgs/<name>/repos` first, falls back to `/users/<name>/repos` \
+         on 404 so personal accounts work transparently. Returns name, \
+         description, default_branch, open_issues_count, updated_at."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -117,8 +135,21 @@ impl Tool for GithubListReposTool {
                 )
             })?;
         let per_page = params.get("per_page").and_then(|v| v.as_u64()).unwrap_or(30).min(100);
-        let url = format!("{API_BASE}/orgs/{org}/repos?per_page={per_page}");
-        let body = get_json(&url).await?;
+
+        // Try the org endpoint first. If GitHub returns 404, the name is
+        // almost certainly a personal account, not an organization, so
+        // retry against /users/{name}/repos. This is what's happening
+        // with WeaveITMeta which owns repos as a user, not an org.
+        let org_url = format!("{API_BASE}/orgs/{org}/repos?per_page={per_page}");
+        let (body, account_kind) = match get_json_opt(&org_url).await? {
+            Some(v) => (v, "org"),
+            None => {
+                let user_url = format!("{API_BASE}/users/{org}/repos?per_page={per_page}");
+                let v = get_json(&user_url).await?;
+                (v, "user")
+            }
+        };
+
         let trimmed = body
             .as_array()
             .map(|arr| {
@@ -139,7 +170,12 @@ impl Tool for GithubListReposTool {
             })
             .unwrap_or_default();
         Ok(ToolOutput::success(
-            serde_json::json!({ "org": org, "repos": trimmed, "count": trimmed.len() }),
+            serde_json::json!({
+                "owner": org,
+                "owner_kind": account_kind,
+                "repos": trimmed,
+                "count": trimmed.len(),
+            }),
             start.elapsed(),
         ))
     }

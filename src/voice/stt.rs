@@ -61,7 +61,12 @@ pub async fn transcribe_via_server(base: &str, audio: &[u8]) -> Result<String, V
         .send()
         .await
         .map_err(|e| VoiceError::Subprocess {
-            bin: "whisper-server".into(),
+            // Renamed from "whisper-server" — the sidecar can be
+            // whisper.cpp OR parakeet (both expose a whisper-compatible
+            // /inference endpoint), and the misleading name had McKale
+            // chasing a phantom subprocess crash that was really just
+            // parakeet still loading its model.
+            bin: "stt-server".into(),
             code: -1,
             stderr: format!("POST {url}: {e}"),
         })?;
@@ -70,7 +75,12 @@ pub async fn transcribe_via_server(base: &str, audio: &[u8]) -> Result<String, V
         let code = resp.status().as_u16() as i32;
         let body = resp.text().await.unwrap_or_default();
         return Err(VoiceError::Subprocess {
-            bin: "whisper-server".into(),
+            // Renamed from "whisper-server" — the sidecar can be
+            // whisper.cpp OR parakeet (both expose a whisper-compatible
+            // /inference endpoint), and the misleading name had McKale
+            // chasing a phantom subprocess crash that was really just
+            // parakeet still loading its model.
+            bin: "stt-server".into(),
             code,
             stderr: body,
         });

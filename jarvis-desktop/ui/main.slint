@@ -1,0 +1,2013 @@
+// JARVIS desktop UI.
+//
+// Native Slint, two modes (floating widget + expandable HUD), driven
+// by the Rust side. Designed to **beat** the Leptos dashboard for
+// daily use: full scrollback transcript, real text input, native drag,
+// global hotkeys, embedded taskbar icon, always-on-top across all
+// workspaces, native audio I/O with halt-on-barge-in. Markdown
+// rendering at block level.
+
+import { ScrollView, LineEdit } from "std-widgets.slint";
+
+// -------------------- types ------------------------------------------------
+
+// One row in the transcript. `kind` is a small enum encoded as a string
+// because Slint's struct properties can't take enum values yet.
+/// One row in the sidebar conversation list.
+export struct ConversationRow {
+    id: string,
+    title: string,
+    subtitle: string,
+    is_active: bool,
+}
+
+export struct TranscriptEntry {
+    // "user" | "jarvis" | "tool" | "status"
+    kind: string,
+    // The renderable body. Block-level: \n separates lines, headers
+    // come prefixed with "#", bullets with "•".
+    body: string,
+    // Header rank (1-3) for h1/h2/h3 styling; 0 for non-header.
+    header_rank: int,
+    // True if this whole block is code-fenced.
+    is_code: bool,
+    // True if this is a bullet line.
+    is_bullet: bool,
+    // True if the text run should render bold (whole-block or inline).
+    is_bold: bool,
+    // Optional timestamp short string ("12:34").
+    timestamp: string,
+    // True if this row is a mid-paragraph continuation of the previous
+    // row. The renderer tightens vertical spacing and drops the bubble
+    // chrome so inline-emphasis runs visually read as one paragraph.
+    continues_prev: bool,
+}
+
+/// One row in the Sub-Agents panel. Populated by SubAgentStarted SSE
+/// events, mutated by SubAgentProgress, marked done by
+/// SubAgentCompleted. Rows linger after completion so the user can
+/// scroll back through what just happened.
+export struct SubAgentRow {
+    // The friendly identity name ("Memory Diver", "Browser Pilot")
+    // is now the persistent key. Cards are looked up by name; a
+    // re-invocation of `memory_search` finds the existing "Memory
+    // Diver" card and increments turn_count instead of pushing a
+    // new card. Context preservation is attributed to the name.
+    id: string,
+    label: string,
+    // The raw tool name (e.g. "memory_search") of the LAST call.
+    tool_name: string,
+    // Short uppercase category badge ("MEMORY", "WEB", "FILES", …).
+    category: string,
+    // Current status — latest progress, or final summary.
+    status: string,
+    // "running" | "ok" | "fail"
+    state: string,
+    // True once SubAgentCompleted has arrived for the latest call.
+    done: bool,
+    // How many times this named identity has been invoked in this
+    // session. Card header shows it as "· N" so you can see at a
+    // glance which sub-agents have been doing heavy lifting.
+    turn_count: int,
+    tint_r: int,
+    tint_g: int,
+    tint_b: int,
+}
+
+// -------------------- floating widget --------------------------------------
+
+/// Compact arc-reactor variant used in the floating widget — same
+/// spin + breath wiring as the full ArcReactor but at 92px instead
+/// of 168px. Defined inline here so FloatingMode doesn't have to
+/// reach across the file to ArcReactor (and so it can have a slimmer
+/// look tuned for the tiny widget).
+component MiniArcReactor inherits Rectangle {
+    in property <image> reactor_image;
+    in property <float> pulse: 0.0;
+    in property <float> spin: 0.0;
+    in property <bool> mic_active: false;
+    width: 96px;
+    height: 96px;
+
+    // Rotating SVG.
+    Image {
+        source: reactor_image;
+        width: parent.width;
+        height: parent.height;
+        image-fit: contain;
+        rotation-angle: spin * 360deg;
+        opacity: 0.92;
+    }
+    // Halo ring.
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        border-radius: self.width / 2;
+        border-color: mic_active
+            ? rgba(34, 211, 238, 0.55 + 0.30 * pulse)
+            : rgba(34, 211, 238, 0.25 + 0.10 * pulse);
+        border-width: 1.2px;
+    }
+    // Pulsing core.
+    Rectangle {
+        width: parent.width * (0.28 + 0.05 * pulse);
+        height: parent.height * (0.28 + 0.05 * pulse);
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        border-radius: self.width / 2;
+        background: mic_active
+            ? rgba(165, 243, 252, 0.65 + 0.30 * pulse)
+            : rgba(34, 211, 238, 0.20 + 0.15 * pulse);
+        border-color: rgba(207, 250, 254, 0.9);
+        border-width: 1px;
+        drop-shadow-color: mic_active
+            ? rgba(165, 243, 252, 0.65)
+            : rgba(34, 211, 238, 0.30);
+        drop-shadow-blur: mic_active ? 18px : 8px;
+    }
+    // Center pinpoint.
+    Rectangle {
+        width: 5px; height: 5px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        border-radius: 2.5px;
+        background: rgba(236, 254, 255, 0.95);
+        drop-shadow-color: rgba(236, 254, 255, 0.85);
+        drop-shadow-blur: 4px;
+    }
+}
+
+component FloatingMode inherits Rectangle {
+    in property <string> status: "ready";
+    in property <bool> mic_active: false;
+    in property <float> pulse: 0.0;
+    in property <float> spin: 0.0;
+    in property <image> reactor_image;
+    callback toggle_expand();
+    callback start_drag();
+
+    // Wider so the status caption can show "listening — say anything"
+    // without clipping; taller so the bottom hint row has air. Border
+    // is a thin cyan rule (single hairline) instead of the heavier
+    // 1px so the widget reads as a polished badge, not a button.
+    width: 196px;
+    height: 232px;
+    background: rgba(2, 6, 23, 0.94);
+    border-color: rgba(34, 211, 238, 0.55);
+    border-width: 1px;
+    border-radius: 18px;
+    drop-shadow-color: mic_active
+        ? rgba(34, 211, 238, 0.55)
+        : rgba(34, 211, 238, 0.30);
+    drop-shadow-blur: 18px;
+
+    // Live indicator bar at the very top — green when listening,
+    // amber when muted. Tiny capsule so the user reads state at a
+    // glance without needing to focus on the caption.
+    Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: 10px;
+        width: 44px;
+        height: 6px;
+        border-radius: 3px;
+        background: mic_active
+            ? rgba(34, 197, 94, 0.85)
+            : rgba(245, 158, 11, 0.75);
+        drop-shadow-color: mic_active
+            ? rgba(34, 197, 94, 0.65)
+            : rgba(245, 158, 11, 0.55);
+        drop-shadow-blur: 6px;
+    }
+
+    // Reactor centerpiece.
+    Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: 30px;
+        width: 96px;
+        height: 96px;
+        MiniArcReactor {
+            reactor_image: root.reactor_image;
+            pulse: root.pulse;
+            spin: root.spin;
+            mic_active: root.mic_active;
+        }
+    }
+
+    // Status caption: elides on overflow rather than clipping. Tone
+    // matches expanded mode.
+    Text {
+        x: 10px;
+        y: 144px;
+        width: parent.width - 20px;
+        height: 32px;
+        text: status;
+        color: rgba(207, 250, 254, 0.92);
+        font-size: 11px;
+        font-family: "JetBrains Mono";
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        wrap: word-wrap;
+        overflow: elide;
+    }
+
+    // Bottom hint row: "TAP to EXPAND" — fades on hover so users get
+    // visual feedback that the widget is interactive.
+    Rectangle {
+        x: 0px;
+        y: parent.height - 38px;
+        width: parent.width;
+        height: 38px;
+        background: rgba(10, 15, 28, 0.55);
+        border-radius: 0px;
+        Text {
+            text: "TAP to EXPAND  ·  HOLD to DRAG";
+            color: drag_ta.has-hover
+                ? rgba(207, 250, 254, 0.95)
+                : rgba(165, 243, 252, 0.55);
+            font-size: 9px;
+            font-family: "JetBrains Mono";
+            letter-spacing: 1.2px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+
+    // Drag handle covers the whole widget — pointer events differentiate
+    // click vs drag via the 4px movement threshold.
+    drag_ta := TouchArea {
+        property <bool> dragged: false;
+        property <length> px;
+        property <length> py;
+        pointer-event(ev) => {
+            if (ev.kind == PointerEventKind.down) {
+                drag_ta.px = self.mouse-x;
+                drag_ta.py = self.mouse-y;
+                drag_ta.dragged = false;
+            }
+            if (ev.kind == PointerEventKind.move && self.pressed && !drag_ta.dragged) {
+                if (abs(self.mouse-x - drag_ta.px) > 4px
+                    || abs(self.mouse-y - drag_ta.py) > 4px)
+                {
+                    drag_ta.dragged = true;
+                    root.start_drag();
+                }
+            }
+        }
+        clicked => {
+            if (!drag_ta.dragged) {
+                root.toggle_expand();
+            }
+        }
+    }
+}
+
+// -------------------- one transcript row -----------------------------------
+
+component ChatRow inherits Rectangle {
+    in property <TranscriptEntry> entry;
+
+    HorizontalLayout {
+        alignment: entry.kind == "user" ? end : start;
+        padding-left: 8px;
+        padding-right: 8px;
+        // Tight outer gutters so short messages don't get inflated
+        // chrome. 2px (was 4px) trims ~4px off every single row.
+        padding-top: entry.continues_prev ? 0px : 2px;
+        padding-bottom: entry.continues_prev ? 0px : 2px;
+        Rectangle {
+            horizontal-stretch: 0;
+            min-width: 60px;
+            // Tool rows get a tighter max-width — they're informational
+            // chrome, not conversation, so they shouldn't compete for
+            // visual weight with the user / jarvis bubbles.
+            max-width: entry.kind == "tool" ? 380px : 440px;
+            background: entry.continues_prev
+                ? transparent
+                : (entry.kind == "user"   ? rgba(34, 211, 238, 0.14)
+                : entry.kind == "jarvis" ? rgba(255, 255, 255, 0.04)
+                : entry.kind == "tool"   ? rgba(10, 15, 28, 0.55)
+                :                          rgba(255, 255, 255, 0.02));
+            border-color: entry.continues_prev
+                ? transparent
+                : (entry.kind == "user"   ? rgba(34, 211, 238, 0.55)
+                : entry.kind == "jarvis" ? rgba(165, 243, 252, 0.30)
+                : entry.kind == "tool"   ? rgba(34, 211, 238, 0.18)
+                :                          rgba(165, 243, 252, 0.20));
+            border-width: entry.continues_prev ? 0px : 1px;
+            border-radius: entry.kind == "tool" ? 6px : 8px;
+            VerticalLayout {
+                padding-left: entry.kind == "tool" ? 10px : 12px;
+                padding-right: entry.kind == "tool" ? 10px : 12px;
+                // Half the previous vertical padding. A 1-word user
+                // message ("Hey") no longer reads as a tall pill of
+                // empty space. Multi-line messages still breathe.
+                padding-top: entry.kind == "tool" ? 4px : 3px;
+                padding-bottom: entry.kind == "tool" ? 4px : 3px;
+                spacing: 0px;
+
+                Text {
+                    text: entry.is_bullet ? "• " + entry.body : entry.body;
+                    color:
+                        entry.kind == "user"   ? rgba(207, 250, 254, 1)
+                      : entry.kind == "jarvis" ? rgba(236, 254, 255, 0.95)
+                      : entry.kind == "tool"   ? rgba(165, 243, 252, 0.78)
+                      :                          rgba(165, 243, 252, 0.75);
+                    font-size:
+                        entry.header_rank == 1 ? 16px
+                      : entry.header_rank == 2 ? 14px
+                      : entry.header_rank == 3 ? 12px
+                      : entry.kind == "tool"   ? 10px
+                      :                          11px;
+                    font-family: entry.is_code ? "JetBrains Mono" : "JetBrains Mono";
+                    font-weight: entry.is_bold || entry.header_rank > 0 ? 700 : 400;
+                    wrap: word-wrap;
+                }
+                // Timestamps removed — added ~12px of vertical chrome
+                // per bubble for metadata that's not useful in real-time
+                // voice flow. Re-enable here if a history/scrollback
+                // view ever needs it.
+            }
+        }
+    }
+}
+
+// -------------------- telemetry orb ----------------------------------------
+
+component TelemetryOrb inherits Rectangle {
+    in property <string> label;
+    in property <bool> up: false;
+    height: 16px;
+    // Absolute positioning so the dot truly sits centered-left of the
+    // label instead of getting tangled in HorizontalLayout vertical
+    // distribution (which was floating the dot to the top edge).
+    Rectangle {
+        width: 9px;
+        height: 9px;
+        x: 0;
+        y: (parent.height - self.height) / 2;
+        border-radius: 4.5px;
+        background: up
+            ? rgba(34, 211, 238, 1)
+            : rgba(244, 63, 94, 0.85);
+        drop-shadow-color: up ? rgba(34, 211, 238, 0.6) : rgba(0, 0, 0, 0);
+        drop-shadow-blur: 6px;
+    }
+    Text {
+        text: label;
+        x: 15px;
+        y: 0;
+        height: parent.height;
+        vertical-alignment: center;
+        color: up ? rgba(165, 243, 252, 1) : rgba(165, 243, 252, 0.55);
+        font-size: 10px;
+        font-family: "JetBrains Mono";
+    }
+}
+
+// -------------------- mini control button ----------------------------------
+
+// -------------------- approval banner button -------------------------------
+
+component ApprovalButton inherits Rectangle {
+    in property <string> label;
+    callback clicked();
+    width: 76px;
+    height: 28px;
+    border-radius: 6px;
+    background: rgba(20, 14, 4, 0.85);
+    border-color: rgba(0, 0, 0, 0.6);
+    border-width: 1px;
+    Text {
+        text: label;
+        color: rgba(255, 220, 150, 0.95);
+        font-size: 10px;
+        font-family: "JetBrains Mono";
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+// -------------------- arc reactor ------------------------------------------
+//
+// The SVG itself (rasterized from assets/jarvis.svg) carries the
+// instrument-panel detail: outer dashed ring, tick marks, segmented
+// arc-reactor plates, glowing core. Slint can only rotate Image and
+// Text elements — not Rectangle — so we layer two Image instances of
+// the same SVG: one rotates with `spin` (slow forward), one counter-
+// rotates faster. The visual effect: rings and plates spin in
+// opposite directions, looking dynamic instead of wobbly.
+//
+// Pulsing core overlay is a Rectangle (no rotation needed) whose
+// scale + opacity breathe with `pulse`, and brightens when mic is
+// live. The whole reactor is a click target for mic toggle.
+component ArcReactor inherits Rectangle {
+    in property <image> reactor_image;
+    in property <float> pulse: 0.0;
+    in property <float> spin: 0.0;
+    in property <bool> mic_active: false;
+    callback clicked();
+    width: 168px;
+    height: 168px;
+
+    // Single rotating SVG layer. Previously this was a pair of Images
+    // (one forward, one reversed) stacked at different scales, but
+    // the overlapping tick marks + capacitor dots from both copies
+    // created a busy "woven squares" pattern at the core. One clean
+    // rotation reads as a precise instrument; the SVG itself carries
+    // the visual richness (rings, ticks, 9 rounded capacitors).
+    Image {
+        source: reactor_image;
+        width: parent.width;
+        height: parent.height;
+        image-fit: contain;
+        rotation-angle: spin * 360deg;
+        opacity: 0.92;
+    }
+
+    // Static cyan halo ring — keeps the outer boundary stable so the
+    // eye has something to anchor on while the inside spins.
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        border-radius: self.width / 2;
+        border-color: mic_active
+            ? rgba(34, 211, 238, 0.55 + 0.30 * pulse)
+            : rgba(34, 211, 238, 0.25 + 0.10 * pulse);
+        border-width: 1.5px;
+    }
+
+    // Pulsing core — brighter when mic is live.
+    Rectangle {
+        width: parent.width * (0.26 + 0.04 * pulse);
+        height: parent.height * (0.26 + 0.04 * pulse);
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        border-radius: self.width / 2;
+        background: mic_active
+            ? rgba(165, 243, 252, 0.65 + 0.30 * pulse)
+            : rgba(34, 211, 238, 0.20 + 0.15 * pulse);
+        border-color: rgba(207, 250, 254, 0.9);
+        border-width: 1px;
+        drop-shadow-color: mic_active
+            ? rgba(165, 243, 252, 0.7)
+            : rgba(34, 211, 238, 0.30);
+        drop-shadow-blur: mic_active ? 26px : 12px;
+    }
+
+    // Center pinpoint — the bright dot at exact center.
+    Rectangle {
+        width: 8px;
+        height: 8px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        border-radius: 4px;
+        background: rgba(236, 254, 255, 0.95);
+        drop-shadow-color: rgba(236, 254, 255, 0.85);
+        drop-shadow-blur: 6px;
+    }
+
+    // Mic toggle: click anywhere on the reactor.
+    TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+// -------------------- sub-agent row + right-side column --------------------
+
+component SubAgentRowView inherits Rectangle {
+    in property <SubAgentRow> data;
+    callback dismiss(string);
+    property <color> tint: rgba(data.tint_r, data.tint_g, data.tint_b, 1.0);
+    height: 62px;
+    border-radius: 10px;
+    background: data.state == "ok"
+        ? rgba(34, 197, 94, 0.06)
+        : (data.state == "fail"
+            ? rgba(244, 63, 94, 0.09)
+            : rgba(data.tint_r, data.tint_g, data.tint_b, 0.06));
+    border-color: data.state == "ok"
+        ? rgba(34, 197, 94, 0.45)
+        : (data.state == "fail"
+            ? rgba(244, 63, 94, 0.55)
+            : rgba(data.tint_r, data.tint_g, data.tint_b, 0.50));
+    border-width: 1.2px;
+
+    // Indicator dot — colored by state when done, by category tint
+    // while running. Glow drops 50% when complete to de-emphasize
+    // settled rows.
+    Rectangle {
+        x: 12px;
+        y: (parent.height - self.height) / 2;
+        width: 10px;
+        height: 10px;
+        border-radius: 5px;
+        background: data.state == "ok"
+            ? rgba(34, 197, 94, 0.95)
+            : (data.state == "fail"
+                ? rgba(244, 63, 94, 0.95)
+                : tint);
+        drop-shadow-color: data.state == "ok"
+            ? rgba(34, 197, 94, 0.45)
+            : (data.state == "fail"
+                ? rgba(244, 63, 94, 0.45)
+                : rgba(data.tint_r, data.tint_g, data.tint_b, 0.65));
+        drop-shadow-blur: data.done ? 4px : 10px;
+    }
+
+    // Category chip ("MEMORY", "WEB", "FILES" …).
+    Rectangle {
+        x: 30px;
+        y: 10px;
+        width: cat_text.preferred-width + 12px;
+        height: 16px;
+        border-radius: 4px;
+        background: rgba(data.tint_r, data.tint_g, data.tint_b, 0.18);
+        border-color: rgba(data.tint_r, data.tint_g, data.tint_b, 0.55);
+        border-width: 1px;
+        cat_text := Text {
+            text: data.category;
+            color: rgba(data.tint_r, data.tint_g, data.tint_b, 1.0);
+            font-size: 8px;
+            font-family: "JetBrains Mono";
+            x: 6px;
+            y: 0;
+            height: parent.height;
+            vertical-alignment: center;
+            letter-spacing: 1.4px;
+        }
+    }
+
+    // Friendly name (primary identifier) + turn count.
+    Text {
+        x: 30px;
+        y: 28px;
+        width: parent.width - 60px;
+        height: 16px;
+        text: data.turn_count > 1
+            ? data.label + " · " + data.turn_count
+            : data.label;
+        color: rgba(236, 254, 255, 0.97);
+        font-size: 12px;
+        font-family: "JetBrains Mono";
+        font-weight: 700;
+        vertical-alignment: center;
+        overflow: elide;
+        letter-spacing: 0.4px;
+    }
+
+    // Status line — running status while in flight, summary when done.
+    Text {
+        x: 30px;
+        y: 44px;
+        width: parent.width - 60px;
+        height: 14px;
+        text: data.status == "running" ? "in flight…" : data.status;
+        color: rgba(165, 243, 252, 0.72);
+        font-size: 9px;
+        font-family: "JetBrains Mono";
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    // X dismiss button — top-right. While running, this is a
+    // user-initiated cancel signal (server doesn't support real
+    // cancellation yet so the work continues but the card vanishes
+    // from the panel). After completion, it just removes the
+    // settled card. Either way: a quick "get this out of my view"
+    // gesture instead of waiting for the auto-prune.
+    Rectangle {
+        x: parent.width - 24px;
+        y: 8px;
+        width: 18px;
+        height: 18px;
+        border-radius: 4px;
+        background: x_ta.has-hover
+            ? rgba(244, 63, 94, 0.30)
+            : rgba(255, 255, 255, 0.06);
+        border-color: x_ta.has-hover
+            ? rgba(244, 63, 94, 0.65)
+            : rgba(165, 243, 252, 0.20);
+        border-width: 1px;
+        Text {
+            text: "×";
+            color: x_ta.has-hover
+                ? rgba(254, 226, 226, 0.97)
+                : rgba(207, 250, 254, 0.85);
+            font-size: 13px;
+            font-family: "JetBrains Mono";
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        x_ta := TouchArea {
+            clicked => { root.dismiss(data.id); }
+        }
+    }
+}
+
+
+//
+// Dedicated 220px column anchored on the right side of the expanded
+// HUD. Renders the live sub-agent rows that the gateway emits via SSE.
+// When empty, shows a quiet "no sub-agents running" placeholder so the
+// column doesn't read as broken; when populated, scrolls vertically.
+component SubAgentsRightPanel inherits Rectangle {
+    in property <[SubAgentRow]> sub_agents;
+    callback dismiss_sub_agent(string);
+    background: rgba(2, 6, 23, 0.92);
+    border-color: rgba(34, 211, 238, 0.18);
+    border-width: 1px;
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 8px;
+        Text {
+            text: "SUB-AGENTS · " + sub_agents.length;
+            color: rgba(165, 243, 252, 0.78);
+            font-size: 10px;
+            font-family: "JetBrains Mono";
+            letter-spacing: 1.8px;
+            horizontal-alignment: center;
+        }
+        Rectangle {
+            height: 1px;
+            background: rgba(34, 211, 238, 0.18);
+        }
+        if sub_agents.length == 0: Text {
+            text: "// no sub-agents running";
+            color: rgba(165, 243, 252, 0.40);
+            font-size: 9px;
+            font-family: "JetBrains Mono";
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+        ScrollView {
+            VerticalLayout {
+                spacing: 6px;
+                for row in sub_agents: SubAgentRowView {
+                    data: row;
+                    dismiss(id) => { root.dismiss_sub_agent(id); }
+                }
+            }
+        }
+    }
+}
+
+// -------------------- horizontal splitter ----------------------------------
+//
+// 5px-wide vertical bar between two columns. Drag to resize the
+// neighbor column. Caller passes the bound width property and a
+// flag for which direction the drag grows; the splitter does the
+// pointer math + clamping inline.
+component HSplitter inherits Rectangle {
+    in-out property <length> bound_width;
+    in property <length> min_w: 140px;
+    in property <length> max_w: 560px;
+    in property <bool> drag_grows_left: true;
+    // 3px hairline; transparent at rest so the column seam reads as
+    // a clean vertical line instead of a stripe of cyan-tinted pixels.
+    // Pops to bright cyan on hover so the user can still grab + drag.
+    width: 3px;
+    background: ta.has-hover || ta.pressed
+        ? rgba(34, 211, 238, 0.55)
+        : transparent;
+
+    ta := TouchArea {
+        mouse-cursor: ew-resize;
+        property <length> initial: 0px;
+        pointer-event(ev) => {
+            if (ev.kind == PointerEventKind.down) {
+                ta.initial = root.bound_width;
+            }
+        }
+        moved => {
+            if (self.pressed) {
+                if (drag_grows_left) {
+                    root.bound_width = min(max(ta.initial + (self.mouse-x - self.pressed-x), min_w), max_w);
+                } else {
+                    root.bound_width = min(max(ta.initial - (self.mouse-x - self.pressed-x), min_w), max_w);
+                }
+            }
+        }
+    }
+}
+
+// -------------------- minify (collapse-to-floating) button -----------------
+//
+// Mirrors `ScreenShareButton` in style: same 56px circle, same cyan
+// border + halo on hover/active. Icon = four corner brackets pulling
+// inward — universal "minify / shrink" visual. Sits to the LEFT of
+// the arc reactor so the trio (minify · reactor · screen-share) is
+// visually balanced.
+component MinifyButton inherits Rectangle {
+    in property <image> source;
+    callback clicked();
+    width: 56px;
+    height: 56px;
+    border-radius: 28px;
+    background: ta.has-hover
+        ? rgba(34, 211, 238, 0.18)
+        : rgba(34, 211, 238, 0.04);
+    border-color: rgba(34, 211, 238, 0.55);
+    border-width: 1.5px;
+    Image {
+        source: root.source;
+        width: 28px;
+        height: 28px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        image-fit: contain;
+        colorize: rgba(207, 250, 254, 0.95);
+    }
+    ta := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+// -------------------- screen share icon button -----------------------------
+//
+// Round icon button shaped like a desktop monitor with a wifi-style
+// signal in its screen. Active state = filled cyan body + brighter
+// signal; off state = outlined only. Sits to the right of the arc
+// reactor, vertically centered with the reactor's core.
+component ScreenShareButton inherits Rectangle {
+    in property <bool> active: false;
+    in property <image> source;
+    callback clicked();
+    width: 56px;
+    height: 56px;
+    border-radius: 28px;
+    background: active
+        ? rgba(34, 211, 238, 0.22)
+        : (ta.has-hover ? rgba(34, 211, 238, 0.10) : rgba(34, 211, 238, 0.04));
+    border-color: active
+        ? rgba(34, 211, 238, 0.90)
+        : rgba(34, 211, 238, 0.55);
+    border-width: 1.5px;
+    drop-shadow-color: active ? rgba(34, 211, 238, 0.45) : rgba(0, 0, 0, 0);
+    drop-shadow-blur: 12px;
+    Image {
+        source: root.source;
+        width: 30px;
+        height: 30px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        image-fit: contain;
+        colorize: active
+            ? rgba(236, 254, 255, 1.0)
+            : rgba(207, 250, 254, 0.92);
+    }
+    ta := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+// -------------------- HUD --------------------------------------------------
+
+/// One row in the SubAgentsPanel. Compact: 24px tall, a colored dot
+/// for state (cyan = running, green = ok, red = fail), a label, and
+/// the most recent status / final-summary text.
+component FullHud inherits Rectangle {
+    in property <string> status: "ready";
+    in property <bool> mic_active: false;
+    in property <bool> screen_share_active: false;
+    in property <float> pulse: 0.0;
+    in property <float> spin: 0.0;
+    in property <[TranscriptEntry]> transcript;
+    in property <[SubAgentRow]> sub_agents;
+    in property <string> version: "v2.0";
+    in property <image> reactor_image;
+    in property <image> minify_icon;
+    in property <image> monitor_icon;
+    in property <bool> gateway_up: false;
+    in property <bool> parakeet_up: false;
+    in property <bool> elevenlabs_up: false;
+    in property <bool> claude_up: false;
+    in-out property <string> composer_text: "";
+
+    callback toggle_expand();
+    callback toggle_mic();
+    callback toggle_screen_share();
+    callback start_drag();
+    callback send_text(string);
+    callback clear_transcript();
+    callback compact_thread();
+    callback undo_turn();
+    callback redo_turn();
+    callback new_thread();
+    callback open_wizard();
+    in property <[string]> thread_ids;
+    in property <int> active_thread_index: 0;
+    callback switch_thread(int);
+
+    background: rgba(2, 6, 23, 0.97);
+    border-color: rgba(34, 211, 238, 0.55);
+    border-width: 1px;
+    border-radius: 14px;
+    drop-shadow-color: rgba(34, 211, 238, 0.5);
+    drop-shadow-blur: 20px;
+
+    VerticalLayout {
+        spacing: 0px;
+
+        // ----- header -----
+        // Header strip: just a hairline divider and the version
+        // number. The clear-transcript circle moved out to make
+        // space; the new circular row of action buttons lives on
+        // either side of the arc reactor below (minify · reactor ·
+        // screen share). OS title bar carries the brand.
+        Rectangle {
+            height: 30px;
+            background: rgba(10, 15, 28, 0.7);
+            HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                spacing: 12px;
+                alignment: end;
+                Text {
+                    text: version;
+                    color: rgba(34, 211, 238, 0.7);
+                    font-size: 11px;
+                    font-family: "JetBrains Mono";
+                    vertical-alignment: center;
+                }
+            }
+            Rectangle {
+                y: parent.height - 1px;
+                width: parent.width;
+                height: 1px;
+                background: rgba(34, 211, 238, 0.35);
+            }
+        }
+
+        // ----- centered arc reactor + status (click reactor to toggle mic) -----
+        // Reactor stays horizontally centered. Screen-share lives to
+        // its right, vertically centered with the reactor's CORE (not
+        // the reactor's outer bounds — the empty spacer on the left
+        // mirrors the screen-share button's width so the trio is
+        // visually balanced).
+        Rectangle {
+            height: 210px;
+            VerticalLayout {
+                alignment: center;
+                spacing: 10px;
+                padding-top: 14px;
+                HorizontalLayout {
+                    alignment: center;
+                    spacing: 24px;
+                    // Minify button on the left, screen-share button on
+                    // the right — both vertically centered with the
+                    // reactor core for visual balance.
+                    Rectangle {
+                        width: 56px;
+                        height: 168px;
+                        MinifyButton {
+                            source: root.minify_icon;
+                            y: (parent.height - self.height) / 2;
+                            clicked => { root.toggle_expand(); }
+                        }
+                    }
+                    ArcReactor {
+                        reactor_image: root.reactor_image;
+                        pulse: root.pulse;
+                        spin: root.spin;
+                        mic_active: root.mic_active;
+                        clicked => { root.toggle_mic(); }
+                    }
+                    // ScreenShareButton removed — screen capture now fires
+                    // automatically whenever JARVIS needs vision context
+                    // (see the "Screen vision — never announce, just look"
+                    // section in workspace_seed/AGENTS.md). Manual toggle
+                    // is no longer useful and was visually unbalancing the
+                    // reactor.
+                }
+                Text {
+                    text: mic_active ? "● LIVE — " + status : "● MUTED — click reactor to enable mic";
+                    color: mic_active
+                        ? rgba(207, 250, 254, 0.95)
+                        : rgba(165, 243, 252, 0.65);
+                    font-size: 11px;
+                    font-family: "JetBrains Mono";
+                    horizontal-alignment: center;
+                    letter-spacing: 1px;
+                }
+            }
+        }
+
+        // ----- control row: turn ops + thread selector + setup link -----
+        // Control bar removed — UNDO/REDO/COMPACT/+NEW/SETUP all had
+        // sidebar or contextual equivalents and were duplicating each
+        // other. SETUP became SETTINGS in the sidebar; + NEW lives on
+        // the sidebar; compact + undo + redo are reachable via slash
+        // commands in the composer (/undo, /redo, /compact) since they
+        // are rarely-used actions that don't deserve permanent chrome.
+
+        // ----- transcript (fills the entire bottom area now that
+        // sub-agents have moved to the right-side column) -----
+        Rectangle {
+            background: rgba(10, 15, 28, 0.35);
+            vertical-stretch: 1;
+            min-height: 200px;
+            ScrollView {
+                VerticalLayout {
+                    padding-top: 10px;
+                    padding-bottom: 10px;
+                    spacing: 2px;
+                    for entry in transcript: ChatRow {
+                        entry: entry;
+                    }
+                    if transcript.length == 0: Text {
+                        text: "// awaiting voice or text input";
+                        color: rgba(165, 243, 252, 0.45);
+                        font-size: 10px;
+                        font-family: "JetBrains Mono";
+                        horizontal-alignment: center;
+                    }
+                }
+            }
+        }
+
+        // ----- composer (capsule, large) -----
+        // Larger capsule input rail. Pulled the bottom telemetry
+        // strip (the row that had GATEWAY · PARAKEET · 11LABS ·
+        // CLAUDE dots) so this can grow vertically and read as the
+        // primary action area. Status indicators moved to the
+        // header strip at top so the user always sees them but they
+        // don't crowd the input.
+        Rectangle {
+            // Slimmer composer rail — the 88×60 capsule was visually
+            // the heaviest element on screen and dominated the layout
+            // McKale wanted reading-area-first.
+            height: 56px;
+            background: rgba(2, 6, 23, 0.85);
+            HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                padding-top: 8px;
+                padding-bottom: 8px;
+                spacing: 0px;
+                alignment: stretch;
+                Rectangle {
+                    height: 40px;
+                    border-radius: 20px;
+                    background: rgba(10, 15, 28, 0.92);
+                    border-color: composer.has-focus
+                        ? rgba(34, 211, 238, 0.85)
+                        : rgba(34, 211, 238, 0.42);
+                    border-width: 1.2px;
+                    HorizontalLayout {
+                        padding-left: 18px;
+                        padding-right: 6px;
+                        spacing: 8px;
+                        alignment: stretch;
+                        composer := LineEdit {
+                            placeholder-text: "Speak or Send Commands - Press Enter";
+                            text <=> root.composer_text;
+                            font-size: 12px;
+                            accepted(s) => {
+                                if (s != "") {
+                                    root.send_text(s);
+                                    root.composer_text = "";
+                                }
+                            }
+                        }
+                        Rectangle {
+                            width: 72px;
+                            height: 30px;
+                            y: (parent.height - self.height) / 2;
+                            border-radius: 15px;
+                            background: send_ta.has-hover
+                                ? rgba(34, 211, 238, 0.48)
+                                : rgba(34, 211, 238, 0.28);
+                            border-color: rgba(34, 211, 238, 0.75);
+                            border-width: 1px;
+                            Text {
+                                text: "SEND";
+                                color: rgba(207, 250, 254, 0.97);
+                                font-size: 10px;
+                                font-family: "JetBrains Mono";
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                letter-spacing: 1.6px;
+                            }
+                            send_ta := TouchArea {
+                                clicked => {
+                                    if (root.composer_text != "") {
+                                        root.send_text(root.composer_text);
+                                        root.composer_text = "";
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Telemetry orbs (GATEWAY / PARAKEET / 11LABS / CLAUDE) were
+        // removed entirely — the row was getting squashed when the
+        // window resized below ~600px and the labels overlapped into
+        // an unreadable cyan blur. Status is now communicated via
+        // the reactor's mic indicator + the "warming up parakeet…"
+        // → "listening — say anything" status text above the input.
+    }
+}
+
+// -------------------- left sidebar (conversations + settings) -------------
+
+/// Settings gear icon rendered from an SVG asset (assets/icons/gear.svg).
+/// Tinted at draw time via Slint's `colorize` so the same source asset
+/// works for both active and idle states.
+component GearIcon inherits Rectangle {
+    in property <image> source;
+    in property <color> tint: rgba(207, 250, 254, 0.95);
+    width: 18px;
+    height: 18px;
+    Image {
+        source: root.source;
+        width: parent.width;
+        height: parent.height;
+        image-fit: contain;
+        colorize: tint;
+    }
+}
+
+component ConversationRowView inherits Rectangle {
+    in property <ConversationRow> data;
+    callback clicked();
+    /// Right-click reports the absolute screen coords (relative to the
+    /// window) where the context menu should anchor. The host renders
+    /// a top-level menu overlay with Open / Rename / Export / Delete.
+    callback context_menu_requested(length, length);
+    height: 50px;
+    border-radius: 8px;
+    background: data.is_active
+        ? rgba(34, 211, 238, 0.18)
+        : (ta.has-hover ? rgba(34, 211, 238, 0.06) : transparent);
+    border-color: data.is_active
+        ? rgba(34, 211, 238, 0.55)
+        : rgba(34, 211, 238, 0.10);
+    border-width: 1px;
+    VerticalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        padding-top: 7px;
+        padding-bottom: 7px;
+        Text {
+            text: data.title;
+            color: rgba(207, 250, 254, 0.95);
+            font-size: 11px;
+            font-family: "JetBrains Mono";
+            overflow: elide;
+        }
+        Text {
+            text: data.subtitle;
+            color: rgba(165, 243, 252, 0.55);
+            font-size: 9px;
+            font-family: "JetBrains Mono";
+            overflow: elide;
+        }
+    }
+    ta := TouchArea {
+        pointer-event(ev) => {
+            if (ev.kind == PointerEventKind.up && ev.button == PointerEventButton.right) {
+                // Hand absolute window coordinates to the host so the
+                // popup can pin itself wherever the user clicked.
+                root.context_menu_requested(
+                    self.absolute-position.x + self.mouse-x,
+                    self.absolute-position.y + self.mouse-y,
+                );
+            }
+        }
+        clicked => { root.clicked(); }
+    }
+}
+
+/// One row in the popup menu. Matches the styling of the SettingsField
+/// + sidebar button language so it reads as part of the same UI vocab.
+component ContextMenuItem inherits Rectangle {
+    in property <string> label;
+    in property <bool> destructive: false;
+    callback clicked();
+    height: 30px;
+    background: ta.has-hover
+        ? (destructive
+            ? rgba(244, 63, 94, 0.25)
+            : rgba(34, 211, 238, 0.18))
+        : transparent;
+    Text {
+        text: label;
+        color: destructive
+            ? rgba(254, 226, 226, 0.95)
+            : rgba(207, 250, 254, 0.95);
+        font-size: 11px;
+        font-family: "JetBrains Mono";
+        x: 14px;
+        y: (parent.height - self.height) / 2;
+    }
+    ta := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+component Sidebar inherits Rectangle {
+    in property <[ConversationRow]> conversations;
+    in property <bool> settings_open: false;
+    in property <image> gear_icon;
+    callback select_conversation(string);
+    callback new_conversation();
+    callback toggle_settings();
+    callback export_conversation();
+    /// Right-click on a row. Bubbles up to MainWindow with the thread
+    /// id + absolute window coords so the popup can position itself.
+    callback context_menu(string, length, length);
+    // Width is bound by the caller (MainWindow.sidebar_width) so the
+    // splitter can resize it live. No default-width here.
+    background: rgba(2, 6, 23, 0.92);
+
+    VerticalLayout {
+        padding: 10px;
+        spacing: 8px;
+
+        // Sidebar "JARVIS" label removed — the OS title bar provides
+        // the brand. Sidebar opens directly with the + NEW button.
+
+        // + New Conversation
+        Rectangle {
+            height: 34px;
+            border-radius: 8px;
+            background: new_ta.has-hover
+                ? rgba(34, 211, 238, 0.22)
+                : rgba(34, 211, 238, 0.10);
+            border-color: rgba(34, 211, 238, 0.55);
+            border-width: 1px;
+            Text {
+                text: "+ NEW CONVERSATION";
+                color: rgba(207, 250, 254, 0.95);
+                font-size: 10px;
+                font-family: "JetBrains Mono";
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                letter-spacing: 1.2px;
+            }
+            new_ta := TouchArea {
+                clicked => { root.new_conversation(); }
+            }
+        }
+
+        // Conversation list. Left-click selects; right-click triggers
+        // export for that specific thread.
+        Rectangle {
+            background: transparent;
+            ScrollView {
+                VerticalLayout {
+                    spacing: 4px;
+                    for c in conversations: ConversationRowView {
+                        data: c;
+                        clicked => { root.select_conversation(c.id); }
+                        context_menu_requested(x, y) => {
+                            root.context_menu(c.id, x, y);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Settings rail. Absolute positioning so the gear icon (or
+        // close-X when open) sits at a deterministic x-offset from
+        // the left and the label hangs next to it — no more nested
+        // HorizontalLayout/Rectangle/centering games that made the
+        // gear look lumpy and the spacing inconsistent.
+        Rectangle {
+            height: 32px;
+            border-radius: 6px;
+            background: settings_open
+                ? rgba(34, 211, 238, 0.18)
+                : (settings_ta.has-hover
+                    ? rgba(34, 211, 238, 0.08)
+                    : transparent);
+            border-color: settings_open
+                ? rgba(34, 211, 238, 0.55)
+                : rgba(34, 211, 238, 0.20);
+            border-width: 1px;
+            if !settings_open: GearIcon {
+                source: root.gear_icon;
+                width: 14px;
+                height: 14px;
+                x: 14px;
+                y: (parent.height - self.height) / 2;
+                tint: rgba(207, 250, 254, 0.95);
+            }
+            if settings_open: Text {
+                text: "×";
+                color: rgba(207, 250, 254, 0.97);
+                font-size: 16px;
+                font-family: "JetBrains Mono";
+                width: 14px;
+                height: parent.height;
+                x: 14px;
+                y: 0;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            Text {
+                text: "SETTINGS";
+                color: rgba(207, 250, 254, 0.92);
+                font-size: 10px;
+                font-family: "JetBrains Mono";
+                x: 36px;
+                y: 0;
+                height: parent.height;
+                vertical-alignment: center;
+                letter-spacing: 1.5px;
+            }
+            settings_ta := TouchArea {
+                clicked => { root.toggle_settings(); }
+            }
+        }
+    }
+}
+
+component SettingsField inherits Rectangle {
+    in property <string> label;
+    in-out property <string> value;
+    in property <bool> obscured: false;
+    in property <string> placeholder: "";
+    height: 56px;
+    VerticalLayout {
+        spacing: 4px;
+        Text {
+            text: label;
+            color: rgba(165, 243, 252, 0.85);
+            font-size: 10px;
+            font-family: "JetBrains Mono";
+            letter-spacing: 1px;
+        }
+        Rectangle {
+            height: 30px;
+            background: rgba(10, 15, 28, 0.7);
+            border-color: rgba(34, 211, 238, 0.35);
+            border-width: 1px;
+            border-radius: 6px;
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 10px;
+                input := LineEdit {
+                    text <=> root.value;
+                    placeholder-text: placeholder;
+                    input-type: obscured ? InputType.password : InputType.text;
+                }
+            }
+        }
+    }
+}
+
+component SettingsPanel inherits Rectangle {
+    in-out property <string> anthropic_key;
+    in-out property <string> model;
+    in-out property <string> elevenlabs_key;
+    in-out property <string> elevenlabs_voice_id;
+    in property <bool> heartbeat_enabled: true;
+    in property <bool> autonomous_enabled: false;
+    in property <bool> save_in_flight: false;
+    in property <string> save_status: "";
+
+    callback save();
+    callback toggle_heartbeat();
+    callback toggle_autonomous();
+
+    background: rgba(2, 6, 23, 0.97);
+
+    VerticalLayout {
+        padding: 24px;
+        spacing: 14px;
+
+        Text {
+            text: "SETTINGS";
+            color: rgba(207, 250, 254, 1);
+            font-size: 18px;
+            font-family: "JetBrains Mono";
+            letter-spacing: 3px;
+        }
+        Text {
+            text: "Authentication, model selection, voice, and runtime flags. Saved values are written to .ironclad/.env on disk; restart the gateway to pick them up.";
+            color: rgba(165, 243, 252, 0.65);
+            font-size: 10px;
+            font-family: "JetBrains Mono";
+            wrap: word-wrap;
+        }
+
+        SettingsField {
+            label: "ANTHROPIC API KEY";
+            value <=> root.anthropic_key;
+            obscured: true;
+            placeholder: "sk-ant-…";
+        }
+        SettingsField {
+            label: "ANTHROPIC MODEL";
+            value <=> root.model;
+            placeholder: "claude-haiku-4-5";
+        }
+        SettingsField {
+            label: "ELEVENLABS API KEY";
+            value <=> root.elevenlabs_key;
+            obscured: true;
+            placeholder: "sk_…";
+        }
+        SettingsField {
+            label: "ELEVENLABS VOICE ID";
+            value <=> root.elevenlabs_voice_id;
+            placeholder: "a8xldQ1FGKRv2r1v0QSx";
+        }
+
+        // Toggles row
+        HorizontalLayout {
+            spacing: 12px;
+            Rectangle {
+                height: 36px;
+                width: 200px;
+                border-radius: 8px;
+                background: heartbeat_enabled
+                    ? rgba(34, 211, 238, 0.24)
+                    : rgba(34, 211, 238, 0.06);
+                border-color: rgba(34, 211, 238, 0.5);
+                border-width: 1px;
+                Text {
+                    text: heartbeat_enabled ? "HEARTBEAT • ON" : "HEARTBEAT • OFF";
+                    color: rgba(207, 250, 254, 0.95);
+                    font-size: 10px;
+                    font-family: "JetBrains Mono";
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    letter-spacing: 1.2px;
+                }
+                TouchArea {
+                    clicked => { root.toggle_heartbeat(); }
+                }
+            }
+            Rectangle {
+                height: 36px;
+                width: 220px;
+                border-radius: 8px;
+                background: autonomous_enabled
+                    ? rgba(34, 211, 238, 0.24)
+                    : rgba(34, 211, 238, 0.06);
+                border-color: rgba(34, 211, 238, 0.5);
+                border-width: 1px;
+                Text {
+                    text: autonomous_enabled
+                        ? "AUTONOMOUS LOOP • ON"
+                        : "AUTONOMOUS LOOP • OFF";
+                    color: rgba(207, 250, 254, 0.95);
+                    font-size: 10px;
+                    font-family: "JetBrains Mono";
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    letter-spacing: 1.2px;
+                }
+                TouchArea {
+                    clicked => { root.toggle_autonomous(); }
+                }
+            }
+        }
+
+        // Save button — native wizard for first-run is reachable via
+        // the SETUP entry in the HUD control bar, not from here.
+        HorizontalLayout {
+            spacing: 12px;
+            Rectangle {
+                width: 130px;
+                height: 38px;
+                border-radius: 10px;
+                background: save_in_flight
+                    ? rgba(34, 211, 238, 0.10)
+                    : rgba(34, 211, 238, 0.24);
+                border-color: rgba(34, 211, 238, 0.55);
+                border-width: 1px;
+                Text {
+                    text: save_in_flight ? "SAVING…" : "SAVE";
+                    color: rgba(207, 250, 254, 0.95);
+                    font-size: 11px;
+                    font-family: "JetBrains Mono";
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    letter-spacing: 2px;
+                }
+                TouchArea {
+                    clicked => {
+                        if (!root.save_in_flight) {
+                            root.save();
+                        }
+                    }
+                }
+            }
+        }
+
+        Text {
+            text: save_status;
+            color: rgba(34, 211, 238, 0.85);
+            font-size: 10px;
+            font-family: "JetBrains Mono";
+        }
+        Rectangle { vertical-stretch: 1; }
+    }
+}
+
+// -------------------- native setup wizard ---------------------------------
+//
+// 5-step first-run wizard that replaces the browser bridge entirely.
+// Steps:
+//   0  Welcome
+//   1  Anthropic API key
+//   2  Model selection (radio: Haiku / Sonnet / Opus)
+//   3  ElevenLabs API key + voice
+//   4  Done / restart prompt
+//
+// Reuses the existing SettingsField component for text inputs. State
+// lives on the WizardPanel itself; on FINISH it surfaces the values
+// back to MainWindow via the `finish` callback, which the Rust side
+// writes to .env atomically (same write_settings_to_env used by the
+// SettingsPanel save path).
+
+component WizardStepDot inherits Rectangle {
+    in property <int> step_index;
+    in property <int> current_step;
+    width: 14px;
+    height: 14px;
+    border-radius: 7px;
+    background: step_index == current_step
+        ? rgba(34, 211, 238, 0.95)
+        : (step_index < current_step
+            ? rgba(34, 197, 94, 0.85)
+            : rgba(34, 211, 238, 0.20));
+    border-color: rgba(34, 211, 238, 0.60);
+    border-width: 1px;
+}
+
+component WizardRadio inherits Rectangle {
+    in property <string> label;
+    in property <string> sublabel;
+    in property <bool> selected;
+    callback clicked();
+    height: 54px;
+    border-radius: 10px;
+    background: selected
+        ? rgba(34, 211, 238, 0.18)
+        : (ta.has-hover ? rgba(34, 211, 238, 0.06) : transparent);
+    border-color: selected
+        ? rgba(34, 211, 238, 0.65)
+        : rgba(34, 211, 238, 0.25);
+    border-width: 1px;
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        spacing: 12px;
+        alignment: start;
+        Rectangle {
+            width: 14px;
+            height: 14px;
+            border-radius: 7px;
+            y: (parent.height - 14px) / 2;
+            background: selected ? rgba(34, 211, 238, 0.95) : transparent;
+            border-color: rgba(34, 211, 238, 0.65);
+            border-width: 1px;
+        }
+        VerticalLayout {
+            spacing: 1px;
+            Text {
+                text: label;
+                color: rgba(207, 250, 254, 0.97);
+                font-size: 12px;
+                font-family: "JetBrains Mono";
+                letter-spacing: 0.6px;
+            }
+            Text {
+                text: sublabel;
+                color: rgba(165, 243, 252, 0.65);
+                font-size: 9px;
+                font-family: "JetBrains Mono";
+            }
+        }
+    }
+    ta := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+component WizardPanel inherits Rectangle {
+    in-out property <string> anthropic_key;
+    in-out property <string> model: "claude-haiku-4-5";
+    in-out property <string> elevenlabs_key;
+    in-out property <string> elevenlabs_voice_id;
+    in property <bool> save_in_flight: false;
+    in property <string> save_status: "";
+
+    callback finish();
+    callback cancel();
+
+    in-out property <int> current_step: 0;
+    property <int> total_steps: 5;
+
+    background: rgba(2, 6, 23, 0.97);
+
+    VerticalLayout {
+        padding: 24px;
+        spacing: 14px;
+
+        // Header + step indicator
+        HorizontalLayout {
+            spacing: 12px;
+            alignment: space-between;
+            VerticalLayout {
+                spacing: 4px;
+                Text {
+                    text: "SETUP";
+                    color: rgba(207, 250, 254, 1);
+                    font-size: 18px;
+                    font-family: "JetBrains Mono";
+                    letter-spacing: 3px;
+                }
+                Text {
+                    text: "Step " + (current_step + 1) + " of " + total_steps;
+                    color: rgba(34, 211, 238, 0.75);
+                    font-size: 10px;
+                    font-family: "JetBrains Mono";
+                    letter-spacing: 1.4px;
+                }
+            }
+            HorizontalLayout {
+                spacing: 6px;
+                alignment: end;
+                WizardStepDot { step_index: 0; current_step: root.current_step; }
+                WizardStepDot { step_index: 1; current_step: root.current_step; }
+                WizardStepDot { step_index: 2; current_step: root.current_step; }
+                WizardStepDot { step_index: 3; current_step: root.current_step; }
+                WizardStepDot { step_index: 4; current_step: root.current_step; }
+            }
+        }
+
+        // -- Step 0: Welcome --
+        if current_step == 0: VerticalLayout {
+            spacing: 12px;
+            Text {
+                text: "Welcome.";
+                color: rgba(207, 250, 254, 0.98);
+                font-size: 22px;
+                font-family: "JetBrains Mono";
+                letter-spacing: 1.2px;
+            }
+            Text {
+                text: "This wizard configures Iron Clad's gateway in five steps: API keys, model selection, and voice. Everything stays local — values are written to .ironclad/.env on this machine only.";
+                color: rgba(165, 243, 252, 0.78);
+                font-size: 12px;
+                font-family: "JetBrains Mono";
+                wrap: word-wrap;
+            }
+            Text {
+                text: "You can re-open this wizard any time via the SETUP button in the HUD.";
+                color: rgba(165, 243, 252, 0.55);
+                font-size: 11px;
+                font-family: "JetBrains Mono";
+                wrap: word-wrap;
+            }
+        }
+
+        // -- Step 1: Anthropic --
+        if current_step == 1: VerticalLayout {
+            spacing: 12px;
+            Text {
+                text: "Anthropic API key";
+                color: rgba(207, 250, 254, 0.98);
+                font-size: 16px;
+                font-family: "JetBrains Mono";
+                letter-spacing: 0.6px;
+            }
+            Text {
+                text: "Drives the main agent. Get one at console.anthropic.com — starts with sk-ant-.";
+                color: rgba(165, 243, 252, 0.65);
+                font-size: 10px;
+                font-family: "JetBrains Mono";
+                wrap: word-wrap;
+            }
+            SettingsField {
+                label: "ANTHROPIC API KEY";
+                value <=> root.anthropic_key;
+                obscured: true;
+                placeholder: "sk-ant-…";
+            }
+        }
+
+        // -- Step 2: Model --
+        if current_step == 2: VerticalLayout {
+            spacing: 10px;
+            Text {
+                text: "Pick a model";
+                color: rgba(207, 250, 254, 0.98);
+                font-size: 16px;
+                font-family: "JetBrains Mono";
+                letter-spacing: 0.6px;
+            }
+            Text {
+                text: "Haiku is fast + cheap and matches JARVIS's interactive style. Pick Sonnet/Opus for heavier reasoning tasks.";
+                color: rgba(165, 243, 252, 0.65);
+                font-size: 10px;
+                font-family: "JetBrains Mono";
+                wrap: word-wrap;
+            }
+            WizardRadio {
+                label: "Haiku 4.5  (recommended)";
+                sublabel: "claude-haiku-4-5 — fast, low cost, great for chat";
+                selected: root.model == "claude-haiku-4-5";
+                clicked => { root.model = "claude-haiku-4-5"; }
+            }
+            WizardRadio {
+                label: "Sonnet 4.6";
+                sublabel: "claude-sonnet-4-6 — balanced reasoning";
+                selected: root.model == "claude-sonnet-4-6";
+                clicked => { root.model = "claude-sonnet-4-6"; }
+            }
+            WizardRadio {
+                label: "Opus 4.7";
+                sublabel: "claude-opus-4-7 — heaviest reasoning, slower + costlier";
+                selected: root.model == "claude-opus-4-7";
+                clicked => { root.model = "claude-opus-4-7"; }
+            }
+        }
+
+        // -- Step 3: ElevenLabs --
+        if current_step == 3: VerticalLayout {
+            spacing: 12px;
+            Text {
+                text: "ElevenLabs voice";
+                color: rgba(207, 250, 254, 0.98);
+                font-size: 16px;
+                font-family: "JetBrains Mono";
+                letter-spacing: 0.6px;
+            }
+            Text {
+                text: "Powers TTS playback. Both fields can be left blank to disable voice output; STT still works.";
+                color: rgba(165, 243, 252, 0.65);
+                font-size: 10px;
+                font-family: "JetBrains Mono";
+                wrap: word-wrap;
+            }
+            SettingsField {
+                label: "ELEVENLABS API KEY";
+                value <=> root.elevenlabs_key;
+                obscured: true;
+                placeholder: "sk_…";
+            }
+            SettingsField {
+                label: "ELEVENLABS VOICE ID";
+                value <=> root.elevenlabs_voice_id;
+                placeholder: "a8xldQ1FGKRv2r1v0QSx";
+            }
+        }
+
+        // -- Step 4: Done --
+        if current_step == 4: VerticalLayout {
+            spacing: 12px;
+            Text {
+                text: "Ready.";
+                color: rgba(207, 250, 254, 0.98);
+                font-size: 22px;
+                font-family: "JetBrains Mono";
+                letter-spacing: 1.2px;
+            }
+            Text {
+                text: "Press FINISH to write these values to .ironclad/.env. The gateway needs to restart to pick them up — close + relaunch via `cargo run-jarvis`.";
+                color: rgba(165, 243, 252, 0.78);
+                font-size: 12px;
+                font-family: "JetBrains Mono";
+                wrap: word-wrap;
+            }
+            Text {
+                text: save_status;
+                color: rgba(34, 211, 238, 0.85);
+                font-size: 11px;
+                font-family: "JetBrains Mono";
+                wrap: word-wrap;
+            }
+        }
+
+        Rectangle { vertical-stretch: 1; }
+
+        // Navigation row.
+        HorizontalLayout {
+            spacing: 12px;
+            alignment: space-between;
+            // BACK button (or CANCEL on the first step).
+            Rectangle {
+                width: 110px;
+                height: 38px;
+                border-radius: 10px;
+                background: rgba(34, 211, 238, 0.06);
+                border-color: rgba(34, 211, 238, 0.40);
+                border-width: 1px;
+                Text {
+                    text: current_step == 0 ? "CANCEL" : "BACK";
+                    color: rgba(165, 243, 252, 0.92);
+                    font-size: 11px;
+                    font-family: "JetBrains Mono";
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    letter-spacing: 1.6px;
+                }
+                back_ta := TouchArea {
+                    clicked => {
+                        if (current_step == 0) {
+                            root.cancel();
+                        } else {
+                            root.current_step = current_step - 1;
+                        }
+                    }
+                }
+            }
+            // NEXT / FINISH button.
+            Rectangle {
+                width: 130px;
+                height: 38px;
+                border-radius: 10px;
+                background: save_in_flight
+                    ? rgba(34, 211, 238, 0.10)
+                    : rgba(34, 211, 238, 0.28);
+                border-color: rgba(34, 211, 238, 0.65);
+                border-width: 1px;
+                Text {
+                    text: save_in_flight
+                        ? "SAVING…"
+                        : (current_step == 4 ? "FINISH" : "NEXT →");
+                    color: rgba(207, 250, 254, 0.97);
+                    font-size: 11px;
+                    font-family: "JetBrains Mono";
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    letter-spacing: 1.8px;
+                }
+                next_ta := TouchArea {
+                    clicked => {
+                        if (root.save_in_flight) {
+                            return;
+                        }
+                        if (current_step == 4) {
+                            root.finish();
+                        } else {
+                            root.current_step = current_step + 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// -------------------- top-level switching window ---------------------------
+
+export component MainWindow inherits Window {
+    title: "JARVIS";
+    // OS-native window chrome — real titlebar with close/min/max +
+    // resize handles. Always-on-top is OFF: the window behaves like
+    // any other app, falling behind other windows when focus moves
+    // and joining the normal Alt-Tab cycle. McKale can pin it on
+    // top via the OS's "Always on top" affordance if needed.
+    background: rgba(2, 6, 23, 1.0);
+    in property <image> window_icon;
+    icon: window_icon;
+
+    // Default to expanded so the user lands in the full HUD on first
+    // launch. The mini/floating mode is still reachable via the
+    // expand toggle for users who want a HUD that gets out of the
+    // way; just no longer the boot default.
+    in-out property <bool> expanded: true;
+    // User-resizable column widths. Drag the cyan splitter rules
+    // between Sidebar | HUD | Sub-Agents to change these live.
+    in-out property <length> sidebar_width: 200px;
+    in-out property <length> sub_agents_width: 220px;
+    // SVG icons rasterized at startup on the Rust side. Same vector
+    // source = crisp at any DPI; colorize lets each callsite tint to
+    // its active/idle palette without bundling separate assets.
+    in property <image> gear_icon;
+    in property <image> minify_icon;
+    in property <image> monitor_icon;
+    in property <string> status: "ready";
+    in property <bool> mic_active: false;
+    in property <bool> screen_share_active: false;
+    in property <float> pulse: 0.0;
+    in property <float> spin: 0.0;
+    in property <[TranscriptEntry]> transcript;
+    in property <[SubAgentRow]> sub_agents;
+    in property <string> version: "v2.0";
+    in property <image> reactor_image;
+    in property <bool> parakeet_up: false;
+    in property <bool> elevenlabs_up: false;
+    in property <bool> claude_up: false;
+    in property <bool> gateway_up: false;
+    in property <string> approval_request_id: "";
+    in property <string> approval_tool_name: "";
+    in property <string> approval_description: "";
+    in-out property <string> composer_text: "";
+
+    // Sidebar / settings state
+    in property <[ConversationRow]> conversations;
+    in-out property <bool> settings_open: false;
+    in-out property <bool> wizard_open: false;
+    in-out property <string> anthropic_key;
+    in-out property <string> model;
+    in-out property <string> elevenlabs_key;
+    in-out property <string> elevenlabs_voice_id;
+    in property <bool> heartbeat_enabled: true;
+    in property <bool> autonomous_enabled: false;
+    in property <bool> settings_saving: false;
+    in property <string> settings_status: "";
+    in property <bool> wizard_saving: false;
+    in property <string> wizard_status: "";
+
+    callback select_conversation(string);
+    callback new_conversation();
+    callback toggle_settings();
+    callback save_settings();
+    callback toggle_heartbeat();
+    callback toggle_autonomous();
+    callback export_conversation();
+    callback dismiss_sub_agent(string);
+
+    callback toggle_expand();
+    callback toggle_mic();
+    callback toggle_screen_share();
+    callback send_text(string);
+    callback clear_transcript();
+    callback approve(string, bool);
+    callback deny(string);
+    callback start_drag();
+    callback compact_thread();
+    callback undo_turn();
+    callback redo_turn();
+    callback new_thread();
+    callback open_wizard();
+    callback finish_wizard();
+    callback cancel_wizard();
+
+    // Initial size + minimum (so the user can drag the OS edges to
+    // resize the window freely). `preferred-` becomes the default
+    // launch size; `min-` lets the user shrink down to a usable
+    // floor without breaking the layout. Default expanded width
+    // bumped to 960×780 to match McKale's reference layout (sidebar
+    // ~200 + main HUD ~530 + sub-agents column ~220 ≈ 950).
+    preferred-width: expanded ? 960px : 200px;
+    preferred-height: expanded ? 780px : 240px;
+    min-width: expanded ? 720px : 196px;
+    min-height: expanded ? 520px : 232px;
+
+    if !expanded: FloatingMode {
+        status: root.status;
+        mic_active: root.mic_active;
+        pulse: root.pulse;
+        spin: root.spin;
+        reactor_image: root.reactor_image;
+        toggle_expand => { root.toggle_expand(); }
+        start_drag => { root.start_drag(); }
+    }
+
+    if expanded: Rectangle {
+        HorizontalLayout {
+            spacing: 0px;
+            // Left sidebar: conversation list + settings toggle.
+            Sidebar {
+                width: root.sidebar_width;
+                conversations: root.conversations;
+                settings_open: root.settings_open;
+                gear_icon: root.gear_icon;
+                select_conversation(id) => { root.select_conversation(id); }
+                new_conversation => { root.new_conversation(); }
+                toggle_settings => { root.toggle_settings(); }
+                export_conversation => { root.export_conversation(); }
+            }
+            // Drag this to resize the sidebar.
+            HSplitter {
+                bound_width <=> root.sidebar_width;
+                min_w: 140px;
+                max_w: 360px;
+                drag_grows_left: true;
+            }
+            // Right column: wizard wins if open, then settings, then HUD.
+            Rectangle {
+                background: rgba(2, 6, 23, 0.97);
+                if wizard_open: WizardPanel {
+                    anthropic_key <=> root.anthropic_key;
+                    model <=> root.model;
+                    elevenlabs_key <=> root.elevenlabs_key;
+                    elevenlabs_voice_id <=> root.elevenlabs_voice_id;
+                    save_in_flight: root.wizard_saving;
+                    save_status: root.wizard_status;
+                    finish => { root.finish_wizard(); }
+                    cancel => { root.cancel_wizard(); }
+                }
+                if !wizard_open && settings_open: SettingsPanel {
+                    anthropic_key <=> root.anthropic_key;
+                    model <=> root.model;
+                    elevenlabs_key <=> root.elevenlabs_key;
+                    elevenlabs_voice_id <=> root.elevenlabs_voice_id;
+                    heartbeat_enabled: root.heartbeat_enabled;
+                    autonomous_enabled: root.autonomous_enabled;
+                    save_in_flight: root.settings_saving;
+                    save_status: root.settings_status;
+                    save => { root.save_settings(); }
+                    toggle_heartbeat => { root.toggle_heartbeat(); }
+                    toggle_autonomous => { root.toggle_autonomous(); }
+                }
+                if !wizard_open && !settings_open: FullHud {
+                    status: root.status;
+                    mic_active: root.mic_active;
+                    screen_share_active: root.screen_share_active;
+                    pulse: root.pulse;
+                    spin: root.spin;
+                    transcript: root.transcript;
+                    sub_agents: root.sub_agents;
+                    version: root.version;
+                    reactor_image: root.reactor_image;
+                    minify_icon: root.minify_icon;
+                    monitor_icon: root.monitor_icon;
+                    gateway_up: root.gateway_up;
+                    parakeet_up: root.parakeet_up;
+                    elevenlabs_up: root.elevenlabs_up;
+                    claude_up: root.claude_up;
+                    composer_text <=> root.composer_text;
+                    toggle_expand => { root.toggle_expand(); }
+                    toggle_mic => { root.toggle_mic(); }
+                    toggle_screen_share => { root.toggle_screen_share(); }
+                    send_text(s) => { root.send_text(s); }
+                    clear_transcript => { root.clear_transcript(); }
+                    start_drag => { root.start_drag(); }
+                    compact_thread => { root.compact_thread(); }
+                    undo_turn => { root.undo_turn(); }
+                    redo_turn => { root.redo_turn(); }
+                    new_thread => { root.new_thread(); }
+                    open_wizard => { root.open_wizard(); }
+                }
+            }
+            // Splitter between HUD and the sub-agents column. Drag
+            // grows the right panel (drag-left → wider panel).
+            if !wizard_open && !settings_open: HSplitter {
+                bound_width <=> root.sub_agents_width;
+                min_w: 160px;
+                max_w: 400px;
+                drag_grows_left: false;
+            }
+            // Right-side sub-agents column — only when the main HUD
+            // is showing (wizard/settings get the full width).
+            if !wizard_open && !settings_open: SubAgentsRightPanel {
+                width: root.sub_agents_width;
+                sub_agents: root.sub_agents;
+                dismiss_sub_agent(id) => { root.dismiss_sub_agent(id); }
+            }
+        }
+
+        if approval_request_id != "": Rectangle {
+            y: 56px;
+            x: 14px;
+            width: parent.width - 28px;
+            height: 120px;
+            background: rgba(245, 158, 11, 0.96);
+            border-color: rgba(255, 200, 100, 1);
+            border-width: 1px;
+            border-radius: 10px;
+            drop-shadow-color: rgba(0, 0, 0, 0.5);
+            drop-shadow-blur: 14px;
+            VerticalLayout {
+                padding: 12px;
+                spacing: 6px;
+                Text {
+                    text: "Approval required: " + root.approval_tool_name;
+                    color: rgba(20, 14, 4, 1);
+                    font-size: 13px;
+                    font-family: "JetBrains Mono";
+                }
+                Text {
+                    text: root.approval_description;
+                    color: rgba(40, 28, 8, 1);
+                    font-size: 10px;
+                    font-family: "JetBrains Mono";
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: end;
+                    ApprovalButton {
+                        label: "Approve";
+                        clicked => { root.approve(root.approval_request_id, false); }
+                    }
+                    ApprovalButton {
+                        label: "Always";
+                        clicked => { root.approve(root.approval_request_id, true); }
+                    }
+                    ApprovalButton {
+                        label: "Deny";
+                        clicked => { root.deny(root.approval_request_id); }
+                    }
+                }
+            }
+        }
+    }
+}

@@ -266,17 +266,31 @@ pub struct CallToolResult {
 }
 
 /// Content block in a tool result.
+///
+/// MCP spec wire format is camelCase (`mimeType`), but the Rust idiomatic
+/// snake_case is preserved in the field name via `#[serde(rename)]`.
+/// `mime_type` is `Option` because some servers (Playwright in
+/// particular) sometimes omit it on image blocks when the data itself
+/// is a self-describing data URL. Without these renames, deserialization
+/// failed with "missing field `mime_type`" and the agent loop never got
+/// to see the screenshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
     #[serde(rename = "image")]
-    Image { data: String, mime_type: String },
+    Image {
+        data: String,
+        #[serde(rename = "mimeType", default, skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+    },
     #[serde(rename = "resource")]
     Resource {
         uri: String,
+        #[serde(rename = "mimeType", default, skip_serializing_if = "Option::is_none")]
         mime_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         text: Option<String>,
     },
 }
@@ -286,6 +300,19 @@ impl ContentBlock {
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Self::Text { text } => Some(text),
+            _ => None,
+        }
+    }
+
+    /// Get base64 image data (no `data:` prefix) if this is an image
+    /// block. The agent loop pipes this straight into
+    /// `ToolOutput::with_images` so Anthropic's vision model receives
+    /// real pixels — that's how `browser_take_screenshot` finally
+    /// becomes useful instead of being a tool that returns 1 MB of
+    /// stripped text the model can't see.
+    pub fn as_image_base64(&self) -> Option<&str> {
+        match self {
+            Self::Image { data, .. } => Some(data),
             _ => None,
         }
     }

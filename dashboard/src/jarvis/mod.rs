@@ -542,13 +542,39 @@ pub fn JarvisShell() -> impl IntoView {
                         muted.set(false);
                         mic_initialized.set(true);
                         // Mic open counts as the user gesture that Chrome
-                        // requires to allow subsequent PiP requests from
-                        // non-gesture handlers like visibilitychange. Install
-                        // the auto-PiP listener now so the next time McKale
-                        // switches tabs / minimizes, voice stays alive without
-                        // him having to click anything.
+                        // requires to allow PiP. **Pin PiP RIGHT NOW**
+                        // while we still hold that transient activation
+                        // token — it expires after ~5 seconds, long before
+                        // McKale ever switches tabs. If we wait for the
+                        // visibilitychange listener to fire, Chrome will
+                        // silently reject `requestPictureInPicture` with
+                        // "no active user activation" and voice dies the
+                        // moment the dashboard tab loses focus.
+                        //
+                        // The visibilitychange listener stays installed as
+                        // a re-pin guard in case McKale closes PiP manually
+                        // and then tabs away — though once the activation
+                        // expires, even that fallback won't re-engage. The
+                        // real load-bearing call is the immediate pin
+                        // below.
                         install_auto_pip(move |pinned| {
                             pip_pinned.set(pinned);
+                        });
+                        spawn_local(async move {
+                            match pin_pip().await {
+                                Ok(()) => {
+                                    pip_pinned.set(true);
+                                    web_sys::console::log_1(
+                                        &"[pip] auto-pinned on mic open".into(),
+                                    );
+                                }
+                                Err(e) => {
+                                    web_sys::console::log_1(
+                                        &format!("[pip] auto-pin on mic open failed: {e}")
+                                            .into(),
+                                    );
+                                }
+                            }
                         });
                     }
                     Err(e) => {
@@ -1028,10 +1054,37 @@ fn handle_chat_event(
     );
     match ev {
         ChatEvent::Response { content } => {
-            // Flush any trailing partial sentence into the TTS pipeline so
-            // the audio matches the transcript.
+            // Two cases:
+            //  (a) The response is the END of a streamed turn. StreamChunk
+            //      events fed the splitter and queued TTS per sentence;
+            //      we just flush the trailing partial sentence.
+            //  (b) The response is a STANDALONE message — control commands
+            //      (auto-approve toggle, undo, clear, heartbeat ack) come
+            //      down as a single `Response` event with no prior chunks.
+            //      Without explicit handling, the splitter is empty,
+            //      `finish()` returns None, and the dashboard renders the
+            //      text silently. That was the "no vocal feedback for
+            //      automatic permissions" bug.
+            // Distinguish by whether the streaming buffer was populated.
+            let was_streamed = streaming_buffer.get_untracked().is_some();
             if tts_enabled.get() && tts_ready.get() {
-                if let Some(tail) = splitter.borrow_mut().finish() {
+                let mut s = splitter.borrow_mut();
+                if !was_streamed {
+                    // Standalone response — push the whole content
+                    // through the splitter so its sentences queue for TTS
+                    // exactly like a streamed turn would have.
+                    for sentence in s.push(&content) {
+                        queue_sentence(
+                            sentence,
+                            &tts_queue,
+                            &tts_worker_running,
+                            &audio_queue,
+                            &mic_handle,
+                            token.get(),
+                        );
+                    }
+                }
+                if let Some(tail) = s.finish() {
                     queue_sentence(
                         tail,
                         &tts_queue,

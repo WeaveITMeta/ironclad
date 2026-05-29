@@ -47,6 +47,27 @@ impl SubmissionParser {
             return Submission::Quit;
         }
 
+        // Auto-approval toggle. Both slash-command and natural-language
+        // voice forms — McKale invokes by saying "automate permissions"
+        // or "disable automatic permissions" to JARVIS over the mic.
+        // Phrase matching is deliberately loose; we want this to fire
+        // even with STT errors like "automate permission" (singular) or
+        // "auto approve all".
+        if matches!(
+            lower.as_str(),
+            "/auto on" | "/autoapprove" | "/auto-approve" | "auto on"
+        ) || phrase_means_auto_approve_on(&lower)
+        {
+            return Submission::AutoApprove { enabled: true };
+        }
+        if matches!(
+            lower.as_str(),
+            "/auto off" | "/noauto" | "/no-auto" | "auto off"
+        ) || phrase_means_auto_approve_off(&lower)
+        {
+            return Submission::AutoApprove { enabled: false };
+        }
+
         // /thread <uuid> - switch thread
         if let Some(rest) = lower.strip_prefix("/thread ") {
             let rest = rest.trim();
@@ -172,6 +193,54 @@ pub enum Submission {
 
     /// Quit the agent. Bypasses thread-state checks.
     Quit,
+
+    /// Toggle session-wide automatic permission approval.
+    AutoApprove {
+        /// True to auto-approve every tool except the hard-deny list;
+        /// false to require explicit approval again.
+        enabled: bool,
+    },
+}
+
+/// Match phrases McKale uses by voice to mean "turn on auto-approve".
+/// Loose match — anything mentioning automate/auto/approve + permission
+/// without a negation. STT often mis-segments words so we substring
+/// rather than equality.
+fn phrase_means_auto_approve_on(lower: &str) -> bool {
+    let has_negation = lower.contains("disable")
+        || lower.contains("turn off")
+        || lower.contains("stop ")
+        || lower.contains("don't")
+        || lower.contains("dont ");
+    if has_negation {
+        return false;
+    }
+    let has_subject = lower.contains("permission")
+        || lower.contains("approval")
+        || lower.contains("approve");
+    let has_action = lower.contains("automate")
+        || lower.contains("automatic")
+        || lower.contains("auto-")
+        || lower.contains("auto ")
+        || lower.contains("auto.")
+        || lower.ends_with("auto");
+    has_subject && has_action
+}
+
+/// Inverse: voice phrases that mean "turn off auto-approve".
+fn phrase_means_auto_approve_off(lower: &str) -> bool {
+    let kills = lower.contains("disable")
+        || lower.contains("turn off")
+        || lower.contains("stop ")
+        || lower.contains("manual");
+    let subject = lower.contains("permission")
+        || lower.contains("approval")
+        || lower.contains("approve")
+        || lower.contains("automate")
+        || lower.contains("automatic")
+        || lower.contains("auto-")
+        || lower.contains("auto ");
+    kills && subject
 }
 
 impl Submission {
@@ -238,6 +307,7 @@ impl Submission {
                 | Self::Heartbeat
                 | Self::Summarize
                 | Self::Suggest
+                | Self::AutoApprove { .. }
         )
     }
 }

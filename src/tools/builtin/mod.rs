@@ -18,7 +18,9 @@ mod shell;
 mod spawn_agent;
 mod taskrabbit;
 mod claude_code_transcript;
+mod feedback_log;
 mod time;
+mod weather;
 mod tools_inventory;
 mod vault;
 #[cfg(target_os = "windows")]
@@ -32,6 +34,10 @@ mod windows_window;
 
 pub use claude_code_transcript::ClaudeCodeTranscriptTailTool;
 pub use echo::EchoTool;
+pub use feedback_log::{
+    FeedbackLogReadTool, FeedbackLogWriteTool, append_entry as feedback_append_entry,
+    record_silently as feedback_record_silently,
+};
 pub use ecommerce::EcommerceTool;
 pub use extension_tools::{
     ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool,
@@ -54,6 +60,7 @@ pub use shell::ShellTool;
 pub use spawn_agent::SpawnAgentTool;
 pub use taskrabbit::TaskRabbitTool;
 pub use time::TimeTool;
+pub use weather::WeatherTool;
 pub use tools_inventory::{generate_inventory, ListMyToolsTool};
 pub use vault::{
     VaultDeleteTool, VaultListTool, VaultMoveTool, VaultReadTool, VaultSearchTool,

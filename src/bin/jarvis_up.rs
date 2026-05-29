@@ -206,6 +206,38 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to start Iron Clad")?;
     let h_ironclad = supervise("ironclad", ironclad, shutdown.clone());
 
+    // jarvis-desktop: native always-on-top HUD + floating widget + tray
+    // icon + global hotkeys (Ctrl+Alt+J / Ctrl+Alt+M). Lives alongside
+    // ironclad.exe in the same target directory thanks to the workspace
+    // root, so the sibling-path lookup just works. Skippable for
+    // headless deployments via JARVIS_DESKTOP_ENABLED=false.
+    let h_desktop = if std::env::var("JARVIS_DESKTOP_ENABLED").as_deref() != Ok("false") {
+        match spawn_jarvis_desktop(GATEWAY_PORT) {
+            Ok(Some(child)) => {
+                println!(
+                    "[jarvis-up] starting jarvis-desktop (native HUD; \
+                     hotkeys Ctrl+Alt+J = expand, Ctrl+Alt+M = mute)"
+                );
+                Some(supervise("jarvis-desktop", child, shutdown.clone()))
+            }
+            Ok(None) => {
+                println!(
+                    "[jarvis-up] jarvis-desktop binary not found at sibling path \
+                     (run `cargo build --release --bin jarvis-desktop` first); \
+                     dashboard-only mode"
+                );
+                None
+            }
+            Err(e) => {
+                eprintln!("[jarvis-up] failed to start jarvis-desktop: {e}");
+                None
+            }
+        }
+    } else {
+        println!("[jarvis-up] jarvis-desktop disabled via JARVIS_DESKTOP_ENABLED=false");
+        None
+    };
+
     // WebTransport sidecar for true streaming STT (interim transcripts).
     // Runs alongside the HTTP /inference sidecar; the dashboard prefers WT
     // when /api/voice/streaming-config returns a non-empty cert hash.
@@ -234,6 +266,7 @@ async fn main() -> anyhow::Result<()> {
     handles.extend(h_stt);
     handles.extend(h_wt);
     handles.push(h_ironclad);
+    handles.extend(h_desktop);
 
     tokio::select! {
         res = tokio::signal::ctrl_c() => {
@@ -686,6 +719,41 @@ fn free_port(port: u16) {
     }
 }
 
+
+/// Spawn the native desktop overlay (`jarvis-desktop` binary) and
+/// supervise it. The binary lives in the same target directory as
+/// jarvis_up itself because of the workspace setup, so we resolve it
+/// via `current_exe().parent()/jarvis-desktop[.exe]`. Returns
+/// `Ok(None)` if the binary isn't there — the orchestrator continues
+/// without the desktop and the user gets a one-line nudge to build it.
+fn spawn_jarvis_desktop(gateway_port: u16) -> anyhow::Result<Option<Child>> {
+    let me = std::env::current_exe().context("current_exe")?;
+    let dir = me
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("current_exe has no parent"))?;
+    let name = if cfg!(windows) {
+        "jarvis-desktop.exe"
+    } else {
+        "jarvis-desktop"
+    };
+    let candidate = dir.join(name);
+    if !candidate.exists() {
+        return Ok(None);
+    }
+    let mut cmd = Command::new(&candidate);
+    cmd.env(
+        "JARVIS_GATEWAY_URL",
+        format!("http://127.0.0.1:{gateway_port}"),
+    )
+    // Default to info; let the user crank to debug/trace via the
+    // outer env if something looks off.
+    .env(
+        "RUST_LOG",
+        std::env::var("JARVIS_DESKTOP_LOG").unwrap_or_else(|_| "info".to_string()),
+    )
+    .env("RUST_BACKTRACE", "1");
+    spawn(cmd).map(Some)
+}
 
 fn spawn_ironclad(exe: &Path, gateway_port: u16, whisper_port: u16) -> anyhow::Result<Child> {
     // The gateway port can be held by a previous Iron Clad instance that

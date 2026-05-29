@@ -359,22 +359,31 @@ async fn main() -> anyhow::Result<()> {
     let subagent_providers: Option<(
         Arc<dyn ironclad::llm::LlmProvider>,
         Arc<dyn ironclad::llm::LlmProvider>,
+        Arc<dyn ironclad::llm::LlmProvider>,
     )> = {
         use ironclad::llm::AnthropicProvider;
+        let mut haiku_cfg = config.llm.anthropic.clone();
+        haiku_cfg.model = std::env::var("SUBAGENT_HAIKU_MODEL")
+            .unwrap_or_else(|_| "claude-haiku-4-5".to_string());
         let mut sonnet_cfg = config.llm.anthropic.clone();
         sonnet_cfg.model = std::env::var("SUBAGENT_SONNET_MODEL")
             .unwrap_or_else(|_| "claude-sonnet-4-6".to_string());
         let mut opus_cfg = config.llm.anthropic.clone();
         opus_cfg.model = std::env::var("SUBAGENT_OPUS_MODEL")
             .unwrap_or_else(|_| "claude-opus-4-7".to_string());
-        match (AnthropicProvider::new(sonnet_cfg), AnthropicProvider::new(opus_cfg)) {
-            (Ok(s), Ok(o)) => Some((
+        match (
+            AnthropicProvider::new(haiku_cfg),
+            AnthropicProvider::new(sonnet_cfg),
+            AnthropicProvider::new(opus_cfg),
+        ) {
+            (Ok(h), Ok(s), Ok(o)) => Some((
+                Arc::new(h) as Arc<dyn ironclad::llm::LlmProvider>,
                 Arc::new(s) as Arc<dyn ironclad::llm::LlmProvider>,
                 Arc::new(o) as Arc<dyn ironclad::llm::LlmProvider>,
             )),
-            (Err(e), _) | (_, Err(e)) => {
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
                 tracing::warn!(
-                    "spawn_agent not registered (failed to build Sonnet/Opus providers): {e}"
+                    "spawn_agent not registered (failed to build Haiku/Sonnet/Opus providers): {e}"
                 );
                 None
             }
@@ -549,11 +558,24 @@ async fn main() -> anyhow::Result<()> {
                                     return;
                                 }
                                 (false, _) => {
-                                    McpClient::new_with_name(
-                                        &server_name,
-                                        &server.url,
-                                        Arc::clone(&mcp_sm),
-                                    )
+                                    // Hosted MCPs authed by a long-lived
+                                    // API key (e.g. Strategic Profits)
+                                    // declare static_headers in config. We
+                                    // need to keep the McpServerConfig on
+                                    // the client so resolved_static_headers
+                                    // actually fires at request time.
+                                    if server.static_headers.is_some() {
+                                        McpClient::new_with_static_auth(
+                                            server,
+                                            Arc::clone(&mcp_sm),
+                                        )
+                                    } else {
+                                        McpClient::new_with_name(
+                                            &server_name,
+                                            &server.url,
+                                            Arc::clone(&mcp_sm),
+                                        )
+                                    }
                                 }
                             };
 
@@ -637,6 +659,7 @@ async fn main() -> anyhow::Result<()> {
         "playwright_cdp",
         "playwright",
         "eustress",
+        "sp-shared",
     ];
     let _collapsed = ironclad::tools::mcp::install_namespace_routers(&tools, mcp_namespaces).await;
 
@@ -951,9 +974,10 @@ async fn main() -> anyhow::Result<()> {
     // their completion summaries back to McKale as unsolicited assistant
     // messages.
     let sonnet_for_autonomous: Option<Arc<dyn ironclad::llm::LlmProvider>> =
-        if let Some((sonnet, opus)) = subagent_providers {
+        if let Some((haiku, sonnet, opus)) = subagent_providers {
             let sonnet_clone = Arc::clone(&sonnet);
             tools.register_spawn_agent_tool(
+                haiku,
                 sonnet,
                 opus,
                 Arc::clone(&channels),
@@ -1016,6 +1040,8 @@ async fn main() -> anyhow::Result<()> {
                     "memory_read",
                     "memory_search",
                     "memory_tree",
+                    "feedback_log_read",
+                    "feedback_log_write",
                     "list_my_tools",
                     "mission_lookup",
                     "time",
@@ -1154,6 +1180,56 @@ async fn bootstrap_jarvis_identity(workspace: &Arc<ironclad::workspace::Workspac
                 }
             }
         }
+    }
+
+    // Live-sync the rich vault docs into the workspace every boot. McKale
+    // edits CLIENT-PROFILE.md and CLIENT-DOSSIER.md in Obsidian; the next
+    // JARVIS restart picks them up and Workspace::system_prompt() injects
+    // them into every turn. Runtime read (not include_str!) so a vault edit
+    // doesn't need a recompile.
+    let vault_root = std::env::var("VAULT_PATH")
+        .ok()
+        .map(std::path::PathBuf::from);
+    if let Some(root) = vault_root {
+        let vault_synced: &[(&str, &str)] = &[
+            ("CLIENT-PROFILE.md", "00 System/CLIENT-PROFILE.md"),
+            ("CLIENT-DOSSIER.md", "00 System/CLIENT-DOSSIER.md"),
+            ("VAULT-SUMMARY.md",  "00 System/VAULT-SUMMARY.md"),
+            ("WISHLIST.md",       "00 System/WISHLIST.md"),
+            ("MY-TOOLKIT.md",     "00 System/MY-TOOLKIT.md"),
+        ];
+        for (workspace_path, vault_rel) in vault_synced {
+            let src = root.join(vault_rel);
+            match tokio::fs::read_to_string(&src).await {
+                Ok(content) => {
+                    if let Err(e) = workspace.write(workspace_path, &content).await {
+                        tracing::warn!(
+                            "failed to refresh {} from vault {}: {}",
+                            workspace_path,
+                            src.display(),
+                            e
+                        );
+                    } else {
+                        tracing::info!(
+                            "refreshed {} from vault ({} bytes)",
+                            workspace_path,
+                            content.len()
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "vault doc {} not readable, skipping ({})",
+                        src.display(),
+                        e
+                    );
+                }
+            }
+        }
+    } else {
+        tracing::debug!(
+            "VAULT_PATH not set, skipping CLIENT-PROFILE/DOSSIER sync"
+        );
     }
 }
 

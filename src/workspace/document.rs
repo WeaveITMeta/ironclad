@@ -19,6 +19,26 @@ pub mod paths {
     pub const AGENTS: &str = "AGENTS.md";
     /// User context (name, preferences).
     pub const USER: &str = "USER.md";
+    /// Full client profile (synced from the vault at boot). Deep biography,
+    /// goals, obstacles, history. Loaded into the system prompt every turn so
+    /// JARVIS opens every conversation already knowing the user.
+    pub const CLIENT_PROFILE: &str = "CLIENT-PROFILE.md";
+    /// Full client dossier (synced from the vault at boot). Operational
+    /// context: ventures, calendar, decisions, current state. Loaded into the
+    /// system prompt every turn.
+    pub const CLIENT_DOSSIER: &str = "CLIENT-DOSSIER.md";
+    /// Vault map (synced from the vault at boot). Tells JARVIS where things
+    /// live: folder structure, project locations, navigation hints.
+    pub const VAULT_SUMMARY: &str = "VAULT-SUMMARY.md";
+    /// User wishlist (synced from the vault at boot). What McKale wants JARVIS
+    /// to be able to do, ranked by priority. Loaded into every system prompt
+    /// so the model carries McKale's stated intent into every turn.
+    pub const WISHLIST: &str = "WISHLIST.md";
+    /// User toolkit (synced from the vault at boot). The set of tools, methods,
+    /// and recurring workflows McKale uses; the canonical answer to "what do
+    /// I have at my disposal." Injected into the system prompt so JARVIS can
+    /// reach for the right tool before asking.
+    pub const MY_TOOLKIT: &str = "MY-TOOLKIT.md";
     /// Periodic checklist for heartbeat.
     pub const HEARTBEAT: &str = "HEARTBEAT.md";
     /// Auto-generated inventory of the tools the agent has access to.

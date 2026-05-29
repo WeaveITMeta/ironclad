@@ -279,26 +279,9 @@ fn pcm_le_to_floats(bytes: &[u8]) -> Vec<f32> {
     out
 }
 
-/// POST text to `/api/voice/tts`, get back wav bytes.
-pub async fn post_tts(token: &str, text: &str) -> Result<Vec<u8>, String> {
-    #[derive(Serialize)]
-    struct B<'a> {
-        text: &'a str,
-    }
-    let resp = Request::post(&url("/api/voice/tts"))
-        .header("authorization", &format!("Bearer {token}"))
-        .header("content-type", "application/json")
-        .json(&B { text })
-        .map_err(|e| format!("encode: {e}"))?
-        .send()
-        .await
-        .map_err(|e| format!("net: {e}"))?;
-    if !resp.ok() {
-        return Err(format!("tts {}", resp.status()));
-    }
-    let bytes = resp.binary().await.map_err(|e| format!("read: {e}"))?;
-    Ok(bytes)
-}
+// Deleted: post_tts (non-streaming) pointed at /api/voice/tts which
+// doesn't exist on the gateway. The streaming version
+// (post_tts_stream → /api/voice/tts_stream) is the only TTS endpoint.
 
 /// SSE URL for the chat event stream (auth via query param since EventSource
 /// can't set headers). The gateway issues alphanumeric tokens so no escaping

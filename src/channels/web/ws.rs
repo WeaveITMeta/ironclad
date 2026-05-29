@@ -407,7 +407,7 @@ mod tests {
             shutdown_tx: tokio::sync::RwLock::new(None),
             ws_tracker: Some(Arc::new(WsConnectionTracker::new())),
             voice: crate::config::VoiceConfig::default(),
-            piper_daemon: None,
+            tts_client: reqwest::Client::new(),
             auth_token: "test-token".to_string(),
         }
     }

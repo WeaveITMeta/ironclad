@@ -121,6 +121,26 @@ pub enum StatusUpdate {
         description: String,
         parameters: serde_json::Value,
     },
+    /// A sub-agent (parallel sub-task, background handler, fan-out
+    /// worker) has started. Clients render this as a row in the
+    /// "Sub-Agents" panel so the user can see what parallel work the
+    /// main agent dispatched.
+    SubAgentStarted {
+        id: String,
+        label: String,
+        kind: String,
+    },
+    /// A previously-started sub-agent has progress to report. Updates
+    /// the existing row's status_message in place.
+    SubAgentProgress { id: String, message: String },
+    /// A previously-started sub-agent has finished. Clients mark the
+    /// row done (with success/fail indicator + summary) and may fade
+    /// it out after a short hold.
+    SubAgentCompleted {
+        id: String,
+        success: bool,
+        summary: String,
+    },
 }
 
 /// Trait for message channels.

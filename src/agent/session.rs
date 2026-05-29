@@ -38,7 +38,23 @@ pub struct Session {
     /// Tools that have been auto-approved for this session ("always approve").
     #[serde(default)]
     pub auto_approved_tools: HashSet<String>,
+    /// When true, every tool except those in `HARD_DENY_TOOLS` is
+    /// auto-approved. Set via voice ("automate permissions") or slash
+    /// command (`/auto on`); cleared with "disable automatic
+    /// permissions" / `/auto off`. Persisted into Fjall like the rest
+    /// of session state so it survives across restarts.
+    #[serde(default)]
+    pub auto_approve_all: bool,
 }
+
+/// Tools that NEVER get auto-approved, even when `auto_approve_all` is
+/// on. One-way / irreversible / pull-the-floor-out operations stay
+/// gated behind an explicit human "yes". Mirror the autonomous loop's
+/// deny list — same reasoning applies.
+pub const HARD_DENY_TOOLS: &[&str] = &[
+    "vault_delete",
+    "windows_new_desktop",
+];
 
 impl Session {
     /// Create a new session.
@@ -53,17 +69,38 @@ impl Session {
             last_active_at: now,
             metadata: serde_json::Value::Null,
             auto_approved_tools: HashSet::new(),
+            auto_approve_all: std::env::var("IRONCLAD_AUTO_APPROVE")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false),
         }
     }
 
-    /// Check if a tool has been auto-approved for this session.
+    /// Check if a tool has been auto-approved for this session. Honors
+    /// the session-wide `auto_approve_all` flag, but the hard deny list
+    /// always wins — even when blanket auto-approve is on, vault_delete
+    /// and other one-way operations still require an explicit yes.
     pub fn is_tool_auto_approved(&self, tool_name: &str) -> bool {
+        if HARD_DENY_TOOLS.contains(&tool_name) {
+            return false;
+        }
+        if self.auto_approve_all {
+            return true;
+        }
         self.auto_approved_tools.contains(tool_name)
     }
 
-    /// Add a tool to the auto-approved set.
+    /// Add a tool to the per-tool auto-approved set (the "always" path
+    /// from a single approval banner).
     pub fn auto_approve_tool(&mut self, tool_name: impl Into<String>) {
         self.auto_approved_tools.insert(tool_name.into());
+    }
+
+    /// Flip the session-wide blanket auto-approval. Returns the new
+    /// state so the caller can echo it back to the user.
+    pub fn set_auto_approve_all(&mut self, enabled: bool) -> bool {
+        self.auto_approve_all = enabled;
+        self.last_active_at = Utc::now();
+        enabled
     }
 
     /// Create a new thread in this session.

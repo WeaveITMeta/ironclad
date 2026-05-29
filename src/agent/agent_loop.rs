@@ -27,6 +27,57 @@ use crate::tools::ToolRegistry;
 use crate::workspace::Workspace;
 
 /// Collapse a tool output string into a single-line preview for display.
+/// Build a short, actionable lesson string for a failed tool call so
+/// the feedback log entry has something the next tick can actually use.
+/// Pattern-matches on common Windows / GitHub / shell / Playwright
+/// failures; falls back to a generic "look before re-running" hint.
+fn derive_failure_lesson(tool: &str, error: &str) -> String {
+    let e = error.to_ascii_lowercase();
+    if e.contains("is a directory") {
+        return format!(
+            "Path was a directory — for '{}'-style reads, call list_dir first to discover files",
+            tool
+        );
+    }
+    if e.contains("access is denied") || e.contains("access denied") {
+        return format!(
+            "Access denied — '{}' targeted a path outside our permissions. Try a workspace path \
+             or use vault_read instead",
+            tool
+        );
+    }
+    if e.contains("404 not found") || e.contains("not found") {
+        return format!(
+            "Resource not found — verify the identifier exists before calling '{}' again (e.g. \
+             user vs org for github, exact path for vault_read)",
+            tool
+        );
+    }
+    if e.contains("session not found") || e.contains("not initialized") {
+        return format!(
+            "MCP session expired — the client self-heals on retry, but consider whether the '{}' \
+             call is needed at all",
+            tool
+        );
+    }
+    if e.contains("setforegroundwindow refused") {
+        return "Foreground-lock hit — focus_window now retries with Alt-tap + AttachThreadInput. \
+                If still failing, the target app may be admin-elevated"
+            .to_string();
+    }
+    if e.contains("timed out") || e.contains("timeout") {
+        return format!(
+            "'{}' timed out — narrow scope or skip; don't burn another iteration on the same call",
+            tool
+        );
+    }
+    format!(
+        "'{}' failed: {} — read the error message and pick a different approach next time",
+        tool,
+        error.chars().take(180).collect::<String>()
+    )
+}
+
 fn truncate_for_preview(output: &str, max_chars: usize) -> String {
     let collapsed: String = output
         .chars()
@@ -454,6 +505,9 @@ impl Agent {
             Submission::Summarize => self.process_summarize(session, thread_id).await,
             Submission::Suggest => self.process_suggest(session, thread_id).await,
             Submission::Quit => return Ok(None),
+            Submission::AutoApprove { enabled } => {
+                self.process_auto_approve(session, enabled).await
+            }
             Submission::SwitchThread { thread_id: target } => {
                 self.process_switch_thread(message, target).await
             }
@@ -802,6 +856,15 @@ impl Agent {
         const MAX_TOOL_ITERATIONS: usize = 10;
         let mut iteration = 0;
         let mut tools_executed = resume_after_tool;
+        // Cache of tool-call signatures already executed THIS agentic
+        // loop. If the model re-asks for the exact same (name, args) in
+        // a later iteration, we short-circuit with the prior result
+        // instead of re-running the tool. Prevents the cost of
+        // pathological re-navigation loops (e.g. same Playwright URL
+        // across multiple browser profiles) and gives Sonnet a strong
+        // signal "you already did this, decide based on the result."
+        let mut tool_signature_cache: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
 
         loop {
             iteration += 1;
@@ -1020,6 +1083,35 @@ impl Agent {
                             )
                             .await;
 
+                        // Dedup check FIRST so we don't fire a
+                        // SubAgentStarted card for a call we're about
+                        // to short-circuit to a cached result. The
+                        // earlier behavior was: emit Started → check
+                        // cache → emit Completed-as-duplicate, which
+                        // floods the HUD's Sub-Agents panel with
+                        // repeated "duplicate call" rows that don't
+                        // represent real parallel work. Now: cached
+                        // calls produce zero card-traffic.
+                        let signature =
+                            format!("{}::{}", tc.name, tc.arguments);
+                        let cached_hit = tool_signature_cache.get(&signature).cloned();
+                        let is_cache_hit = cached_hit.is_some();
+
+                        if !is_cache_hit {
+                            let _ = self
+                                .channels
+                                .send_status(
+                                    &message.channel,
+                                    StatusUpdate::SubAgentStarted {
+                                        id: tc.id.clone(),
+                                        label: tc.name.clone(),
+                                        kind: "tool_exec".to_string(),
+                                    },
+                                    &message.metadata,
+                                )
+                                .await;
+                        }
+
                         // Use the full variant so we can plumb any images
                         // the tool attached into the Claude tool_result.
                         // Split the tuple immediately so the rest of the
@@ -1027,12 +1119,33 @@ impl Agent {
                         // auth-await detection) can keep operating on a
                         // plain `Result<String, _>`.
                         let (tool_result, tool_images): (Result<String, Error>, Vec<String>) =
-                            match self
-                                .execute_chat_tool_full(&tc.name, &tc.arguments, &job_ctx)
-                                .await
-                            {
-                                Ok((text, images)) => (Ok(text), images),
-                                Err(e) => (Err(e), Vec::new()),
+                            if let Some(prior) = cached_hit {
+                                tracing::info!(
+                                    "🔁 tool '{}' called with identical args this turn; \
+                                     returning cached result instead of re-running",
+                                    tc.name
+                                );
+                                (
+                                    Ok(format!(
+                                        "[duplicate call — same args already executed earlier this turn]\n{}",
+                                        prior
+                                    )),
+                                    Vec::new(),
+                                )
+                            } else {
+                                match self
+                                    .execute_chat_tool_full(&tc.name, &tc.arguments, &job_ctx)
+                                    .await
+                                {
+                                    Ok((text, images)) => {
+                                        // Cache the successful text result for
+                                        // future iterations in this turn.
+                                        tool_signature_cache
+                                            .insert(signature.clone(), text.clone());
+                                        (Ok(text), images)
+                                    }
+                                    Err(e) => (Err(e), Vec::new()),
+                                }
                             };
 
                         let _ = self
@@ -1047,6 +1160,30 @@ impl Agent {
                             )
                             .await;
 
+                        // Sub-agent completion mirror of the
+                        // ToolStarted-time SubAgentStarted: same id,
+                        // so the Slint HUD updates the existing row.
+                        let sa_summary = match &tool_result {
+                            Ok(s) => truncate_for_preview(s, 80),
+                            Err(e) => format!("error: {}", truncate_for_preview(&e.to_string(), 60)),
+                        };
+                        // Skip the Completed event symmetrically with
+                        // the Started event we skipped for cache hits.
+                        if !is_cache_hit {
+                            let _ = self
+                                .channels
+                                .send_status(
+                                    &message.channel,
+                                    StatusUpdate::SubAgentCompleted {
+                                        id: tc.id.clone(),
+                                        success: tool_result.is_ok(),
+                                        summary: sa_summary,
+                                    },
+                                    &message.metadata,
+                                )
+                                .await;
+                        }
+
                         if let Ok(ref output) = tool_result {
                             if !output.is_empty() {
                                 let _ = self
@@ -1060,6 +1197,40 @@ impl Agent {
                                         &message.metadata,
                                     )
                                     .await;
+                            }
+                        }
+
+                        // Auto-capture tool failures into the feedback
+                        // log. The model can forget to reflect, but the
+                        // runtime can't forget — every failed call leaves
+                        // a durable lesson so the next tick or next
+                        // session can avoid the same dead end.
+                        if let Err(ref e) = tool_result {
+                            if let Some(ws) = self.workspace() {
+                                let err_text = e.to_string();
+                                let args_preview = {
+                                    let s = tc.arguments.to_string();
+                                    if s.len() > 240 {
+                                        format!("{}...", &s[..240])
+                                    } else {
+                                        s
+                                    }
+                                };
+                                let summary = format!(
+                                    "{}({}) failed: {}",
+                                    tc.name,
+                                    args_preview,
+                                    truncate_for_preview(&err_text, 200)
+                                );
+                                let lesson = derive_failure_lesson(&tc.name, &err_text);
+                                crate::tools::builtin::feedback_record_silently(
+                                    ws.as_ref(),
+                                    "tool_failure",
+                                    &summary,
+                                    &lesson,
+                                    Some(&tc.name),
+                                )
+                                .await;
                             }
                         }
 
@@ -1433,6 +1604,27 @@ impl Agent {
         undo_mgr.lock().await.clear();
 
         Ok(SubmissionResult::ok_with_message("Thread cleared."))
+    }
+
+    /// Flip the session-wide automatic permission flag. McKale toggles
+    /// this by voice ("automate permissions" / "disable automatic
+    /// permissions") or by `/auto on` / `/auto off`. When on, every
+    /// tool except the hard-deny list runs without an approval banner;
+    /// when off, normal per-tool approval resumes.
+    async fn process_auto_approve(
+        &self,
+        session: Arc<Mutex<Session>>,
+        enabled: bool,
+    ) -> Result<SubmissionResult, Error> {
+        let mut sess = session.lock().await;
+        sess.set_auto_approve_all(enabled);
+        let msg = if enabled {
+            "Automatic permissions on. Every tool runs without asking, except the hard deny list (vault_delete, windows_new_desktop). Say 'disable automatic permissions' to turn off."
+        } else {
+            "Automatic permissions off. Sensitive tools will ask again."
+        };
+        tracing::info!("auto_approve_all = {} for session {}", enabled, sess.id);
+        Ok(SubmissionResult::ok_with_message(msg))
     }
 
     /// Process an approval or rejection of a pending tool execution.

@@ -68,15 +68,23 @@ impl Default for VadConfig {
             // against the silly case where the room is dead silent.
             speech_threshold: 0.010,
             barge_in_threshold: 0.05,
-            // 2 frames at 80ms = 160ms. Words like "test" or "go" don't
-            // sustain 250ms continuous voicing, especially after the pre-utt
-            // hangover squeezes through brief silences.
-            min_speech_ms: 160,
-            // 1.2s of silence ends an utterance. Long enough for a natural
-            // breath / mid-sentence pause but short enough to feel responsive
-            // for a one-word command.
-            endpoint_silence_ms: 1200,
-            frame_ms: 80,
+            // 2-3 frames at 40ms = 80-120ms. One-word commands ("stop",
+            // "yes", "no", "JARVIS") have to fire within ~100ms of voice
+            // onset or they feel laggy.
+            min_speech_ms: 100,
+            // Aggressive endpoint detection: 350ms of silence ends an
+            // utterance. Industry-standard fast endpointing (Alexa-class)
+            // sits around 300-500ms; we pick the lower end because McKale
+            // explicitly asked for instant pickup. Trade-off: mid-sentence
+            // breaths longer than 350ms will get cut. If that becomes a
+            // problem in practice, the right fix is Silero VAD scoring
+            // the audio for "speech vs. trailing breath" rather than
+            // ratcheting this number back up.
+            endpoint_silence_ms: 350,
+            // VAD ticks every 40ms instead of 80ms — twice the
+            // responsiveness for sub-1% additional CPU. Endpointing
+            // resolution improves from 80ms-quantized to 40ms-quantized.
+            frame_ms: 40,
         }
     }
 }
@@ -821,15 +829,12 @@ fn find_sentence_boundary(s: &str) -> Option<usize> {
                 i += 1;
                 continue;
             }
-            // Skip decimals: "3.14" — digit before, digit after.
-            if c == b'.' && i > 0 && bytes[i - 1].is_ascii_digit() {
-                if let Some(prev_word_end) = bytes.get(i + 1).copied() {
-                    if prev_word_end.is_ascii_digit() {
-                        i += 1;
-                        continue;
-                    }
-                }
-            }
+            // Note: there's no explicit decimal-skip here. The outer
+            // "must be followed by whitespace" guard at the top of this
+            // block already rejects "3.14" because '.' is followed by
+            // '1' (not whitespace). Earlier this carried a dead
+            // belt-and-braces decimal check that confused reviewers; it
+            // was a no-op against the outer guard. Removed for clarity.
             // Skip common abbreviations: "Mr.", "Mrs.", "Dr.", "etc.", "Inc.", "Co.", "vs."
             if c == b'.' {
                 let head = &s[..i];

@@ -1,17 +1,22 @@
-//! Native Windows Virtual Desktop control.
+//! Native Windows Virtual Desktop control via the `winvd_helper`
+//! subprocess.
 //!
-//! Talks to the undocumented `IVirtualDesktopManagerInternal` COM interface
-//! through the `winvd` crate, which keeps the GUID/vtable mappings in
-//! sync with Windows 11 builds. The thin native layer avoids the
-//! PowerShell `VirtualDesktop` module dependency and shaves the
-//! shell-out latency off every desktop operation.
+//! winvd's undocumented COM calls into `IVirtualDesktopManagerInternal`
+//! throw 0xC0000005 access violations whenever the Windows 11 COM
+//! interface IDs shift between builds (1-2x per year, plus the gap
+//! while the winvd crate catches up). Those are SEH exceptions, NOT
+//! Rust panics — `catch_unwind` cannot trap them, and they take down
+//! the entire ironclad process: every Playwright instance, the
+//! autonomous loop, voice, all of it.
 //!
-//! Trade-off (per `WISHLIST.md` discussion): when Microsoft ships a Win11
-//! build that shifts the internal COM interface IDs (1–2× per year), the
-//! tools throw `winvd`-level errors until that crate updates. The
-//! `winvd` crate has been keeping pace; if it ever falls behind, the
-//! fallback is to swap to the PowerShell-backed implementation listed in
-//! the wishlist for ~30 minutes of work.
+//! The fix is process isolation. The `winvd_helper.exe` sibling binary
+//! does the COM call and prints JSON. We exec it for every desktop
+//! operation. A crash there means a non-zero exit code here — we
+//! surface a clean ToolError. The parent never dies.
+//!
+//! The Win32 `find_window_handle` helper at the bottom of this file is
+//! NOT a winvd call (it's plain EnumWindows + GetWindowText) and stays
+//! in-process. windows_input.rs and windows_window.rs use it too.
 
 use std::time::Instant;
 
@@ -19,6 +24,67 @@ use async_trait::async_trait;
 
 use crate::context::JobContext;
 use crate::tools::tool::{Tool, ToolError, ToolOutput};
+
+// =============================================================================
+// helper subprocess dispatch
+// =============================================================================
+
+/// Invoke the `winvd_helper` sibling binary with the given args, capture
+/// stdout (single-line JSON), parse it. Non-zero exit code surfaces as
+/// a `ToolError::ExecutionFailed` with the helper's stderr; 0xC0000005
+/// crashes inside the helper produce a distinct error message so the
+/// LLM (and the user reading logs) knows what just happened.
+#[cfg(target_os = "windows")]
+async fn run_helper(args: Vec<String>) -> Result<serde_json::Value, ToolError> {
+    let exe = helper_exe_path()?;
+    let output = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(&exe).args(&args).output()
+    })
+    .await
+    .map_err(|e| ToolError::ExecutionFailed(format!("spawn join: {e}")))?
+    .map_err(|e| ToolError::ExecutionFailed(format!("spawn winvd_helper: {e}")))?;
+
+    if !output.status.success() {
+        // Distinguish a logical error (helper printed to stderr + exit 1)
+        // from a COM crash (no stderr, exit code is the raw exception code
+        // or a negative number Windows surfaces as i32::from(u32) bits).
+        let code = output.status.code();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let reason = match (code, stderr.as_str()) {
+            (Some(1), s) if !s.is_empty() => format!("winvd_helper error: {s}"),
+            (Some(c), s) if !s.is_empty() => format!("winvd_helper exit {c}: {s}"),
+            (Some(c), _) => format!(
+                "winvd_helper crashed with exit code {c} (0x{:08X}) — likely a COM \
+                 access violation from a Windows 11 build shift. Restart usually \
+                 clears it; if it persists, the winvd crate needs a bump.",
+                c as u32
+            ),
+            (None, s) => format!("winvd_helper killed by signal: {s}"),
+        };
+        return Err(ToolError::ExecutionFailed(reason));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str::<serde_json::Value>(stdout.trim())
+        .map_err(|e| ToolError::ExecutionFailed(format!("parse helper output: {e}; raw: {stdout}")))
+}
+
+/// Resolve the path to the `winvd_helper.exe` sibling binary. It's built
+/// alongside `ironclad.exe` and `jarvis_up.exe` in the same target dir.
+/// Allow override via `IRONCLAD_WINVD_HELPER` if a packaging build needs
+/// to drop the helper somewhere else.
+#[cfg(target_os = "windows")]
+fn helper_exe_path() -> Result<std::path::PathBuf, ToolError> {
+    if let Ok(p) = std::env::var("IRONCLAD_WINVD_HELPER") {
+        return Ok(std::path::PathBuf::from(p));
+    }
+    let current = std::env::current_exe()
+        .map_err(|e| ToolError::ExecutionFailed(format!("current_exe: {e}")))?;
+    let dir = current
+        .parent()
+        .ok_or_else(|| ToolError::ExecutionFailed("current_exe has no parent".to_string()))?;
+    Ok(dir.join("winvd_helper.exe"))
+}
 
 // =============================================================================
 // list desktops
@@ -34,7 +100,9 @@ impl Tool for WindowsListDesktopsTool {
 
     fn description(&self) -> &str {
         "List Windows 11 virtual desktops. Returns { count, current_index, \
-         desktops: [{index, name, current}] }. Read-only, no approval needed."
+         desktops: [{index, name, current}] }. Runs in an isolated \
+         subprocess so a winvd COM crash can't take down the gateway. \
+         Read-only, no approval needed."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -53,45 +121,18 @@ impl Tool for WindowsListDesktopsTool {
         let start = Instant::now();
         #[cfg(target_os = "windows")]
         {
-            let (count, current_idx, names) = tokio::task::spawn_blocking(|| {
-                // catch_unwind around the winvd COM calls. winvd talks to
-                // undocumented Windows COM interfaces whose vtable layouts
-                // can shift between Win11 builds — a Rust panic inside its
-                // shim would otherwise propagate as UB. A native SEH
-                // access violation bypasses this and still crashes (those
-                // are the 0xC0000005 exits); for those we need WER /
-                // minidump-level handling, which is out of scope here.
-                use std::panic::{catch_unwind, AssertUnwindSafe};
-                let result: Result<Result<(usize, u32, Vec<String>), String>, _> =
-                    catch_unwind(AssertUnwindSafe(|| {
-                        let desktops = winvd::get_desktops()
-                            .map_err(|e| format!("get_desktops: {:?}", e))?;
-                        let current = winvd::get_current_desktop()
-                            .map_err(|e| format!("get_current_desktop: {:?}", e))?;
-                        let current_idx = current
-                            .get_index()
-                            .map_err(|e| format!("current index: {:?}", e))?;
-                        let mut names = Vec::new();
-                        for d in &desktops {
-                            let n = d.get_name().unwrap_or_default();
-                            names.push(n);
-                        }
-                        Ok((desktops.len(), current_idx, names))
-                    }));
-                match result {
-                    Ok(Ok(v)) => Ok(v),
-                    Ok(Err(e)) => Err(e),
-                    Err(_) => Err(
-                        "winvd panicked inside get_desktops; likely COM vtable mismatch \
-                         (Win11 build vs. winvd 0.0.46). Try WINDOWS_DESKTOP_TOOLS=0 \
-                         to disable these tools."
-                            .to_string(),
-                    ),
-                }
-            })
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("join: {e}")))?
-            .map_err(ToolError::ExecutionFailed)?;
+            let v = run_helper(vec!["list".to_string()]).await?;
+            let count = v.get("count").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+            let current_idx = v.get("current_idx").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+            let names: Vec<String> = v
+                .get("names")
+                .and_then(|x| x.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|n| n.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
 
             let desks: Vec<serde_json::Value> = names
                 .into_iter()
@@ -147,7 +188,8 @@ impl Tool for WindowsSwitchDesktopTool {
     fn description(&self) -> &str {
         "Switch the active Windows 11 virtual desktop by zero-based index. \
          Approval-gated — visibly changes the screen. Call windows_list_desktops \
-         first if you don't know how many desktops exist."
+         first if you don't know how many desktops exist. Runs through an \
+         isolated subprocess so a COM crash won't kill the gateway."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -178,14 +220,7 @@ impl Tool for WindowsSwitchDesktopTool {
 
         #[cfg(target_os = "windows")]
         {
-            tokio::task::spawn_blocking(move || {
-                let d = winvd::get_desktop(idx);
-                winvd::switch_desktop(d).map_err(|e| format!("switch_desktop: {:?}", e))
-            })
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("join: {e}")))?
-            .map_err(ToolError::ExecutionFailed)?;
-
+            run_helper(vec!["switch".to_string(), idx.to_string()]).await?;
             return Ok(ToolOutput::success(
                 serde_json::json!({ "status": "switched", "index": idx }),
                 start.elapsed(),
@@ -223,7 +258,10 @@ impl Tool for WindowsNewDesktopTool {
 
     fn description(&self) -> &str {
         "Create a new Windows 11 virtual desktop. Optional `name` labels it \
-         (visible in Task View). Returns the new desktop's index. Approval-gated."
+         (visible in Task View). Returns the new desktop's index. \
+         Approval-gated. Subprocess-isolated so a COM crash won't kill \
+         the gateway. The 30-desktop Win11 cap is enforced inside the \
+         helper."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -251,38 +289,17 @@ impl Tool for WindowsNewDesktopTool {
 
         #[cfg(target_os = "windows")]
         {
-            // Windows 11 hard-caps virtual desktops at 30. Refuse the
-            // create call instead of letting the OS swallow it silently.
-            let existing = tokio::task::spawn_blocking(|| {
-                winvd::get_desktops()
-                    .map(|d| d.len())
-                    .map_err(|e| format!("count: {:?}", e))
-            })
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("join: {e}")))?
-            .map_err(ToolError::ExecutionFailed)?;
-            if existing >= 30 {
-                return Err(ToolError::ExecutionFailed(format!(
-                    "Windows 11 caps virtual desktops at 30. You currently have {existing}; \
-                     delete one before creating a new desktop."
-                )));
+            let mut args = vec!["create".to_string()];
+            if let Some(n) = &name {
+                args.push(n.clone());
             }
-
-            let new_idx = tokio::task::spawn_blocking(move || {
-                let d = winvd::create_desktop().map_err(|e| format!("create: {:?}", e))?;
-                if let Some(n) = &name {
-                    let _ = d.set_name(n);
-                }
-                d.get_index().map_err(|e| format!("get_index: {:?}", e))
-            })
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("join: {e}")))?
-            .map_err(ToolError::ExecutionFailed)?;
-
+            let v = run_helper(args).await?;
+            let new_idx = v.get("idx").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
             return Ok(ToolOutput::success(
                 serde_json::json!({
                     "status": "created",
                     "index": new_idx,
+                    "name": name,
                 }),
                 start.elapsed(),
             ));
@@ -321,7 +338,8 @@ impl Tool for WindowsMoveWindowToDesktopTool {
         "Move a window to a different Windows 11 virtual desktop. Identify the \
          window by `process` (process name, e.g. 'chrome', 'code') OR \
          `title_contains` (case-insensitive title substring). If multiple \
-         matches exist, the first visible top-level window wins. Approval-gated."
+         matches exist, the first visible top-level window wins. \
+         Approval-gated. Subprocess-isolated for the COM call portion."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -374,6 +392,8 @@ impl Tool for WindowsMoveWindowToDesktopTool {
 
         #[cfg(target_os = "windows")]
         {
+            // Step 1: find the hwnd in-process (Win32 EnumWindows, no
+            // winvd involved, so it's safe to run here).
             let process_for_blocking = process.clone();
             let title_for_blocking = title.clone();
             let (hwnd_raw, matched_title) = tokio::task::spawn_blocking(move || {
@@ -384,15 +404,13 @@ impl Tool for WindowsMoveWindowToDesktopTool {
             .map_err(|e| ToolError::ExecutionFailed(format!("join: {e}")))?
             .map_err(ToolError::ExecutionFailed)?;
 
-            tokio::task::spawn_blocking(move || {
-                let d = winvd::get_desktop(idx);
-                let hwnd = windows::Win32::Foundation::HWND(hwnd_raw);
-                winvd::move_window_to_desktop(d, &hwnd)
-                    .map_err(|e| format!("move_window_to_desktop: {:?}", e))
-            })
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("join: {e}")))?
-            .map_err(ToolError::ExecutionFailed)?;
+            // Step 2: hand the hwnd + desktop index to the subprocess.
+            run_helper(vec![
+                "move".to_string(),
+                hwnd_raw.to_string(),
+                idx.to_string(),
+            ])
+            .await?;
 
             return Ok(ToolOutput::success(
                 serde_json::json!({
@@ -423,7 +441,9 @@ impl Tool for WindowsMoveWindowToDesktopTool {
 }
 
 // =============================================================================
-// Win32 helpers — only compiled on Windows
+// Win32 helpers — only compiled on Windows. NOT a winvd call: pure
+// EnumWindows + GetWindowText, safe to run in-process. Used by
+// windows_input.rs and windows_window.rs as well.
 // =============================================================================
 
 #[cfg(target_os = "windows")]
@@ -457,7 +477,6 @@ pub(crate) fn find_window_handle(
             if !IsWindowVisible(hwnd).as_bool() {
                 return TRUE;
             }
-            // Read window title.
             let len = GetWindowTextLengthW(hwnd);
             if len <= 0 {
                 return TRUE;
@@ -470,7 +489,6 @@ pub(crate) fn find_window_handle(
             let title = String::from_utf16_lossy(&buf[..copied as usize]);
             let title_lower = title.to_ascii_lowercase();
 
-            // Look up owning process module name.
             let mut pid: u32 = 0;
             let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
             let proc_name = if pid != 0 {
@@ -515,8 +533,6 @@ pub(crate) fn find_window_handle(
                     .as_ref()
                     .map(|q| title_lower.contains(*q))
                     .unwrap_or(true);
-                // If neither filter is set, don't claim a match — we already
-                // bailed at the caller in that case, but defensive guard.
                 let any_filter =
                     state.process_lower.is_some() || state.title_lower.is_some();
                 if any_filter && proc_ok && title_ok {
@@ -535,17 +551,8 @@ pub(crate) fn find_window_handle(
         title_lower,
         found: None,
     };
-    // SAFETY: STATE's lifetime is bound to this call. We clear it before
-    // returning, so the 'static cast never escapes the function.
     let state_ptr: *mut State<'static> = unsafe { std::mem::transmute(&mut state as *mut State) };
     STATE.with(|s| *s.borrow_mut() = Some(state_ptr));
-    // Wrap the EnumWindows call (and the synchronous callbacks it fires
-    // for every top-level window) in catch_unwind. A panic inside the
-    // callback would otherwise unwind through the extern "system" FFI
-    // boundary — undefined behavior on Windows. Native SEH segfaults
-    // bypass this and still crash the process, but at least a stray
-    // Rust panic (slice OOB, OpenProcess returning bad handles, etc.)
-    // gets contained.
     let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
         let _ = EnumWindows(Some(enum_proc), LPARAM(0));
     }));

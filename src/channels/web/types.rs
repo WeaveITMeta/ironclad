@@ -101,6 +101,26 @@ pub enum SseEvent {
     Error { message: String },
     #[serde(rename = "heartbeat")]
     Heartbeat,
+    /// A sub-agent (parallel sub-task, background worker, fan-out
+    /// task) started running. `id` uniquely identifies this sub-agent
+    /// so subsequent progress/completed events can update the same
+    /// row; `kind` is one of "tool_exec" | "background" | "job".
+    #[serde(rename = "sub_agent_started")]
+    SubAgentStarted {
+        id: String,
+        label: String,
+        kind: String,
+    },
+    /// In-flight progress message for a previously-started sub-agent.
+    #[serde(rename = "sub_agent_progress")]
+    SubAgentProgress { id: String, message: String },
+    /// A sub-agent finished. Caller marks the row done.
+    #[serde(rename = "sub_agent_completed")]
+    SubAgentCompleted {
+        id: String,
+        success: bool,
+        summary: String,
+    },
 }
 
 // --- Memory ---
@@ -326,6 +346,9 @@ impl WsServerMessage {
             SseEvent::ApprovalNeeded { .. } => "approval_needed",
             SseEvent::Error { .. } => "error",
             SseEvent::Heartbeat => "heartbeat",
+            SseEvent::SubAgentStarted { .. } => "sub_agent_started",
+            SseEvent::SubAgentProgress { .. } => "sub_agent_progress",
+            SseEvent::SubAgentCompleted { .. } => "sub_agent_completed",
         };
         let data = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
         WsServerMessage::Event {

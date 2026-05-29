@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+  <!-- Four corner brackets pulling inward = minify / shrink -->
+  <!-- TL -->
+  <polyline points="9 4 4 4 4 9"/>
+  <!-- TR -->
+  <polyline points="15 4 20 4 20 9"/>
+  <!-- BR -->
+  <polyline points="20 15 20 20 15 20"/>
+  <!-- BL -->
+  <polyline points="4 15 4 20 9 20"/>
+</svg>

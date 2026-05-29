@@ -152,6 +152,12 @@ pub struct GatewayState {
     /// (`ELEVENLABS_*`); the gateway calls ElevenLabs directly from the
     /// `/api/voice/tts_stream` handler — no local TTS daemon.
     pub voice: VoiceConfig,
+    /// Shared `reqwest::Client` for ElevenLabs TTS calls. Constructed
+    /// once at gateway startup so reqwest's connection pool keeps the
+    /// TLS handshake to `api.elevenlabs.io` warm across requests. The
+    /// previous shape built a fresh client per TTS sentence which paid
+    /// the full TCP+TLS setup (~150 ms RTT) on every utterance.
+    pub tts_client: reqwest::Client,
     /// Bearer token for the protected routes. Exposed read-only to localhost
     /// callers via `/api/gateway/token` so the dashboard can self-bootstrap.
     pub auth_token: String,
@@ -1417,6 +1423,7 @@ async fn voice_stt_handler(
 /// the request fails loudly with the upstream's error body so it's
 /// debuggable, rather than degrading to a worse voice.
 async fn voice_tts_stream_handler(
+    axum::extract::State(state): axum::extract::State<Arc<GatewayState>>,
     Json(req): Json<VoiceTtsRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     // Note: `.map()` and `.chain()` on the upstream byte stream are reached
@@ -1443,15 +1450,12 @@ async fn voice_tts_stream_handler(
     let url = format!(
         "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream?output_format={OUTPUT_FORMAT}"
     );
-    // 120s read+connect cap. ElevenLabs Flash usually finishes streaming a
-    // sentence in 1-5s, but the upstream can stall under load. 60s was tight
-    // enough that long multi-sentence replies sometimes truncated mid-word.
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("client: {e}")))?;
+    // Use the shared pooled TTS client from app state. reqwest keeps
+    // idle HTTP/2 connections to api.elevenlabs.io warm, so the second
+    // and subsequent sentence opens skip the ~150 ms TCP+TLS handshake.
     let text_len = req.text.chars().count();
-    let upstream = client
+    let upstream = state
+        .tts_client
         .post(&url)
         .header("xi-api-key", &api_key)
         .header("content-type", "application/json")

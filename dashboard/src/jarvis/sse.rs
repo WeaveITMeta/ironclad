@@ -100,8 +100,19 @@ where
     let _ = source.add_event_listener_with_callback("open", on_open.as_ref().unchecked_ref());
     on_open.forget();
 
+    // EventSource has built-in reconnect for transport-level errors
+    // (3-second backoff per `retry:` field the gateway sends). What it
+    // CANNOT recover from is a stale URL — gateway rotates the auth
+    // token on every boot, so an `error` after the gateway restarted
+    // means the cached `?token=...` is dead and EventSource is now
+    // looping forever against a 401. The error handler logs prominently
+    // so the user can spot it in DevTools; full token-refresh-on-401
+    // is out of scope for the soon-to-be-retired Leptos surface.
     let on_err = Closure::wrap(Box::new(move |ev: JsValue| {
-        console_log(&format!("[jarvis-sse] connection error: {:?}", ev));
+        console_log(&format!(
+            "[jarvis-sse] connection error (will auto-retry; if persistent, refresh the page to pick up a new auth token): {:?}",
+            ev
+        ));
     }) as Box<dyn FnMut(JsValue)>);
     let _ = source.add_event_listener_with_callback("error", on_err.as_ref().unchecked_ref());
     on_err.forget();

@@ -104,10 +104,34 @@ impl AnthropicProvider {
             });
         }
 
-        serde_json::from_str(&text).map_err(|e| LlmError::InvalidResponse {
-            provider: PROVIDER.to_string(),
-            reason: format!("JSON parse: {}; raw: {}", e, text),
-        })
+        let parsed: MessagesResponse =
+            serde_json::from_str(&text).map_err(|e| LlmError::InvalidResponse {
+                provider: PROVIDER.to_string(),
+                reason: format!("JSON parse: {}; raw: {}", e, text),
+            })?;
+        log_cache_usage(&parsed.usage);
+        Ok(parsed)
+    }
+}
+
+/// Surface prompt-cache hit ratio to logs so we can verify the prefix
+/// is actually being reused. Anything above 0 cache_read_input_tokens
+/// after the first call of a session means the breakpoint took.
+fn log_cache_usage(u: &Usage) {
+    if u.cache_read_input_tokens > 0 || u.cache_creation_input_tokens > 0 {
+        let total = u.input_tokens + u.cache_read_input_tokens;
+        let pct = if total > 0 {
+            (u.cache_read_input_tokens as f64 / total as f64) * 100.0
+        } else {
+            0.0
+        };
+        tracing::info!(
+            "anthropic cache: read={} write={} fresh={} hit_rate={:.0}%",
+            u.cache_read_input_tokens,
+            u.cache_creation_input_tokens,
+            u.input_tokens,
+            pct
+        );
     }
 }
 
@@ -124,7 +148,8 @@ impl LlmProvider for AnthropicProvider {
     }
 
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, LlmError> {
-        let (system, messages) = convert_messages(req.messages);
+        let (system, mut messages) = convert_messages(req.messages);
+        apply_message_history_cache(&mut messages);
         let body = MessagesRequest {
             model: self.config.model.clone(),
             max_tokens: req.max_tokens.unwrap_or(self.config.default_max_tokens),
@@ -141,7 +166,7 @@ impl LlmProvider for AnthropicProvider {
             .content
             .iter()
             .filter_map(|block| match block {
-                ContentBlock::Text { text } => Some(text.clone()),
+                ContentBlock::Text { text, .. } => Some(text.clone()),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -159,16 +184,23 @@ impl LlmProvider for AnthropicProvider {
         &self,
         req: ToolCompletionRequest,
     ) -> Result<ToolCompletionResponse, LlmError> {
-        let (system, messages) = convert_messages(req.messages);
-        let tools: Vec<AnthropicTool> = req
+        let (system, mut messages) = convert_messages(req.messages);
+        apply_message_history_cache(&mut messages);
+        let mut tools: Vec<AnthropicTool> = req
             .tools
             .into_iter()
             .map(|t| AnthropicTool {
                 name: t.name,
                 description: t.description,
                 input_schema: t.parameters,
+                cache_control: None,
             })
             .collect();
+        // Cache the system + tools prefix. Last tool gets the marker,
+        // which extends the cache breakpoint backward to cover every
+        // earlier block. Huge for sub-agents and the autonomous loop
+        // where the same 200-tool palette ships on every call.
+        apply_prompt_cache(&mut tools);
         let tool_choice = req.tool_choice.map(map_tool_choice);
 
         let body = MessagesRequest {
@@ -188,7 +220,7 @@ impl LlmProvider for AnthropicProvider {
         let mut tool_calls = Vec::new();
         for block in resp.content {
             match block {
-                ContentBlock::Text { text } => text_parts.push(text),
+                ContentBlock::Text { text, .. } => text_parts.push(text),
                 ContentBlock::ToolUse { id, name, input } => {
                     tool_calls.push(ToolCall {
                         id,
@@ -231,16 +263,19 @@ impl LlmProvider for AnthropicProvider {
         request: ToolCompletionRequest,
         mut on_chunk: Box<dyn FnMut(String) + Send>,
     ) -> Result<ToolCompletionResponse, LlmError> {
-        let (system, messages) = convert_messages(request.messages);
-        let tools: Vec<AnthropicTool> = request
+        let (system, mut messages) = convert_messages(request.messages);
+        apply_message_history_cache(&mut messages);
+        let mut tools: Vec<AnthropicTool> = request
             .tools
             .into_iter()
             .map(|t| AnthropicTool {
                 name: t.name,
                 description: t.description,
                 input_schema: t.parameters,
+                cache_control: None,
             })
             .collect();
+        apply_prompt_cache(&mut tools);
         let tool_choice = request.tool_choice.map(map_tool_choice);
 
         let body = StreamingMessagesRequest {
@@ -286,7 +321,8 @@ impl LlmProvider for AnthropicProvider {
         request: CompletionRequest,
         mut on_chunk: Box<dyn FnMut(String) + Send>,
     ) -> Result<CompletionResponse, LlmError> {
-        let (system, messages) = convert_messages(request.messages);
+        let (system, mut messages) = convert_messages(request.messages);
+        apply_message_history_cache(&mut messages);
         let body = StreamingMessagesRequest {
             model: self.config.model.clone(),
             max_tokens: request.max_tokens.unwrap_or(self.config.default_max_tokens),
@@ -605,13 +641,17 @@ fn convert_messages(msgs: Vec<ChatMessage>) -> (Option<String>, Vec<AnthropicMes
                         .map(|data| ContentBlock::Image {
                             source: ImageSource {
                                 source_type: "base64".to_string(),
-                                media_type: "image/png".to_string(),
+                                media_type: sniff_image_media_type(data).to_string(),
                                 data: data.clone(),
                             },
+                            cache_control: None,
                         })
                         .collect();
                     if !m.content.is_empty() {
-                        blocks.push(ContentBlock::Text { text: m.content });
+                        blocks.push(ContentBlock::Text {
+                            text: m.content,
+                            cache_control: None,
+                        });
                     }
                     out.push(AnthropicMessage {
                         role: "user".to_string(),
@@ -628,7 +668,10 @@ fn convert_messages(msgs: Vec<ChatMessage>) -> (Option<String>, Vec<AnthropicMes
                 if let Some(calls) = m.tool_calls {
                     let mut blocks = Vec::new();
                     if !m.content.is_empty() {
-                        blocks.push(ContentBlock::Text { text: m.content });
+                        blocks.push(ContentBlock::Text {
+                            text: m.content,
+                            cache_control: None,
+                        });
                     }
                     for c in calls {
                         blocks.push(ContentBlock::ToolUse {
@@ -660,15 +703,17 @@ fn convert_messages(msgs: Vec<ChatMessage>) -> (Option<String>, Vec<AnthropicMes
                 let mut blocks: Vec<ContentBlock> = vec![ContentBlock::ToolResult {
                     tool_use_id,
                     content: m.content,
+                    cache_control: None,
                 }];
                 if let Some(imgs) = m.images.as_ref().filter(|v| !v.is_empty()) {
                     for data in imgs {
                         blocks.push(ContentBlock::Image {
                             source: ImageSource {
                                 source_type: "base64".to_string(),
-                                media_type: "image/png".to_string(),
+                                media_type: sniff_image_media_type(data).to_string(),
                                 data: data.clone(),
                             },
+                            cache_control: None,
                         });
                     }
                 }
@@ -694,6 +739,33 @@ fn map_stop_reason(reason: Option<&str>) -> FinishReason {
         Some("max_tokens") => FinishReason::Length,
         Some("tool_use") => FinishReason::ToolUse,
         _ => FinishReason::Unknown,
+    }
+}
+
+/// Detect the actual image format from a base64-encoded payload by
+/// looking at the first few characters. Base64 of the binary magic
+/// bytes is deterministic: PNG starts with `iVBORw0` (89 50 4E 47),
+/// JPEG with `/9j/` (FF D8 FF), GIF with `R0lGOD` (47 49 46 38), WEBP
+/// with `UklGR` (52 49 46 46). Falls back to `image/png` when the
+/// prefix doesn't match any known format — that's the dominant case
+/// historically and matches what the dashboard used to send.
+///
+/// The dashboard now sends JPEG for screen-share frames (much smaller
+/// for photographic content). Without this sniff, the provider was
+/// shipping `media_type: image/png` for JPEG bytes and Anthropic 400'd
+/// the whole turn with "image was specified using the image/png media
+/// type, but the image appears to be a image/jpeg image".
+fn sniff_image_media_type(b64: &str) -> &'static str {
+    if b64.starts_with("iVBORw0") {
+        "image/png"
+    } else if b64.starts_with("/9j/") {
+        "image/jpeg"
+    } else if b64.starts_with("R0lGOD") {
+        "image/gif"
+    } else if b64.starts_with("UklGR") {
+        "image/webp"
+    } else {
+        "image/png"
     }
 }
 
@@ -755,6 +827,13 @@ enum AnthropicContent {
 enum ContentBlock {
     Text {
         text: String,
+        /// Cache breakpoint marker. When set on the last block of the
+        /// last message, Anthropic caches the entire system+tools+
+        /// conversation prefix; only the LLM's new response on top of
+        /// that prefix is billed at full input-token rate.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
+        cache_control: Option<CacheControl>,
     },
     ToolUse {
         id: String,
@@ -764,9 +843,15 @@ enum ContentBlock {
     ToolResult {
         tool_use_id: String,
         content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
+        cache_control: Option<CacheControl>,
     },
     Image {
         source: ImageSource,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
+        cache_control: Option<CacheControl>,
     },
 }
 
@@ -783,6 +868,86 @@ struct AnthropicTool {
     name: String,
     description: String,
     input_schema: serde_json::Value,
+    /// Anthropic prompt cache marker. When present, Anthropic caches
+    /// everything UP TO AND INCLUDING this block (so setting it on the
+    /// last tool caches system + tools as a single prefix). 5-minute
+    /// TTL by default — perfectly aligned with the autonomous loop's
+    /// 5-min cadence and chat sessions in general.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
+}
+
+/// Anthropic cache breakpoint marker. `type: "ephemeral"` is the only
+/// supported value today; the implicit TTL is 5 minutes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CacheControl {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+impl CacheControl {
+    fn ephemeral() -> Self {
+        Self {
+            kind: "ephemeral".to_string(),
+        }
+    }
+}
+
+/// Mark the last tool in the slice as a cache breakpoint so Anthropic
+/// caches the entire system + tools prefix. Idempotent — if the slice
+/// is empty, does nothing. Call this right before building the request
+/// body; both streaming and non-streaming paths share it.
+fn apply_prompt_cache(tools: &mut [AnthropicTool]) {
+    if let Some(last) = tools.last_mut() {
+        last.cache_control = Some(CacheControl::ephemeral());
+    }
+}
+
+/// Mark the last block of the last message with a cache_control marker.
+/// Combined with `apply_prompt_cache` on the tools list, this gives us
+/// two cache breakpoints — one that covers system+tools, and a rolling
+/// one that covers system+tools+conversation-history. Each turn, the
+/// previous user message becomes part of the cached prefix; only the
+/// newest assistant response is billed at full input-token rate.
+///
+/// Converts an AnthropicContent::Text into a Blocks-with-cache_control
+/// when needed so the marker has somewhere to live. Skips short
+/// conversations (under 2 messages) where caching would write more
+/// than it saves.
+fn apply_message_history_cache(messages: &mut Vec<AnthropicMessage>) {
+    if messages.len() < 2 {
+        return;
+    }
+    let Some(last) = messages.last_mut() else {
+        return;
+    };
+    match &mut last.content {
+        AnthropicContent::Text(text) => {
+            let upgraded = vec![ContentBlock::Text {
+                text: std::mem::take(text),
+                cache_control: Some(CacheControl::ephemeral()),
+            }];
+            last.content = AnthropicContent::Blocks(upgraded);
+        }
+        AnthropicContent::Blocks(blocks) => {
+            // Walk from the end and tag the first markable block. Images
+            // and tool_results count; only ToolUse blocks (assistant-only)
+            // don't carry cache_control in this codebase. Last markable
+            // wins because cache_control there extends backward to
+            // include everything earlier in the request.
+            for block in blocks.iter_mut().rev() {
+                match block {
+                    ContentBlock::Text { cache_control, .. }
+                    | ContentBlock::ToolResult { cache_control, .. }
+                    | ContentBlock::Image { cache_control, .. } => {
+                        *cache_control = Some(CacheControl::ephemeral());
+                        return;
+                    }
+                    ContentBlock::ToolUse { .. } => continue,
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -808,6 +973,16 @@ struct MessagesResponse {
 struct Usage {
     input_tokens: u32,
     output_tokens: u32,
+    /// Tokens served from the prompt cache. When non-zero, the prefix
+    /// (system + tools) was a hit and we're being billed at 10% of the
+    /// normal input rate for those tokens.
+    #[serde(default)]
+    cache_read_input_tokens: u32,
+    /// Tokens newly written to the prompt cache on this call (only
+    /// relevant on the first call of a series; billed at 1.25x normal
+    /// input but amortizes across subsequent reads).
+    #[serde(default)]
+    cache_creation_input_tokens: u32,
 }
 
 #[cfg(test)]

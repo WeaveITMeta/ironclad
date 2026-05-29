@@ -177,6 +177,12 @@ impl AutonomousLoopRunner {
             Err(_) => AUTONOMOUS_SEED.to_string(),
         };
 
+        // 1b. Pull recent feedback so prior lessons inform this tick.
+        //     This is the difference between "JARVIS runs the same
+        //     failing tool every 5 minutes" and "JARVIS stops trying
+        //     things it already learned don't work."
+        let prior_lessons = load_recent_lessons(&self.workspace).await;
+
         // 2. Pull system prompt (identity + soul + agents).
         let system_prompt = self
             .workspace
@@ -197,8 +203,14 @@ impl AutonomousLoopRunner {
              It is now your turn to act without user input. Read the priorities \
              below, decide ONE action, execute it via tools, and report back \
              using the sentinel rules (LOOP_OK / LOOP_SILENT: ... / LOOP_VOICE: ...).\n\n\
+             ## Prior lessons (most recent first — DO NOT repeat these failures)\n\n{}\n\n\
              ## Allowed tools\n{}\n\n\
              ## Priorities (AUTONOMOUS.md)\n\n{}",
+            if prior_lessons.trim().is_empty() {
+                "(no prior lessons logged yet)".to_string()
+            } else {
+                prior_lessons
+            },
             palette
                 .iter()
                 .map(|t| t.name.as_str())
@@ -258,9 +270,24 @@ impl AutonomousLoopRunner {
             }
         }
 
-        // 6. Interpret sentinel + emit.
+        // 6. Interpret sentinel + emit + record outcome in feedback log.
         let elapsed = started.elapsed();
         let report = classify_report(&final_text);
+        let outcome_summary = match &report {
+            LoopReport::Ok => format!("autonomous tick LOOP_OK in {:?}", elapsed),
+            LoopReport::Silent(line) => format!("LOOP_SILENT: {}", line),
+            LoopReport::Voice(line) => format!("LOOP_VOICE: {}", line),
+        };
+        // Feedback: record what this tick concluded so future ticks
+        // can see the trajectory. Silent failures here never bubble up.
+        crate::tools::builtin::feedback_record_silently(
+            self.workspace.as_ref(),
+            "outcome",
+            &outcome_summary,
+            "autonomous tick result — useful as context for the next tick",
+            None,
+        )
+        .await;
         match report {
             LoopReport::Ok => {
                 tracing::info!("autonomous tick LOOP_OK in {:?}", elapsed);
@@ -364,6 +391,49 @@ impl AutonomousLoopRunner {
             tracing::warn!("autonomous emit failed: {}", e);
         }
     }
+}
+
+/// Pull the most recent feedback-log entries from the workspace and
+/// format them as a compact prompt block. Bounded at 15 entries / ~1500
+/// chars so the prompt doesn't bloat. If there are no entries yet (first
+/// run on a fresh install), returns empty so the caller can write a
+/// placeholder. Silent on errors — feedback failures must not block
+/// the loop.
+async fn load_recent_lessons(workspace: &Workspace) -> String {
+    let today = chrono::Utc::now().date_naive();
+    let mut lines: Vec<String> = Vec::new();
+    for d in 0..3 {
+        let date = today - chrono::Duration::days(d);
+        let path = format!("feedback/{}.md", date.format("%Y-%m-%d"));
+        let Ok(doc) = workspace.read(&path).await else {
+            continue;
+        };
+        let mut day_lines: Vec<String> = Vec::new();
+        for line in doc.content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with("```") || line.starts_with('#') {
+                continue;
+            }
+            let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let kind = entry.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
+            let lesson = entry.get("lesson").and_then(|v| v.as_str()).unwrap_or("");
+            // Skip the loop's own "outcome" entries from prior ticks —
+            // they're noise; we want failure lessons and reflections.
+            if kind == "outcome" {
+                continue;
+            }
+            day_lines.push(format!("- [{}] {}", kind, lesson));
+        }
+        day_lines.reverse();
+        lines.extend(day_lines);
+        if lines.len() >= 15 {
+            break;
+        }
+    }
+    lines.truncate(15);
+    lines.join("\n")
 }
 
 enum LoopReport {

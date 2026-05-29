@@ -1,0 +1,165 @@
+[package]
+name = "jarvis-desktop"
+version = "2.0.0"
+edition = "2024"
+description = "JARVIS as a native Windows desktop overlay. System tray + floating arc-reactor widget + summonable full HUD, always-on-top across every workspace, native audio I/O via cpal, global hotkeys, no browser."
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "jarvis-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+# Slint compiles its declarative UI markup at build time into Rust code
+# we import. build.rs invokes the compiler.
+slint-build = "1.8"
+
+# Multi-resolution .ico generation from the same SVG the runtime uses,
+# then embedded as a Windows .exe resource so the taskbar / Alt-Tab /
+# Explorer all show the arc reactor instead of a generic window icon.
+# Same pattern Eustress Engine uses.
+resvg = "0.45"
+usvg = "0.45"
+tiny-skia = "0.11"
+ico = "0.3"
+
+# Embed the generated .ico into the .exe via the Windows resource
+# compiler at link time. Effectively a no-op outside Windows.
+[target.'cfg(target_os = "windows")'.build-dependencies]
+winres = "0.1"
+
+[dependencies]
+# Native UI. Slint is pure Rust, no webview, no Chromium, no JS.
+# Eustress already uses Slint elsewhere so the team is familiar.
+slint = { version = "1.8", features = ["compat-1-2", "backend-winit"] }
+
+# Access to the underlying winit window (raw HWND) so we can post the
+# Win32 messages that make a frameless window draggable. Pin the same
+# major version Slint pulls in to avoid HWND-type skew.
+i-slint-backend-winit = "1.8"
+
+# Async runtime. Mirrors the gateway's choices so request/SSE patterns
+# carry forward unchanged from the existing dashboard's Rust glue.
+tokio = { version = "1", features = ["full"] }
+
+# Gateway HTTP. Same crate the dashboard's WASM side used; idiomatic
+# semantics survive the move to native.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+
+# Bridge from Slint's window handle to native Win32 so we can send the
+# WM_NCLBUTTONDOWN HTCAPTION trick that lets a frameless window drag.
+raw-window-handle = "0.6"
+
+# WebTransport (QUIC over UDP) client for the parakeet-wt streaming STT
+# sidecar. Same wire protocol the Leptos dashboard uses — datagrams
+# carry float32-LE PCM @ 16 kHz; unidirectional streams carry JSON
+# control + JSON events. Native gives us back-pressure-aware datagram
+# IO and proper stream multiplexing instead of WebSocket framing.
+wtransport = "0.6"
+
+# Cross-platform "open this URL in the default browser" for the SETUP
+# button (bridges to the Leptos wizard until a native one ships).
+open = "5"
+
+# SSE client for the gateway's chat-event stream.
+eventsource-client = "0.13"
+
+# Bytes-stream → AsyncRead adapter for the TTS PCM stream.
+tokio-util = { version = "0.7", features = ["io"] }
+
+# Stream combinators (TryStreamExt, StreamExt) used by gateway client.
+futures = "0.3"
+
+# Audio I/O. cpal is the cross-platform Rust audio crate; gives us WASAPI
+# on Windows for both mic capture (input stream) and TTS playback (output
+# stream). No browser permission gymnastics, no AudioWorklet shim, no
+# WebTransport.
+cpal = "0.15"
+
+# parking_lot::Mutex is ~5x faster than std::sync::Mutex on Windows and
+# critically — does NOT poison on panic. The cpal audio callback holds
+# this lock every buffer; one poisoned guard from another thread would
+# crash the audio thread permanently with std::sync::Mutex.
+parking_lot = "0.12"
+
+# Resample mic 48 kHz native → 16 kHz mono for Parakeet. Same target rate
+# the dashboard's AudioWorklet was producing.
+rubato = "0.16"
+
+# Global hotkey registration so 'JARVIS' wake-word backup + push-to-summon
+# work from any focused window. Currently used: Ctrl+Alt+J to summon
+# full HUD, Ctrl+Alt+M to toggle mic mute.
+global-hotkey = "0.5"
+
+# System tray icon. Lets JARVIS live quietly in the notification area
+# even when the floating widget is hidden.
+tray-icon = "0.19"
+
+# Tray icon image decode.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+# SVG rasterization for the tray + window icon. Same arc-reactor SVG the
+# Leptos dashboard uses as its favicon, rendered to RGBA at startup so
+# the binary stays self-contained (no runtime asset files).
+resvg = "0.45"
+usvg = "0.45"
+tiny-skia = "0.11"
+
+# Async channels between the UI thread and the audio/network threads.
+async-channel = "2"
+
+# Standard fare.
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Base64 for image content (screenshot frames sent to Claude vision).
+base64 = "0.22"
+
+# Resolve the user's home directory so crash reports land in
+# ~/.ironclad/crashes/ instead of wherever the binary was launched.
+# Tiny crate, no transitive deps of note.
+dirs = "5"
+
+# Zero-copy reinterpretation of `&[f32]` as `&[u8]` for WebTransport
+# datagram packing. The previous per-sample `to_le_bytes()` loop did
+# an allocation + a 4-byte copy per sample (= 1280 allocs per 80ms
+# chunk at 16kHz). bytemuck::cast_slice is a single bit-reinterpret +
+# one memcpy via .to_vec(). Saves ~12k allocs/sec under voice.
+bytemuck = "1"
+
+# Pure-Rust ONNX runtime for Silero VAD inference. Same model the
+# Leptos dashboard runs in `silero.js`; gives us a real
+# speech-vs-everything-else classifier so we can ignore music,
+# JARVIS's own voice, and ambient noise without false-positive
+# barge-ins. tract is pure Rust (no native ORT binary needed); the
+# Silero model is small enough (~2 MB) that perf overhead is sub-ms
+# per 32 ms chunk.
+tract-onnx = "0.21"
+ndarray = "0.16"
+
+# Make the window always-on-top reliably on Windows. winit's API works
+# for most window flags but the always-on-top + skip-taskbar combo is
+# easier to get right via the windows crate at startup.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    # PrintWindow lives under Storage::Xps in windows-rs. Yes, really.
+    "Win32_Storage_Xps",
+    # ReleaseCapture for the frameless-window drag handoff.
+    "Win32_UI_Input_KeyboardAndMouse",
+    # DwmSetWindowAttribute to disable Windows 11 corner rounding.
+    "Win32_Graphics_Dwm",
+] }
+
+# Real native Windows toast notifications via WinRT. Replaces the
+# log-only stub: JARVIS responses that arrive while the HUD is hidden
+# now surface as Action Center toasts McKale can click to summon the
+# window. Tiny wrapper around the Windows::UI::Notifications API; no
+# AppUserModelID registration needed (uses PowerShell's AUMID as
+# default, which is fine for personal use).
+tauri-winrt-notification = "0.2"
